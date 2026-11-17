@@ -1,0 +1,252 @@
+cmake_minimum_required(VERSION 3.16)
+
+project(vision_inference_engine VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Heavy backends stay off until that phase exists. Turning one on without
+# the SDK warns and leaves the core library unchanged.
+option(VIE_ENABLE_CUDA "Enable CUDA" OFF)
+option(VIE_ENABLE_TENSORRT "Enable native TensorRT" OFF)
+option(VIE_ENABLE_ONNXRUNTIME "Enable ONNX Runtime" OFF)
+option(VIE_ENABLE_OPENCV "Enable OpenCV" OFF)
+option(VIE_BUILD_TESTS "Build GoogleTest targets" ON)
+
+if(VIE_ENABLE_CUDA)
+  find_package(CUDAToolkit QUIET)
+  if(NOT CUDAToolkit_FOUND)
+    message(WARNING "VIE_ENABLE_CUDA is ON but CUDAToolkit was not found. CUDA stays disabled.")
+    set(VIE_ENABLE_CUDA OFF CACHE BOOL "Enable CUDA" FORCE)
+  else()
+    message(STATUS "CUDA toolkit: ${CUDAToolkit_VERSION}")
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+      set(CMAKE_CUDA_ARCHITECTURES 89)
+    endif()
+    enable_language(CUDA)
+  endif()
+endif()
+
+if(VIE_ENABLE_TENSORRT)
+  message(WARNING "VIE_ENABLE_TENSORRT is ON, but this version of VIE has no TensorRT sources yet. TensorRT stays disabled.")
+  set(VIE_ENABLE_TENSORRT OFF CACHE BOOL "Enable native TensorRT" FORCE)
+endif()
+
+set(VIE_ONNXRUNTIME_ROOT "" CACHE PATH "ONNX Runtime CPU prefix (include/ and lib/)")
+set(VIE_ONNXRUNTIME_GPU_ROOT "" CACHE PATH "ONNX Runtime GPU prefix; used only when CUDA is enabled")
+if(VIE_ENABLE_ONNXRUNTIME)
+  if(VIE_ONNXRUNTIME_ROOT STREQUAL "" AND DEFINED ENV{ONNXRUNTIME_ROOT})
+    set(VIE_ONNXRUNTIME_ROOT "$ENV{ONNXRUNTIME_ROOT}")
+  endif()
+  find_path(VIE_ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+    HINTS
+      ${VIE_ONNXRUNTIME_ROOT}
+      /opt/onnxruntime-linux-x64-1.20.1
+    PATH_SUFFIXES include)
+  find_library(VIE_ONNXRUNTIME_LIBRARY onnxruntime
+    HINTS
+      ${VIE_ONNXRUNTIME_ROOT}
+      /opt/onnxruntime-linux-x64-1.20.1
+    PATH_SUFFIXES lib lib64)
+  if(NOT VIE_ONNXRUNTIME_INCLUDE_DIR OR NOT VIE_ONNXRUNTIME_LIBRARY)
+    message(WARNING
+      "VIE_ENABLE_ONNXRUNTIME is ON but ONNX Runtime was not found. "
+      "Set VIE_ONNXRUNTIME_ROOT to the CPU SDK prefix. ONNX Runtime stays disabled.")
+    set(VIE_ENABLE_ONNXRUNTIME OFF CACHE BOOL "Enable ONNX Runtime" FORCE)
+  else()
+    message(STATUS "ONNX Runtime include: ${VIE_ONNXRUNTIME_INCLUDE_DIR}")
+    message(STATUS "ONNX Runtime library: ${VIE_ONNXRUNTIME_LIBRARY}")
+    get_filename_component(VIE_ONNXRUNTIME_LIB_DIR "${VIE_ONNXRUNTIME_LIBRARY}" DIRECTORY)
+  endif()
+endif()
+
+set(VIE_ENABLE_ONNXRUNTIME_CUDA OFF)
+if(VIE_ENABLE_CUDA AND VIE_ENABLE_ONNXRUNTIME AND NOT VIE_ONNXRUNTIME_GPU_ROOT STREQUAL "")
+  find_path(VIE_ONNXRUNTIME_GPU_INCLUDE_DIR onnxruntime_cxx_api.h
+    HINTS ${VIE_ONNXRUNTIME_GPU_ROOT}
+    PATH_SUFFIXES include
+    NO_DEFAULT_PATH)
+  find_library(VIE_ONNXRUNTIME_GPU_LIBRARY onnxruntime
+    HINTS ${VIE_ONNXRUNTIME_GPU_ROOT}
+    PATH_SUFFIXES lib lib64
+    NO_DEFAULT_PATH)
+  if(NOT VIE_ONNXRUNTIME_GPU_INCLUDE_DIR OR NOT VIE_ONNXRUNTIME_GPU_LIBRARY)
+    message(WARNING
+      "VIE_ONNXRUNTIME_GPU_ROOT is set but the GPU package was not found. "
+      "The CUDA ONNX Runtime backend stays disabled.")
+  else()
+    set(VIE_ENABLE_ONNXRUNTIME_CUDA ON)
+    get_filename_component(VIE_ONNXRUNTIME_GPU_LIB_DIR "${VIE_ONNXRUNTIME_GPU_LIBRARY}" DIRECTORY)
+    message(STATUS "ONNX Runtime GPU include: ${VIE_ONNXRUNTIME_GPU_INCLUDE_DIR}")
+    message(STATUS "ONNX Runtime GPU library: ${VIE_ONNXRUNTIME_GPU_LIBRARY}")
+  endif()
+endif()
+
+if(VIE_ENABLE_OPENCV)
+  find_package(OpenCV QUIET COMPONENTS core imgproc imgcodecs)
+  if(NOT OpenCV_FOUND)
+    message(WARNING "VIE_ENABLE_OPENCV is ON but OpenCV was not found. OpenCV stays disabled.")
+  else()
+    message(WARNING "OpenCV was found, but this version of VIE does not link it into vie_core. OpenCV stays disabled.")
+  endif()
+  set(VIE_ENABLE_OPENCV OFF CACHE BOOL "Enable OpenCV" FORCE)
+endif()
+
+find_package(nlohmann_json 3.2.0 REQUIRED)
+
+add_library(vie
+  src/core/types.cpp
+  src/core/device_context.cpp
+  src/core/tensor_storage.cpp
+  src/core/tensor.cpp
+  src/core/cuda_memory.cpp
+  src/model/manifest.cpp
+  src/model/manifest_validator.cpp
+  src/backend/backend_registry.cpp
+  src/backend/mock_backend.cpp
+  src/decoder/decoder_registry.cpp
+  src/decoder/mock_decoder.cpp
+  src/decoder/segmentation.cpp
+  src/decoder/detection_ops.cpp
+  src/decoder/yolov8_cpu_decode.cpp
+  src/decoder/yolov8_detect_decoder.cpp
+  src/decoder/rtdetr_decoder.cpp
+  src/decoder/rtdetr_cuda_decoder.cpp
+  src/decoder/yolov8_seg_decoder.cpp
+  src/engine/inference_engine.cpp
+  src/analyzer/onnx_analyzer.cpp
+  src/analyzer/analysis_format.cpp
+  src/recognizer/recognition.cpp
+  src/recognizer/recognizer_registry.cpp
+  src/recognizer/yolov8_detect_recognizer.cpp
+  src/recognizer/yolov8_seg_recognizer.cpp
+  src/recognizer/rtdetr_recognizer.cpp
+  src/recognizer/manifest_generator.cpp
+  src/preprocess/preprocess.cpp
+  src/preprocess/preprocess_cpu.cpp
+)
+
+add_library(vie::vie ALIAS vie)
+
+target_include_directories(vie
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(vie PRIVATE nlohmann_json::nlohmann_json)
+
+if(VIE_ENABLE_CUDA)
+  target_sources(vie PRIVATE src/preprocess/preprocess_cuda.cu src/decoder/yolov8_detect_decoder.cu
+                 src/decoder/yolov8_seg_decoder.cu src/decoder/rtdetr_cuda_decoder.cu)
+  target_link_libraries(vie PUBLIC CUDA::cudart)
+  target_compile_definitions(vie PUBLIC VIE_HAS_CUDA=1)
+  # nvcc emits GNU line markers. -Wpedantic treats those as errors, so this
+  # translation unit keeps -Wall -Wextra -Werror and turns that one warning off.
+  set_source_files_properties(src/preprocess/preprocess_cuda.cu src/decoder/yolov8_detect_decoder.cu PROPERTIES
+    COMPILE_OPTIONS "-Xcompiler=-Wall,-Wextra,-Werror,-Wno-pedantic")
+  set_source_files_properties(src/decoder/rtdetr_cuda_decoder.cu PROPERTIES
+    COMPILE_OPTIONS "--fmad=false;-Xcompiler=-Wall,-Wextra,-Werror,-Wno-pedantic")
+  set_source_files_properties(src/decoder/yolov8_seg_decoder.cu PROPERTIES
+    COMPILE_OPTIONS "--fmad=false;-Xcompiler=-Wall,-Wextra,-Werror,-Wno-pedantic")
+endif()
+
+if(VIE_ENABLE_ONNXRUNTIME)
+  target_sources(vie PRIVATE src/backend/onnxruntime_backend.cpp)
+  target_compile_definitions(vie PUBLIC VIE_HAS_ONNXRUNTIME=1)
+  if(VIE_ENABLE_ONNXRUNTIME_CUDA)
+    # One process can load one libonnxruntime.so.1. The GPU package also
+    # contains the CPU execution provider. The CPU backend still requests only
+    # that provider; this binary does not link the CPU package as well.
+    target_sources(vie PRIVATE src/backend/onnxruntime_cuda_backend.cpp)
+    target_include_directories(vie PRIVATE "${VIE_ONNXRUNTIME_GPU_INCLUDE_DIR}")
+    target_link_libraries(vie PUBLIC "${VIE_ONNXRUNTIME_GPU_LIBRARY}")
+    target_compile_definitions(vie PUBLIC VIE_HAS_ONNXRUNTIME_CUDA=1)
+  else()
+    target_include_directories(vie PRIVATE "${VIE_ONNXRUNTIME_INCLUDE_DIR}")
+    target_link_libraries(vie PUBLIC "${VIE_ONNXRUNTIME_LIBRARY}")
+  endif()
+endif()
+
+target_compile_features(vie PUBLIC cxx_std_17)
+
+target_compile_options(vie PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic;-Werror>)
+
+target_compile_definitions(vie
+  PUBLIC
+    VIE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    VIE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    VIE_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+)
+
+if(VIE_BUILD_TESTS)
+  enable_testing()
+  find_package(GTest REQUIRED)
+  add_executable(vie_tests
+    tests/test_tensor.cpp
+    tests/test_manifest.cpp
+    tests/test_engine.cpp
+    tests/test_engine_segmentation.cpp
+    tests/test_integration_regression.cpp
+    tests/test_onnx_analyzer.cpp
+    tests/test_recognizer.cpp
+    tests/test_yolov8_seg_recognizer.cpp
+    tests/test_rtdetr_recognizer.cpp
+    tests/test_rtdetr_decoder.cpp
+    tests/test_preprocess.cpp
+    tests/test_decoder.cpp
+    tests/test_segmentation.cpp
+    tests/test_yolov8_seg.cpp
+  )
+  target_link_libraries(vie_tests PRIVATE vie::vie GTest::gtest GTest::gtest_main)
+  target_compile_options(vie_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  target_compile_definitions(vie_tests PRIVATE VIE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+  if(VIE_ENABLE_ONNXRUNTIME)
+    target_sources(vie_tests PRIVATE tests/test_onnxruntime_backend.cpp)
+    if(VIE_ENABLE_ONNXRUNTIME_CUDA)
+      target_sources(vie_tests PRIVATE tests/test_onnxruntime_cuda_backend.cpp)
+      set_property(TARGET vie_tests APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_GPU_LIB_DIR}")
+    else()
+      set_property(TARGET vie_tests APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_LIB_DIR}")
+    endif()
+  endif()
+  if(VIE_ENABLE_CUDA)
+    target_sources(vie_tests PRIVATE tests/test_cuda_tensor.cpp tests/test_preprocess_cuda.cpp
+                                   tests/test_decoder_cuda.cpp tests/test_yolov8_seg_cuda.cpp
+                                   tests/test_rtdetr_cuda_decoder.cpp)
+    set_property(TARGET vie_tests APPEND PROPERTY BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
+  endif()
+  include(GoogleTest)
+  gtest_discover_tests(vie_tests WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
+add_executable(vie_analyze_onnx examples/analyze_onnx.cpp)
+target_link_libraries(vie_analyze_onnx PRIVATE vie::vie)
+target_compile_options(vie_analyze_onnx PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
+add_executable(vie_recognize_onnx examples/recognize_onnx.cpp)
+target_link_libraries(vie_recognize_onnx PRIVATE vie::vie)
+target_compile_options(vie_recognize_onnx PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
+if(VIE_ENABLE_ONNXRUNTIME)
+  if(VIE_ENABLE_ONNXRUNTIME_CUDA)
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx
+      APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_GPU_LIB_DIR}")
+  else()
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx
+      APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_LIB_DIR}")
+  endif()
+endif()
+if(VIE_ENABLE_CUDA)
+  set_property(TARGET vie_analyze_onnx vie_recognize_onnx
+    APPEND PROPERTY BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
+endif()
+
+message(STATUS "VIE ${PROJECT_VERSION}")
+message(STATUS "  CUDA=${VIE_ENABLE_CUDA} TENSORRT=${VIE_ENABLE_TENSORRT} ONNXRUNTIME=${VIE_ENABLE_ONNXRUNTIME} ONNXRUNTIME_CUDA=${VIE_ENABLE_ONNXRUNTIME_CUDA} OPENCV=${VIE_ENABLE_OPENCV}")
+message(STATUS "  TESTS=${VIE_BUILD_TESTS}")
