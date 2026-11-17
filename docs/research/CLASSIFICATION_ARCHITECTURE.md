@@ -1,6 +1,6 @@
 # Classification 架构评估
 
-本文只做接入设计。没有改产品代码，没有实现 Classification Decoder，也没有改 Manifest schema 或公共 API。
+第 1–14 节是 Phase 6.1 的接入设计，写于实现之前。Phase 6.2 的实际行为和测量见第 15 节。
 
 研究对象是本机临时导出的 `/tmp/resnet50_untrained_static.onnx`，不是仓库里的 testdata，也不是 ImageNet 权重文件。导出命令使用已安装的 PyTorch 2.14.1 与 torchvision 0.29.2：`resnet50(weights=None)`，legacy TorchScript 导出（`dynamo=False`），opset 17，输入名 `input`，输出名 `logits`，静态张量 `[1,3,224,224]`。文件 102057667 字节。权重是模块的默认初始化。这次执行只证明算子图能跑，不能证明分类正确。
 
@@ -333,3 +333,30 @@ Pose 与 OBB 继续用框任务的扩展点。它们不决定分类要不要 var
 - `imagenet` 词表不能代表所有分类模型。
 - GPU 包里的 CPU EP 与 CPU 包不是同一次链接。两边这次都能执行这张图。换模型时仍要分别验证。
 - dynamo 导出的图没有分析。不能把这次 169 个节点当成所有 ResNet-50 ONNX 的节点数。
+
+## 15. Phase 6.2 实现记录
+
+第一版按独立结果落地，没有 `InferenceResult`。`infer()` 和 `infer_segmentation()` 的签名未改。新增 `Classification`、`ClassificationResult`、`ClassificationBatch`、`ClassificationDecoder` 和 `infer_classification()`。协议名是 `classification_logits_raw`。
+
+和设计稿不一致、以本阶段规格为准的地方：
+
+- Manifest 字段是 `score_type`，取值 `logits` 或 `probabilities`。第一版 Decoder 只执行 `logits`，不跑 Softmax。`probabilities` 可以保存，执行时返回 `Unsupported`。
+- `top_k` 小于 1，或大于类别数，返回 `InvalidArgument`，不截断也不改成全部类别。
+- 非有限 logit 返回 `InvalidArgument`，信息包含输出名、`class_id` 和 NaN 或 infinite。
+- 分类字段的必填检查只在 protocol 为 `classification_logits_raw` 时生效。任务写成 classification、protocol 仍是 mock 的旧执行测试继续走 `run()`，`infer()` 对这个任务返回 `Unsupported`。
+
+`classification` 对象在未使用时不写入 JSON。Detection 和 Segmentation 的序列化测试确认没有这个键。类别数继续用已有的 `num_classes`。输出 shape 不会被填成 ImageNet 语义。
+
+CPU EP 的 logits 留在 CPU 上，`d2h_bytes` 为 0。严格 CUDA EP 先得到 CUDA 上的 FP32 输出，再由引擎把整条向量拷到 CPU，然后 CPU Decoder 做 Top-K。`[1,1000]` FP32 的显式 D2H 是 4000 字节。ORT 创建输出时自己的拷贝不计入这个数。结果的执行设备是 CPU。
+
+真实模型是 `/tmp/resnet50_untrained_static.onnx`，`weights=None`，没有放进仓库。测试图像是 16×16 的零值，预处理是 stretch 和 `scale_0_1`，不是 torchvision 的短边缩放加 center crop。下表是一次 warmup 之后的一次调用，只记录链路，不比较 CPU 和 CUDA 的快慢，也不把类别下标解释成 ImageNet 预测。三条路径的 Top-1 下标相同，这只说明同一份输入走过了解码。
+
+| 路径 | execute | logits D2H | D2H 字节 | CPU Top-K | 解码合计 | 输出字节 |
+|---|---:|---:|---:|---:|---:|---:|
+| CPU 包 CPU EP | 12.126 ms | 0 ms | 0 | 0.241 ms | 0.241 ms | 4000 |
+| GPU 包 CPU EP | 14.568 ms | 0 ms | 0 | 0.056 ms | 0.056 ms | 4000 |
+| GPU 包严格 CUDA EP | 2.182 ms | 0.052 ms | 4000 | 0.045 ms | 0.097 ms | 4000 |
+
+四种构建都重新跑过：CUDA OFF + ORT OFF 105/105，CUDA OFF + ORT CPU 125/125，CUDA ON + ORT CPU 156/156，CUDA ON + ORT GPU 166/166。Detection、Segmentation 和 RT-DETR 的原有测试包含在这些数字里。
+
+本阶段没有做分类 Recognizer、CUDA Top-K、多标签、center crop，也没有开始 Phase 6.3。

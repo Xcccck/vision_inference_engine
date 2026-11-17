@@ -1,6 +1,7 @@
 #include "vie/engine/inference_engine.hpp"
 
 #include "vie/backend/mock_backend.hpp"
+#include "vie/decoder/classification.hpp"
 #include "vie/decoder/detection.hpp"
 #include "vie/decoder/mock_decoder.hpp"
 #include "vie/decoder/rtdetr_cuda_decoder.hpp"
@@ -253,6 +254,8 @@ InferenceEngine::InferenceEngine() {
   decoders_.register_factory("yolov8_detect_raw", [] { return std::make_unique<YoloV8DetectionDecoder>(); });
   decoders_.register_factory("yolov8_seg_raw", [] { return std::make_unique<YoloV8SegmentationDecoder>(); });
   decoders_.register_factory("rtdetr_detection_raw", [] { return std::make_unique<RtdetrDetectionDecoder>(); });
+  decoders_.register_factory("classification_logits_raw",
+                             [] { return std::make_unique<ClassificationDecoder>(); });
 #if defined(VIE_HAS_ONNXRUNTIME)
   backends_.register_factory(BackendKind::OnnxRuntime,
                              [] { return std::make_unique<OnnxRuntimeBackend>(); });
@@ -363,6 +366,10 @@ DetectionBatch InferenceEngine::infer(const ImageInput& image, DetectionInferTim
     throw VieError(ErrorCode::Unsupported,
                    "task segmentation does not produce DetectionBatch; call infer_segmentation()");
   }
+  if (manifest_.task == TaskType::Classification) {
+    throw VieError(ErrorCode::Unsupported,
+                   "task classification does not produce DetectionBatch; call infer_classification()");
+  }
   const auto total_start = std::chrono::steady_clock::now();
   const PreprocessResult prepared = preprocess(image);
   const double preprocess_ms = elapsed_ms(total_start);
@@ -449,6 +456,82 @@ SegmentationBatch InferenceEngine::infer_segmentation(const ImageInput& image,
     timing->includes_sync = device_.device() == DeviceType::Cuda;
     timing->includes_h2d = false;
     timing->includes_mask_d2h = false;
+  }
+  return batch;
+}
+
+ClassificationBatch InferenceEngine::infer_classification(const ImageInput& image,
+                                                         const ClassificationRuntimeConfig& runtime,
+                                                         ClassificationInferTiming* timing) {
+  if (!loaded_ || backend_ == nullptr || decoder_ == nullptr) {
+    throw VieError(ErrorCode::InvalidArgument, "engine is not loaded");
+  }
+  if (manifest_.task != TaskType::Classification) {
+    throw VieError(ErrorCode::Unsupported, "infer_classification() requires task classification");
+  }
+  if (manifest_.decoder.protocol != "classification_logits_raw") {
+    throw VieError(ErrorCode::Unsupported,
+                   "infer_classification() requires decoder protocol classification_logits_raw");
+  }
+  if (!runtime.top_k.has_value()) {
+    throw VieError(ErrorCode::UnresolvedField, "classification top_k is unresolved");
+  }
+
+  const auto total_start = std::chrono::steady_clock::now();
+  const PreprocessResult prepared = preprocess(image);
+  const double preprocess_ms = elapsed_ms(total_start);
+  require_same_device(prepared.output, device_, "preprocess output");
+  BackendRequest request;
+  request.inputs.emplace(manifest_.input.name, prepared.output);
+  const auto execute_start = std::chrono::steady_clock::now();
+  const BackendOutput output = execute(request);
+  const double execute_ms = elapsed_ms(execute_start);
+
+  const std::string output_name = manifest_.classification.output_name;
+  const auto found = output.tensors.find(output_name);
+  if (found == output.tensors.end()) {
+    throw VieError(ErrorCode::InvalidArgument, "classification output '" + output_name + "' is missing");
+  }
+  require_same_device(found->second.tensor, device_, "backend output '" + output_name + "'");
+  Tensor logits = found->second.tensor;
+  const std::size_t output_bytes = logits.nbytes();
+  std::size_t d2h_bytes = 0;
+  double d2h_ms = 0;
+  if (logits.is_cuda()) {
+    const auto d2h_start = std::chrono::steady_clock::now();
+    logits = logits.to(DeviceContext(DeviceType::Cpu, 0));
+    d2h_ms = elapsed_ms(d2h_start);
+    d2h_bytes = output_bytes;
+  }
+
+  ClassificationDecodeRequest decoded;
+  decoded.output_name = output_name;
+  decoded.class_axis = manifest_.classification.class_axis.value_or(-1);
+  decoded.num_classes = manifest_.num_classes.value_or(0);
+  decoded.top_k = *runtime.top_k;
+  decoded.score_type = manifest_.classification.score_type;
+  decoded.class_names = manifest_.classification.class_names;
+  DecoderInput decoder_input;
+  decoder_input.outputs.emplace(output_name, std::move(logits));
+  const auto topk_start = std::chrono::steady_clock::now();
+  ClassificationBatch batch = decoder_->decode_classification(decoder_input, decoded, DeviceContext{});
+  const double topk_ms = elapsed_ms(topk_start);
+  if (!batch.results.empty()) {
+    batch.results[0].output_bytes = output_bytes;
+    batch.results[0].d2h_bytes = d2h_bytes;
+  }
+  if (timing != nullptr) {
+    timing->preprocess_ms = preprocess_ms;
+    timing->execute_ms = execute_ms;
+    timing->d2h_ms = d2h_ms;
+    timing->topk_ms = topk_ms;
+    timing->decode_ms = d2h_ms + topk_ms;
+    timing->total_ms = elapsed_ms(total_start);
+    timing->output_bytes = output_bytes;
+    timing->d2h_bytes = d2h_bytes;
+    timing->includes_sync = device_.device() == DeviceType::Cuda;
+    timing->includes_h2d = false;
+    timing->includes_d2h = d2h_bytes > 0;
   }
   return batch;
 }

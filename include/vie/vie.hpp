@@ -24,6 +24,7 @@
 #include "vie/recognizer/recognizer_registry.hpp"
 #include "vie/recognizer/yolov8_detect_recognizer.hpp"
 #include "vie/recognizer/yolov8_seg_recognizer.hpp"
+#include "vie/decoder/classification.hpp"
 #include "vie/decoder/detection.hpp"
 #include "vie/decoder/segmentation.hpp"
 #include "vie/decoder/rtdetr_cuda_decoder.hpp"

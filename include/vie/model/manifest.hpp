@@ -70,6 +70,18 @@ struct SegmentationDesc {
   std::optional<std::size_t> max_mask_bytes;
 };
 
+// Optional single-label classification head. Absent fields stay empty and are
+// not inferred from an output shape. Omitted from JSON when every field is unset
+// and the task is not classification.
+struct ClassificationDesc {
+  std::string output_name;
+  std::optional<int> class_axis;
+  // "logits" or "probabilities". Empty is unresolved. The first decoder only
+  // executes logits.
+  std::string score_type;
+  std::vector<std::string> class_names;
+};
+
 struct NmsDesc {
   std::optional<bool> enabled;
   std::optional<float> confidence_threshold;
@@ -96,6 +108,7 @@ class ModelManifest {
   DecoderDesc decoder;
   NmsDesc nms;
   SegmentationDesc segmentation;
+  ClassificationDesc classification;
   std::map<std::string, FieldProvenance> provenance;
 
   static ModelManifest from_json_string(std::string_view json_text);

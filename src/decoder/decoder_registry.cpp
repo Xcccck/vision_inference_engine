@@ -1,5 +1,8 @@
 #include "vie/decoder/decoder_registry.hpp"
 
+#include "vie/core/error.hpp"
+#include "vie/decoder/classification.hpp"
+
 #include <mutex>
 
 namespace vie {
@@ -11,6 +14,12 @@ DetectionBatch IModelDecoder::decode_batch(const DecoderInput&, const DecoderCon
 SegmentationBatch IModelDecoder::decode_segmentation(const DecoderInput&, const DecoderConfig&,
                                                      const DeviceContext&) const {
   throw VieError(ErrorCode::Unsupported, "this decoder does not produce instance segmentation");
+}
+
+ClassificationBatch IModelDecoder::decode_classification(const DecoderInput&,
+                                                         const ClassificationDecodeRequest&,
+                                                         const DeviceContext&) const {
+  throw VieError(ErrorCode::Unsupported, "this decoder does not produce classifications");
 }
 
 void DecoderRegistry::register_factory(std::string protocol, Factory factory) {
