@@ -10,6 +10,9 @@
 
 namespace vie {
 
+struct ClassificationBatch;
+struct ClassificationDecodeRequest;
+
 // Boxes are in the model's input coordinate space. The decoder does not run
 // NMS and does not map coordinates back to the original image.
 struct RawBox {
@@ -58,6 +61,12 @@ class IModelDecoder {
   // cannot be mistaken for a segmentation decoder.
   virtual SegmentationBatch decode_segmentation(const DecoderInput& input, const DecoderConfig& config,
                                                 const DeviceContext& device) const;
+
+  // Classification path. The default refuses so a detection or segmentation
+  // decoder cannot be mistaken for a classification decoder.
+  virtual ClassificationBatch decode_classification(const DecoderInput& input,
+                                                    const ClassificationDecodeRequest& request,
+                                                    const DeviceContext& device) const;
 };
 
 }  // namespace vie

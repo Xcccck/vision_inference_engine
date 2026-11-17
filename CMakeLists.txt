@@ -109,6 +109,7 @@ add_library(vie
   src/backend/backend_registry.cpp
   src/backend/mock_backend.cpp
   src/decoder/decoder_registry.cpp
+  src/decoder/classification_decoder.cpp
   src/decoder/mock_decoder.cpp
   src/decoder/segmentation.cpp
   src/decoder/detection_ops.cpp
@@ -189,6 +190,7 @@ if(VIE_BUILD_TESTS)
   find_package(GTest REQUIRED)
   add_executable(vie_tests
     tests/test_tensor.cpp
+    tests/test_classification.cpp
     tests/test_manifest.cpp
     tests/test_engine.cpp
     tests/test_engine_segmentation.cpp

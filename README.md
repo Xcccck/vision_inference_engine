@@ -43,7 +43,7 @@ Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`inte
 ## 已接通的路径
 
 - 模型格式：ONNX。Mock 只用于管线测试。
-- 任务：YOLOv8 Detection 和 Ultralytics RT-DETR Detection（都走 `infer`），以及 YOLOv8 Segmentation（`infer_segmentation`）。RT-DETR 在 CPU 和 CUDA 上各有一个 Decoder，按设备选择，不按 family 字符串分支。
+- 任务：YOLOv8 Detection 和 Ultralytics RT-DETR Detection（都走 `infer`），YOLOv8 Segmentation（`infer_segmentation`），以及单标签分类（`infer_classification`）。Decoder 按 Manifest 里的 protocol 选择，不按模型家族分支。RT-DETR 在 CPU 和 CUDA 上各有一个 Decoder，按设备选择。
 - Backend：构建打开 ONNX Runtime 时有 CPU EP；同时打开 CUDA 和 GPU 包时另有 CUDA EP。CUDA EP 默认禁止 CPU fallback。
 - 预处理和解码：CPU 始终可用；CUDA 只在 `VIE_ENABLE_CUDA` 时编译。
 
@@ -52,9 +52,10 @@ Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`inte
 - NMS 阈值的自动确定
 - TensorRT / PyTorch 解析
 - 图像文件解码
-- 姿态、OBB、分类
+- 姿态、OBB
+- 分类的 Recognizer、Softmax、多标签和 CUDA Top-K。`score_type=probabilities` 可以写入 Manifest，第一版 Decoder 返回 `Unsupported`
 - resize 模式 `crop`
-- 并发推理。`load`、`infer` 和 `infer_segmentation` 共用同一个 session，没有锁。重叠调用是数据竞争，库不会把它们串成队列。
+- 并发推理。`load`、`infer`、`infer_segmentation` 和 `infer_classification` 共用同一个 session，没有锁。重叠调用是数据竞争，库不会把它们串成队列。
 
 `device()` 只描述最近一次成功的 `load`。第一次 `load` 失败时 `loaded()` 仍为 false，`device()` 仍是默认的 CPU 上下文，这不是一次 CPU 推理。再次 `load` 失败不会拆掉已经成功的 session。
 
@@ -93,6 +94,20 @@ segmenter.load(segmentation);
 vie::SegmentationBatch segmented = segmenter.infer_segmentation(image, runtime);
 ```
 
-检测模型调用 `infer_segmentation`，或分割模型调用 `infer`，都返回 `Unsupported`。CUDA 推理要求 `ImageInput` 已经在同一块 GPU 上。
+检测模型调用 `infer_segmentation`，或分割模型调用 `infer`，都返回 `Unsupported`。分类模型调用 `infer` 同样返回 `Unsupported`。CUDA 推理要求 `ImageInput` 已经在同一块 GPU 上。
 
-`yolov8_seg_raw` 有 CPU 和 CUDA 解码。它按名称读取 `output0` 和 prototype，复用检测的置信度过滤、坐标映射和 NMS，并保留 prediction index 以收集 mask 系数。重建是 `M = a · P`，不再做 Sigmoid；二值规则必须显式写成 `M > 0`。`retina_masks=false` 时 mask 是模型输入尺寸，`true` 时是原图尺寸。CUDA 路径把 mask 留在 CUDA Tensor 上，失败时不会退回 CPU。Kernel 使用默认 stream，不是 `DeviceContext` 自己的 stream。缺 `retina_masks`、NMS 或 mask 内存预算时返回 `UnresolvedField`。`InferenceEngine::infer_segmentation()` 走这条路径；`infer()` 遇到分割 Manifest 返回 `Unsupported`。姿态、OBB、分类和 TensorRT 还没有实现。
+`classification_logits_raw` 只解码 rank-2 的 FP32 logits，按分数从高到低取 Top-K，分数相同则按 `class_id` 从小到大。它不执行 Softmax。CUDA EP 的输出仍在 CUDA 上，`infer_classification()` 把整条 logits 向量拷到 CPU 后再做 Top-K，这次拷贝计入 `d2h_bytes`。结果里的执行设备是 CPU。
+
+```cpp
+vie::ClassificationRuntimeConfig labels;
+labels.top_k = 5;
+vie::ModelConfig classification;
+classification.manifest = classification_manifest;  // task、classification 和预处理由调用者填写
+classification.model_path = "model.onnx";
+classification.device = vie::DeviceType::Cpu;
+vie::InferenceEngine classifier;
+classifier.load(classification);
+vie::ClassificationBatch ranked = classifier.infer_classification(image, labels);
+```
+
+`yolov8_seg_raw` 有 CPU 和 CUDA 解码。它按名称读取 `output0` 和 prototype，复用检测的置信度过滤、坐标映射和 NMS，并保留 prediction index 以收集 mask 系数。重建是 `M = a · P`，不再做 Sigmoid；二值规则必须显式写成 `M > 0`。`retina_masks=false` 时 mask 是模型输入尺寸，`true` 时是原图尺寸。CUDA 路径把 mask 留在 CUDA Tensor 上，失败时不会退回 CPU。Kernel 使用默认 stream，不是 `DeviceContext` 自己的 stream。缺 `retina_masks`、NMS 或 mask 内存预算时返回 `UnresolvedField`。`InferenceEngine::infer_segmentation()` 走这条路径；`infer()` 遇到分割 Manifest 返回 `Unsupported`。姿态、OBB 和 TensorRT 还没有实现。分类没有 Recognizer，输出 shape 也不会被当成 ImageNet。

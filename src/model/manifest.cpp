@@ -43,6 +43,17 @@ bool is_coefficient_activation(std::string_view text) { return text == "none"; }
 
 bool is_prototype_activation(std::string_view text) { return text == "model_output_features"; }
 
+bool is_classification_score_type(std::string_view text) {
+  return text == "logits" || text == "probabilities";
+}
+
+bool classification_active(const ModelManifest& manifest) {
+  const ClassificationDesc& classification = manifest.classification;
+  return manifest.task == TaskType::Classification || !classification.output_name.empty() ||
+         classification.class_axis.has_value() || !classification.score_type.empty() ||
+         !classification.class_names.empty();
+}
+
 bool segmentation_active(const ModelManifest& manifest) {
   const SegmentationDesc& segmentation = manifest.segmentation;
   return manifest.task == TaskType::Segmentation || segmentation.mask_channels.has_value() ||
@@ -372,6 +383,17 @@ json manifest_json(const ModelManifest& manifest) {
                                ? json(*manifest.segmentation.max_mask_bytes)
                                : json(nullptr)}};
   }
+  if (classification_active(manifest)) {
+    json names = json::array();
+    for (const std::string& name : manifest.classification.class_names) names.push_back(name);
+    document["classification"] = json{
+        {"output_name", string_or_null(manifest.classification.output_name)},
+        {"class_axis", manifest.classification.class_axis ? json(*manifest.classification.class_axis)
+                                                          : json(nullptr)},
+        {"score_type", string_or_null(manifest.classification.score_type)},
+        {"class_names",
+         manifest.classification.class_names.empty() ? json(nullptr) : json(std::move(names))}};
+  }
   return document;
 }
 
@@ -425,6 +447,28 @@ void read_segmentation(const json& value, SegmentationDesc& segmentation) {
   }
 }
 
+void read_classification(const json& value, ClassificationDesc& classification) {
+  if (!value.is_object()) schema_error("classification must be an object");
+  classification.output_name = read_free_string(value, "output_name", false);
+  if (value.contains("class_axis") && !value.at("class_axis").is_null()) {
+    if (!value.at("class_axis").is_number_integer()) schema_error("class_axis must be an integer");
+    const int axis = value.at("class_axis").get<int>();
+    if (axis < 0) schema_error("class_axis must be >= 0");
+    classification.class_axis = axis;
+  }
+  classification.score_type =
+      read_vocab(value, "score_type", is_classification_score_type, "logits, probabilities");
+  if (value.contains("class_names") && !value.at("class_names").is_null()) {
+    if (!value.at("class_names").is_array()) schema_error("class_names must be an array");
+    for (const auto& item : value.at("class_names")) {
+      if (!item.is_string() || item.get<std::string>().empty()) {
+        schema_error("class_names entries must be non-empty strings");
+      }
+      classification.class_names.push_back(item.get<std::string>());
+    }
+  }
+}
+
 }  // namespace
 
 std::vector<std::string> manifest_field_paths(const ModelManifest& manifest) {
@@ -470,6 +514,10 @@ std::vector<std::string> manifest_field_paths(const ModelManifest& manifest) {
                   "segmentation.has_objectness", "segmentation.class_names",
                   "segmentation.retina_masks", "segmentation.binary_mask_gt_zero",
                   "segmentation.max_mask_bytes"});
+  }
+  if (classification_active(manifest)) {
+    paths.insert(paths.end(), {"classification.output_name", "classification.class_axis",
+                               "classification.score_type", "classification.class_names"});
   }
   for (std::size_t i = 0; i < manifest.outputs.size(); ++i) {
     const std::string prefix = "outputs." + std::to_string(i) + ".";
@@ -544,6 +592,10 @@ bool field_is_set(const ModelManifest& manifest, std::string_view path) {
     return manifest.segmentation.binary_mask_gt_zero.has_value();
   }
   if (path == "segmentation.max_mask_bytes") return manifest.segmentation.max_mask_bytes.has_value();
+  if (path == "classification.output_name") return !manifest.classification.output_name.empty();
+  if (path == "classification.class_axis") return manifest.classification.class_axis.has_value();
+  if (path == "classification.score_type") return !manifest.classification.score_type.empty();
+  if (path == "classification.class_names") return !manifest.classification.class_names.empty();
 
   std::size_t index = 0;
   std::string field;
@@ -636,6 +688,9 @@ ModelManifest ModelManifest::from_json_string(std::string_view json_text) {
     }
     if (document.contains("segmentation") && !document.at("segmentation").is_null()) {
       read_segmentation(document.at("segmentation"), manifest.segmentation);
+    }
+    if (document.contains("classification") && !document.at("classification").is_null()) {
+      read_classification(document.at("classification"), manifest.classification);
     }
     if (document.contains("provenance") && !document.at("provenance").is_null()) {
       read_provenance(document.at("provenance"), manifest);

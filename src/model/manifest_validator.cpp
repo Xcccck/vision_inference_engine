@@ -216,6 +216,53 @@ ManifestValidation ManifestValidator::validate(const ModelManifest& manifest) co
     report.schema_issues.push_back(
         {"segmentation.class_names", "count does not match num_classes"});
   }
+  if (manifest.decoder.protocol == "classification_logits_raw") {
+    require("classification.output_name", !manifest.classification.output_name.empty(),
+            "classification output name is unresolved");
+    require("classification.class_axis", manifest.classification.class_axis.has_value(),
+            "classification class axis is unresolved");
+    require("classification.score_type", !manifest.classification.score_type.empty(),
+            "classification score type is unresolved");
+  }
+  if (manifest.classification.class_axis.has_value() && *manifest.classification.class_axis < 0) {
+    report.schema_issues.push_back({"classification.class_axis", "must be >= 0"});
+  }
+  if (!manifest.classification.score_type.empty() &&
+      manifest.classification.score_type != "logits" &&
+      manifest.classification.score_type != "probabilities") {
+    report.schema_issues.push_back({"classification.score_type", "unsupported score type"});
+  }
+  if (!manifest.classification.class_names.empty() && manifest.num_classes.has_value() &&
+      static_cast<int>(manifest.classification.class_names.size()) != *manifest.num_classes) {
+    report.schema_issues.push_back(
+        {"classification.class_names", "count does not match num_classes"});
+  }
+  if (!manifest.classification.output_name.empty()) {
+    const OutputDesc* named = nullptr;
+    for (const OutputDesc& output : manifest.outputs) {
+      if (output.name == manifest.classification.output_name) named = &output;
+    }
+    if (named == nullptr) {
+      report.schema_issues.push_back(
+          {"classification.output_name", "does not match an output"});
+    } else if (manifest.classification.class_axis.has_value() && !named->shape.empty() &&
+               is_concrete_shape(named->shape)) {
+      const int axis = *manifest.classification.class_axis;
+      if (named->shape.size() != 2) {
+        report.schema_issues.push_back(
+            {"classification.output_name", "classification output must be rank 2"});
+      } else if (axis > 1) {
+        report.schema_issues.push_back({"classification.class_axis", "is outside rank 2"});
+      } else if (manifest.num_classes.has_value() &&
+                 named->shape[static_cast<std::size_t>(axis)] != *manifest.num_classes) {
+        report.schema_issues.push_back(
+            {"classification.class_axis", "length does not match num_classes"});
+      } else if (named->shape[static_cast<std::size_t>(1 - axis)] != 1) {
+        report.schema_issues.push_back(
+            {"classification.class_axis", "the other dimension must be batch size 1"});
+      }
+    }
+  }
   return report;
 }
 
