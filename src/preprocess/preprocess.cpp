@@ -7,6 +7,8 @@
 #endif
 
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <sstream>
 
 namespace vie {
@@ -56,6 +58,8 @@ const char* to_string(ResizeMode mode) {
       return "stretch";
     case ResizeMode::Letterbox:
       return "letterbox";
+    case ResizeMode::ShortestSide:
+      return "shortest_side";
   }
   return "unknown";
 }
@@ -83,6 +87,25 @@ void validate_preprocess_config(const PreprocessConfig& config) {
   if (!std::isfinite(config.padding_value)) {
     throw VieError(ErrorCode::InvalidArgument, "padding_value must be finite");
   }
+  if (config.resize_mode == ResizeMode::ShortestSide) {
+    if (config.short_side < 1) {
+      throw VieError(ErrorCode::InvalidArgument, "short_side must be positive");
+    }
+    if (config.crop_width < 1 || config.crop_height < 1) {
+      throw VieError(ErrorCode::InvalidArgument, "center crop width and height must be positive");
+    }
+    if (config.crop_width > config.short_side || config.crop_height > config.short_side) {
+      throw VieError(ErrorCode::InvalidArgument,
+                     "center crop exceeds short_side, so it cannot fit the resized image");
+    }
+    if (config.target_width != config.crop_width || config.target_height != config.crop_height) {
+      throw VieError(ErrorCode::InvalidArgument,
+                     "shortest_side target size must equal the center crop");
+    }
+  } else if (config.short_side != 0 || config.crop_width != 0 || config.crop_height != 0) {
+    throw VieError(ErrorCode::InvalidArgument,
+                   "short_side and center crop apply only to resize mode shortest_side");
+  }
   if (!config.normalize_enabled) return;
   if (!std::isfinite(config.scale)) {
     throw VieError(ErrorCode::InvalidArgument, "normalize scale must be finite");
@@ -101,10 +124,26 @@ void validate_preprocess_config(const PreprocessConfig& config) {
   }
 }
 
+namespace {
+
+int round_half_away(int numerator, int multiplier, int denominator) {
+  const std::int64_t product =
+      static_cast<std::int64_t>(numerator) * static_cast<std::int64_t>(multiplier);
+  const std::int64_t denom = denominator;
+  const std::int64_t rounded = (product * 2 + denom) / (denom * 2);
+  if (rounded < 1 || rounded > static_cast<std::int64_t>(std::numeric_limits<int>::max())) {
+    throw VieError(ErrorCode::InvalidArgument, "resized image size is out of range");
+  }
+  return static_cast<int>(rounded);
+}
+
+}  // namespace
+
 GeometryTransform make_geometry(const PreprocessConfig& config, int source_width, int source_height) {
   if (source_width <= 0 || source_height <= 0) {
     throw VieError(ErrorCode::InvalidArgument, "image width and height must be positive");
   }
+  validate_preprocess_config(config);
   GeometryTransform geometry;
   geometry.original_width = source_width;
   geometry.original_height = source_height;
@@ -133,6 +172,38 @@ GeometryTransform make_geometry(const PreprocessConfig& config, int source_width
         static_cast<double>(config.target_height) / static_cast<double>(source_height);
     geometry.uniform_scale = 0;
     return geometry;
+  }
+
+  if (config.resize_mode == ResizeMode::ShortestSide) {
+    const int min_side = source_width < source_height ? source_width : source_height;
+    const double uniform = static_cast<double>(config.short_side) / static_cast<double>(min_side);
+    int resized_w = config.short_side;
+    int resized_h = config.short_side;
+    if (source_width < source_height) {
+      resized_h = round_half_away(source_height, config.short_side, source_width);
+    } else if (source_height < source_width) {
+      resized_w = round_half_away(source_width, config.short_side, source_height);
+    }
+    if (config.crop_width > resized_w || config.crop_height > resized_h) {
+      throw VieError(ErrorCode::InvalidArgument,
+                     "center crop is larger than the resized image");
+    }
+    geometry.resized_width = resized_w;
+    geometry.resized_height = resized_h;
+    geometry.output_width = config.crop_width;
+    geometry.output_height = config.crop_height;
+    geometry.uniform_scale = uniform;
+    geometry.scale_x = static_cast<double>(resized_w) / static_cast<double>(source_width);
+    geometry.scale_y = static_cast<double>(resized_h) / static_cast<double>(source_height);
+    const int extra_w = resized_w - config.crop_width;
+    const int extra_h = resized_h - config.crop_height;
+    geometry.crop_x = extra_w / 2;
+    geometry.crop_y = extra_h / 2;
+    return geometry;
+  }
+
+  if (config.resize_mode != ResizeMode::Letterbox) {
+    throw VieError(ErrorCode::InvalidArgument, "resize mode is not supported");
   }
 
   const double scale_w =
@@ -288,8 +359,19 @@ PreprocessConfig preprocess_config_from_manifest(const ModelManifest& manifest, 
     config.resize_mode = ResizeMode::Stretch;
   } else if (manifest.input.resize == "crop") {
     throw VieError(ErrorCode::Unsupported, "resize mode crop is not implemented");
+  } else if (manifest.input.resize == "shortest_side") {
+    require_resolved(manifest.input.short_side.has_value(), "input.short_side");
+    require_resolved(manifest.input.crop_width.has_value(), "input.crop_width");
+    require_resolved(manifest.input.crop_height.has_value(), "input.crop_height");
+    config.resize_mode = ResizeMode::ShortestSide;
+    config.short_side = *manifest.input.short_side;
+    config.crop_width = *manifest.input.crop_width;
+    config.crop_height = *manifest.input.crop_height;
+    if (config.target_width != config.crop_width || config.target_height != config.crop_height) {
+      throw VieError(ErrorCode::InvalidArgument, "input.shape does not match the center crop");
+    }
   } else {
-    throw VieError(ErrorCode::InvalidArgument, "input.resize is not letterbox or stretch");
+    throw VieError(ErrorCode::InvalidArgument, "input.resize is not letterbox, stretch, or shortest_side");
   }
 
   if (manifest.input.normalization == "none" || manifest.input.normalization == "scale_1_255") {
@@ -304,6 +386,14 @@ PreprocessConfig preprocess_config_from_manifest(const ModelManifest& manifest, 
     config.scale = 1.f / 255.f;
     config.mean = {0.485f, 0.456f, 0.406f};
     config.std = {0.229f, 0.224f, 0.225f};
+  } else if (manifest.input.normalization == "explicit") {
+    require_resolved(manifest.input.scale.has_value(), "input.scale");
+    require_resolved(manifest.input.mean.size() == 3, "input.mean");
+    require_resolved(manifest.input.std.size() == 3, "input.std");
+    config.normalize_enabled = true;
+    config.scale = *manifest.input.scale;
+    config.mean = manifest.input.mean;
+    config.std = manifest.input.std;
   } else {
     throw VieError(ErrorCode::UnresolvedField, "input.normalization is unresolved");
   }

@@ -131,12 +131,14 @@ bool map_box_to_original(BoundingBox& box, const GeometryTransform& geometry) {
     throw VieError(ErrorCode::InvalidArgument, "geometry scale or original size is invalid");
   }
   const auto map_x = [&](float value) {
-    return static_cast<float>((static_cast<double>(value) - static_cast<double>(geometry.pad_left)) /
-                              geometry.scale_x);
+    return static_cast<float>(
+        (static_cast<double>(value) - static_cast<double>(geometry_model_origin_x(geometry))) /
+        geometry.scale_x);
   };
   const auto map_y = [&](float value) {
-    return static_cast<float>((static_cast<double>(value) - static_cast<double>(geometry.pad_top)) /
-                              geometry.scale_y);
+    return static_cast<float>(
+        (static_cast<double>(value) - static_cast<double>(geometry_model_origin_y(geometry))) /
+        geometry.scale_y);
   };
   box.x1 = map_x(box.x1);
   box.x2 = map_x(box.x2);

@@ -121,11 +121,12 @@ std::size_t checked_numel(const std::vector<std::int64_t>& shape) {
 bool is_known_color(std::string_view text) { return text == "rgb" || text == "bgr"; }
 
 bool is_known_normalization(std::string_view text) {
-  return text == "scale_0_1" || text == "scale_1_255" || text == "imagenet" || text == "none";
+  return text == "scale_0_1" || text == "scale_1_255" || text == "imagenet" || text == "none" ||
+         text == "explicit";
 }
 
 bool is_known_resize(std::string_view text) {
-  return text == "letterbox" || text == "stretch" || text == "crop";
+  return text == "letterbox" || text == "stretch" || text == "crop" || text == "shortest_side";
 }
 
 bool is_known_box_format(std::string_view text) {

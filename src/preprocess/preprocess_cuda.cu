@@ -151,8 +151,9 @@ PreprocessResult preprocess_cuda(const PreprocessConfig& config, const ImageInpu
       config.input_color != config.output_color ? 1 : 0,
       config.interpolation == Interpolation::Nearest ? 1 : 0, config.normalize_enabled ? 1 : 0,
       config.scale, mean0, mean1, mean2, std0, std1, std2, config.padding_value, geometry.output_width,
-      geometry.output_height, geometry.resized_width, geometry.resized_height, geometry.pad_left,
-      geometry.pad_top, config.output_layout == ImageLayout::Chw ? 1 : 0,
+      geometry.output_height, geometry.resized_width, geometry.resized_height,
+      geometry_model_origin_x(geometry), geometry_model_origin_y(geometry),
+      config.output_layout == ImageLayout::Chw ? 1 : 0,
       config.output_dtype == DataType::Uint8 ? 1 : 0,
       config.output_dtype == DataType::Uint8 ? reinterpret_cast<std::uint8_t*>(output.device_data())
                                             : nullptr,

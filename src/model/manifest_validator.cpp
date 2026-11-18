@@ -90,6 +90,69 @@ ManifestValidation ManifestValidator::validate(const ModelManifest& manifest) co
   if (manifest.input.padding_value.has_value() && !std::isfinite(*manifest.input.padding_value)) {
     report.schema_issues.push_back({"input.padding_value", "must be finite"});
   }
+  const bool shortest = manifest.input.resize == "shortest_side";
+  const bool crop_fields = manifest.input.short_side.has_value() || manifest.input.crop_width.has_value() ||
+                           manifest.input.crop_height.has_value();
+  if (crop_fields && !shortest) {
+    report.schema_issues.push_back(
+        {"input.short_side", "short_side, crop_width, and crop_height require resize shortest_side"});
+  }
+  if (shortest) {
+    if (manifest.input.short_side.has_value() && *manifest.input.short_side < 1) {
+      report.schema_issues.push_back({"input.short_side", "must be positive"});
+    }
+    if (manifest.input.crop_width.has_value() && *manifest.input.crop_width < 1) {
+      report.schema_issues.push_back({"input.crop_width", "must be positive"});
+    }
+    if (manifest.input.crop_height.has_value() && *manifest.input.crop_height < 1) {
+      report.schema_issues.push_back({"input.crop_height", "must be positive"});
+    }
+    if (manifest.input.short_side.has_value() && manifest.input.crop_width.has_value() &&
+        manifest.input.crop_height.has_value() &&
+        (*manifest.input.crop_width > *manifest.input.short_side ||
+         *manifest.input.crop_height > *manifest.input.short_side)) {
+      report.schema_issues.push_back(
+          {"input.crop_width", "center crop exceeds short_side and cannot fit the resized image"});
+    }
+    if (manifest.input.crop_width.has_value() && manifest.input.crop_height.has_value() &&
+        is_concrete_shape(manifest.input.shape) && manifest.input.shape.size() == 4) {
+      const std::int64_t height = manifest.input.layout == Layout::Nhwc ? manifest.input.shape[1]
+                                                                        : manifest.input.shape[2];
+      const std::int64_t width = manifest.input.layout == Layout::Nhwc ? manifest.input.shape[2]
+                                                                       : manifest.input.shape[3];
+      if (height != *manifest.input.crop_height || width != *manifest.input.crop_width) {
+        report.schema_issues.push_back({"input.shape", "does not match the center crop"});
+      }
+    }
+  }
+  const bool explicit_norm = manifest.input.normalization == "explicit";
+  const bool norm_fields =
+      manifest.input.scale.has_value() || !manifest.input.mean.empty() || !manifest.input.std.empty();
+  if (norm_fields && !explicit_norm) {
+    report.schema_issues.push_back(
+        {"input.scale", "scale, mean, and std require normalization explicit"});
+  }
+  if (explicit_norm && manifest.input.scale.has_value() && !std::isfinite(*manifest.input.scale)) {
+    report.schema_issues.push_back({"input.scale", "must be finite"});
+  }
+  if (explicit_norm && !manifest.input.mean.empty() && manifest.input.mean.size() != 3) {
+    report.schema_issues.push_back({"input.mean", "must have 3 values"});
+  }
+  if (explicit_norm && !manifest.input.std.empty() && manifest.input.std.size() != 3) {
+    report.schema_issues.push_back({"input.std", "must have 3 values"});
+  }
+  if (explicit_norm) {
+    for (float value : manifest.input.mean) {
+      if (!std::isfinite(value)) report.schema_issues.push_back({"input.mean", "must be finite"});
+    }
+    for (float value : manifest.input.std) {
+      if (!std::isfinite(value)) {
+        report.schema_issues.push_back({"input.std", "must be finite"});
+      } else if (value == 0.f) {
+        report.schema_issues.push_back({"input.std", "must be non-zero"});
+      }
+    }
+  }
   if (!manifest.decoder.box_format.empty() && !is_known_box_format(manifest.decoder.box_format)) {
     report.schema_issues.push_back({"decoder.box_format", "unsupported box format"});
   }
@@ -150,6 +213,16 @@ ManifestValidation ManifestValidator::validate(const ModelManifest& manifest) co
   require("input.normalization", !manifest.input.normalization.empty(),
           "input normalization is unresolved");
   require("input.resize", !manifest.input.resize.empty(), "input resize is unresolved");
+  if (manifest.input.resize == "shortest_side") {
+    require("input.short_side", manifest.input.short_side.has_value(), "short_side is unresolved");
+    require("input.crop_width", manifest.input.crop_width.has_value(), "crop width is unresolved");
+    require("input.crop_height", manifest.input.crop_height.has_value(), "crop height is unresolved");
+  }
+  if (manifest.input.normalization == "explicit") {
+    require("input.scale", manifest.input.scale.has_value(), "normalize scale is unresolved");
+    require("input.mean", manifest.input.mean.size() == 3, "normalize mean is unresolved");
+    require("input.std", manifest.input.std.size() == 3, "normalize std is unresolved");
+  }
   shape_ready(manifest.input.shape, "input.shape", report.unresolved_critical);
 
   if (manifest.outputs.empty()) {

@@ -36,9 +36,9 @@ ctest --test-dir /home/workspace/vision_inference_engine/build --output-on-failu
 
 CUDA Backend 默认关闭 CPU EP fallback（`session.disable_cpu_ep_fallback=1`）。Session 能创建，表示 CUDA EP 接受了整张图。`set_cpu_ep_fallback(true)` 允许 ORT 把不支持的节点放到 CPU，这是混合执行，不是纯 GPU 执行。当前这份 YOLOv8n 在严格模式下无法创建 Session，因为 ORT 1.20.1 会把部分节点分给 CPU EP；要跑它必须显式打开 fallback。输入必须已经是连续的 CUDA Tensor，绑定借用它的设备指针。输出由 ORT 分配在 CUDA 上，再做一次 D2D 复制到 VIE 的 Storage。ORT 使用自己的 stream，返回前会同步。TensorRT 和 OpenCV 仍然没有实现。
 
-图像预处理是 `ImagePreprocessor`。`ImageInput` 只借用调用方的内存，并写明设备、布局、颜色、dtype 和行距。CPU 与 CUDA 使用同一采样公式：`source = (index + 0.5) * (source_size / resized_size) - 0.5`。最近邻是 `floor(source + 0.5)`，双线性复制边界。Letterbox 先取 `min(target/source)`，内容尺寸用 `round` 后再夹到目标内，余数用整数除法分到两侧。`scale_x` 和 `scale_y` 是取整后的比例，可以不相等。几何信息在 `GeometryTransform` 里，不放进 Tensor。
+图像预处理是 `ImagePreprocessor`。`ImageInput` 只借用调用方的内存，并写明设备、布局、颜色、dtype 和行距。CPU 与 CUDA 使用同一采样公式：`source = (index + 0.5) * (source_size / resized_size) - 0.5`。最近邻是 `floor(source + 0.5)`，双线性复制边界。Letterbox 先取 `min(target/source)`，内容尺寸用 `round` 后再夹到目标内，余数用整数除法分到两侧。`shortest_side` 把短边钉成 `short_side`，长边按一半远离 0 取整，再做中心裁剪；奇数余数分给右和下。`scale_x` 和 `scale_y` 是取整后的比例，可以不相等。几何信息在 `GeometryTransform` 里，不放进 Tensor。
 
-Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`interpolation` 和 `padding_value` 可以写入 manifest；缺了它们时，`preprocess()` 返回 `UnresolvedField`，已有的 Tensor `execute()` 不受影响。`crop` 仍是合法字段，但本阶段不执行。识别器不会因为模型是 YOLOv8 就填上 RGB、letterbox 或除以 255。CUDA 预处理只在 `VIE_ENABLE_CUDA` 时编译；输入必须已经在同一块 GPU 上，返回前 `cudaDeviceSynchronize`。
+Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`interpolation` 和 `padding_value` 可以写入 manifest；缺了它们时，`preprocess()` 返回 `UnresolvedField`，已有的 Tensor `execute()` 不受影响。`resize=shortest_side` 还要 `short_side`、`crop_width`、`crop_height`，模型输入 shape 是裁剪后的尺寸。`normalization=explicit` 使用调用者给出的 `scale`、`mean`、`std`。旧词 `crop` 仍不执行。识别器不会因为模型是 YOLOv8 或 ResNet 就填上 RGB、letterbox、短边或 mean/std。CUDA 预处理只在 `VIE_ENABLE_CUDA` 时编译；输入必须已经在同一块 GPU 上，返回前 `cudaDeviceSynchronize`。
 
 ## 已接通的路径
 
@@ -102,7 +102,7 @@ vie::SegmentationBatch segmented = segmenter.infer_segmentation(image, runtime);
 vie::ClassificationRuntimeConfig labels;
 labels.top_k = 5;
 vie::ModelConfig classification;
-classification.manifest = classification_manifest;  // 识别器可填 task、protocol 和 classification；颜色、resize、类别名仍由调用者填写
+classification.manifest = classification_manifest;  // 识别器可填 task、protocol 和 classification；颜色、resize、short_side、crop、mean/std 仍由调用者填写
 classification.model_path = "model.onnx";
 classification.device = vie::DeviceType::Cpu;
 vie::InferenceEngine classifier;

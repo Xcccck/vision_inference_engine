@@ -95,14 +95,17 @@ PreprocessResult preprocess_cpu(const PreprocessConfig& config, const ImageInput
 
   for (int y = 0; y < geometry.output_height; ++y) {
     for (int x = 0; x < geometry.output_width; ++x) {
-      const bool inside = x >= geometry.pad_left && y >= geometry.pad_top &&
-                          x < geometry.pad_left + geometry.resized_width &&
-                          y < geometry.pad_top + geometry.resized_height;
+      const int origin_x = geometry_model_origin_x(geometry);
+      const int origin_y = geometry_model_origin_y(geometry);
+      const int content_x = x - origin_x;
+      const int content_y = y - origin_y;
+      const bool inside = content_x >= 0 && content_y >= 0 && content_x < geometry.resized_width &&
+                          content_y < geometry.resized_height;
       float src_x = 0.f;
       float src_y = 0.f;
       if (inside) {
-        src_x = source_coordinate(x - geometry.pad_left, image.width, geometry.resized_width);
-        src_y = source_coordinate(y - geometry.pad_top, image.height, geometry.resized_height);
+        src_x = source_coordinate(content_x, image.width, geometry.resized_width);
+        src_y = source_coordinate(content_y, image.height, geometry.resized_height);
       }
       for (int c = 0; c < 3; ++c) {
         float value = config.padding_value;

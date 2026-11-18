@@ -25,6 +25,16 @@ struct InputDesc {
   // Optional letterbox border sample, in the same numeric space as the image
   // before normalization. Unset does not block tensor execute.
   std::optional<float> padding_value;
+  // Shortest-side resize followed by center crop. Unset unless resize is
+  // "shortest_side". The model input shape is the crop, not the short side.
+  std::optional<int> short_side;
+  std::optional<int> crop_width;
+  std::optional<int> crop_height;
+  // Used only when normalization is "explicit": y = (x * scale - mean) / std.
+  // Named normalization tokens do not read these fields.
+  std::optional<float> scale;
+  std::vector<float> mean;
+  std::vector<float> std;
 };
 
 struct OutputDesc {

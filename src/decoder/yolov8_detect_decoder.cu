@@ -351,7 +351,8 @@ CudaDetectionPass decode_yolov8_cuda_pass(const Tensor& tensor, const DecoderCon
   cuda_check(cudaMemset(kept_counter.data, 0, sizeof(int)), "cudaMemset");
   int mapped_count = 0;
   if (top > 0) {
-    map_compact_kernel<<<1, 1>>>(static_cast<GpuCandidate*>(candidates.data), top, geometry.pad_left, geometry.pad_top,
+    map_compact_kernel<<<1, 1>>>(static_cast<GpuCandidate*>(candidates.data), top,
+                                 geometry_model_origin_x(geometry), geometry_model_origin_y(geometry),
                                  geometry.scale_x, geometry.scale_y, static_cast<float>(geometry.original_width),
                                  static_cast<float>(geometry.original_height), static_cast<GpuCandidate*>(mapped.data),
                                  static_cast<int*>(kept_counter.data));
