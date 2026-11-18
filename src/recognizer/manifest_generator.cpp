@@ -306,6 +306,44 @@ ModelManifest ManifestGenerator::generate(const ModelAnalysisReport& report,
       put(manifest, "outputs.0.semantic", Certainty::Inferred, because);
     }
   }
+  if (selected != nullptr && selected->architecture == "single_label_classification") {
+    const std::string because = joined_evidence(*selected);
+    if (!selected->family.empty()) {
+      manifest.model_family = selected->family;
+      put(manifest, "model_family", Certainty::Inferred, because);
+    }
+    manifest.task = TaskType::Classification;
+    put(manifest, "task", Certainty::Inferred, because);
+    if (selected->decoder.num_classes.has_value()) {
+      manifest.num_classes = selected->decoder.num_classes;
+      put(manifest, "num_classes", Certainty::Inferred, because);
+    }
+    if (manifest.input.shape.size() == 4 && manifest.input.shape[1] == 3) {
+      manifest.input.layout = Layout::Nchw;
+      put(manifest, "input.layout", Certainty::Inferred,
+          "declared input axis 1 is static 3");
+    }
+    manifest.decoder.protocol = selected->decoder.protocol;
+    put(manifest, "decoder.protocol", Certainty::Inferred, because);
+    if (!selected->decoder.output_name.empty()) {
+      manifest.classification.output_name = selected->decoder.output_name;
+      put(manifest, "classification.output_name", Certainty::Observed, "declared output name");
+    }
+    if (selected->decoder.class_axis.has_value()) {
+      manifest.classification.class_axis = selected->decoder.class_axis;
+      put(manifest, "classification.class_axis", Certainty::Inferred, because);
+    }
+    if (!selected->decoder.score_type.empty()) {
+      manifest.classification.score_type = selected->decoder.score_type;
+      put(manifest, "classification.score_type", Certainty::Inferred, because);
+    }
+    for (std::size_t index = 0; index < manifest.outputs.size(); ++index) {
+      if (manifest.outputs[index].name == selected->decoder.output_name) {
+        manifest.outputs[index].semantic = "logits";
+        put(manifest, "outputs." + std::to_string(index) + ".semantic", Certainty::Inferred, because);
+      }
+    }
+  }
 
   manifest.ensure_provenance();
   return manifest;

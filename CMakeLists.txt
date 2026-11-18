@@ -126,6 +126,7 @@ add_library(vie
   src/recognizer/yolov8_detect_recognizer.cpp
   src/recognizer/yolov8_seg_recognizer.cpp
   src/recognizer/rtdetr_recognizer.cpp
+  src/recognizer/classification_recognizer.cpp
   src/recognizer/manifest_generator.cpp
   src/preprocess/preprocess.cpp
   src/preprocess/preprocess_cpu.cpp
@@ -197,6 +198,7 @@ if(VIE_BUILD_TESTS)
     tests/test_integration_regression.cpp
     tests/test_onnx_analyzer.cpp
     tests/test_recognizer.cpp
+    tests/test_classification_recognizer.cpp
     tests/test_yolov8_seg_recognizer.cpp
     tests/test_rtdetr_recognizer.cpp
     tests/test_rtdetr_decoder.cpp
