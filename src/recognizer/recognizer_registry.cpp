@@ -1,5 +1,6 @@
 #include "vie/recognizer/recognizer_registry.hpp"
 
+#include "vie/recognizer/classification_recognizer.hpp"
 #include "vie/recognizer/rtdetr_recognizer.hpp"
 #include "vie/recognizer/yolov8_detect_recognizer.hpp"
 #include "vie/recognizer/yolov8_seg_recognizer.hpp"
@@ -46,10 +47,12 @@ RecognitionResult ModelRecognizerRegistry::recognize(const ModelAnalysisReport& 
   bool saw_detection = false;
   bool saw_segmentation = false;
   bool saw_rtdetr = false;
+  bool saw_classification = false;
   for (const RecognitionCandidate& candidate : matched) {
     if (candidate.architecture == "yolov8_detection") saw_detection = true;
     if (candidate.architecture == "yolov8_segmentation") saw_segmentation = true;
     if (candidate.architecture == "rtdetr_detection") saw_rtdetr = true;
+    if (candidate.architecture == "single_label_classification") saw_classification = true;
   }
   result.candidates = std::move(matched);
   if (saw_detection && saw_segmentation) {
@@ -61,6 +64,11 @@ RecognitionResult ModelRecognizerRegistry::recognize(const ModelAnalysisReport& 
   if (saw_rtdetr && (saw_detection || saw_segmentation)) {
     result.status = RecognitionStatus::Ambiguous;
     result.explanation = "RT-DETR and YOLOv8 recognizers both accepted this graph";
+    return result;
+  }
+  if (saw_classification && (saw_detection || saw_segmentation || saw_rtdetr)) {
+    result.status = RecognitionStatus::Ambiguous;
+    result.explanation = "classification and another task recognizer both accepted this graph";
     return result;
   }
   if (tied > 1) {
@@ -79,6 +87,7 @@ ModelRecognizerRegistry default_recognizer_registry() {
   registry.add(std::make_unique<YoloV8DetectRecognizer>());
   registry.add(std::make_unique<YoloV8SegRecognizer>());
   registry.add(std::make_unique<RtdetrRecognizer>());
+  registry.add(std::make_unique<ClassificationRecognizer>());
   return registry;
 }
 

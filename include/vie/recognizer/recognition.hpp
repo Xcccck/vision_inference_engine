@@ -40,6 +40,9 @@ struct DecoderCandidate {
   std::string mask_coefficient_activation;
   std::string prototype_activation;
   std::optional<bool> has_objectness;
+  // Classification only. Unset for detection and segmentation candidates.
+  std::optional<int> class_axis;
+  std::string score_type;
 };
 
 struct RecognitionCandidate {

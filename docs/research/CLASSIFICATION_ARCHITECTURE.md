@@ -360,3 +360,44 @@ CPU EP 的 logits 留在 CPU 上，`d2h_bytes` 为 0。严格 CUDA EP 先得到 
 四种构建都重新跑过：CUDA OFF + ORT OFF 105/105，CUDA OFF + ORT CPU 125/125，CUDA ON + ORT CPU 156/156，CUDA ON + ORT GPU 166/166。Detection、Segmentation 和 RT-DETR 的原有测试包含在这些数字里。
 
 本阶段没有做分类 Recognizer、CUDA Top-K、多标签、center crop，也没有开始 Phase 6.3。
+
+## 16. Phase 6.3 实现记录
+
+`ClassificationRecognizer` 的 id 是 `classification_logits`，architecture 是 `single_label_classification`。它只读 `ModelAnalysisReport`。文件名、路径、框架和推理结果都不参与。
+
+全部成立才接受：
+
+- 一个 FP32 运行时输入，一个 FP32 输出。
+- 输出声明为 rank 2。类别轴是最后一维，静态且不小于 2。另一维是静态 1、符号 batch，或未命名动态轴。两个维度都是不小于 2 的静态数时不识别。类别轴在前面的布局这一版不识别，因为 Gemm 的行维不能从权重形状证明。
+- 从输出往回，只经过 Identity、Flatten、Reshape、Squeeze、Unsqueeze、Dropout、Cast、Transpose，可以有一次与 initializer 相加的 bias，然后必须是 Gemm 或 MatMul。
+- 权重是第二个输入上的 initializer。Gemm 按 `transB` 取列数 N，MatMul 取权重最后一维。N 必须等于输出类别数。
+- 线性层的数据输入只经过上述直通算子就能到达 `GlobalAveragePool` 或 `GlobalMaxPool`。
+- 这条路径上没有 Softmax、Sigmoid、LpNormalization 或其他改变输出语义的算子。
+
+`ReduceMean` 的 axes 是整数列表，当前报告只保存标量整数属性，所以这一版不把 ReduceMean 当成全局池化。
+
+Evidence 都来自上面的图结构，没有数值 confidence：
+
+| code | 来源 |
+|---|---|
+| `single_runtime_input` | 运行时输入的名字、dtype、声明 shape |
+| `single_output` | 输出的名字、dtype、声明 shape |
+| `rank2_output` | 声明 rank 与 shape |
+| `class_dimension` | 最后一维的静态长度 |
+| `batch_dimension` | 另一维是 1、符号或动态 |
+| `linear_classification_head` | Gemm/MatMul 权重名、shape、`transB` |
+| `global_pool_path` | 全局池化输出名和中间直通算子 |
+| `logits_output` | 线性头到图输出之间没有激活 |
+| `single_label_output` | 图只声明这一个输出 |
+
+图里有 `Conv` 时 family 写成 `cnn_classifier`。没有 Conv 时 family 留空。不写 ResNet，也不因为类别数是 1000 写 ImageNet。
+
+ManifestGenerator 在识别成功后填写 task、protocol `classification_logits_raw`、`num_classes`、`classification.output_name`、`classification.class_axis`、`classification.score_type=logits`。输入最后一维以外的轴 1 为静态 3 时，layout 记为 NCHW。颜色、归一化、resize、interpolation 和 `class_names` 保持未填写。生成的 Manifest 因此 schema 合法，但在调用者补上预处理之前不能 `infer_classification()`。
+
+Registry 在分类候选和 Detection、Segmentation 或 RT-DETR 候选同时出现时返回 Ambiguous，不按 Evidence 条数让分类获胜。
+
+负向 fixture 保持 Unknown：只有全局池化、Gemm 不经过池化、MatMul 不经过池化、类别数小于 2、rank 不是 2、Softmax、Sigmoid、LpNormalization、多输入、多输出。YOLOv8 Detection、YOLOv8 Segmentation、RT-DETR 仍由原来的识别器选中，生成的 JSON 没有 `classification` 键。
+
+`/tmp/resnet50_untrained_static.onnx` 被识别为 `cnn_classifier`，输出 `logits`，类别轴 1，1000 类，`score_type=logits`。测试在生成结果之外补了 stretch 和 `scale_0_1`，再调用 `infer_classification()`。这不是自动预处理，也不是 ImageNet 预测。CPU EP 的 `d2h_bytes` 为 0，严格 CUDA EP 为 4000。
+
+没有实现 center crop、类别名、Softmax Decoder、多标签和 CUDA Top-K。没有开始 Phase 6.4。

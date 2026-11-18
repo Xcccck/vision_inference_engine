@@ -53,7 +53,7 @@ Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`inte
 - TensorRT / PyTorch 解析
 - 图像文件解码
 - 姿态、OBB
-- 分类的 Recognizer、Softmax、多标签和 CUDA Top-K。`score_type=probabilities` 可以写入 Manifest，第一版 Decoder 返回 `Unsupported`
+- Softmax、多标签和 CUDA Top-K。`score_type=probabilities` 可以写入 Manifest，第一版 Decoder 返回 `Unsupported`
 - resize 模式 `crop`
 - 并发推理。`load`、`infer`、`infer_segmentation` 和 `infer_classification` 共用同一个 session，没有锁。重叠调用是数据竞争，库不会把它们串成队列。
 
@@ -102,7 +102,7 @@ vie::SegmentationBatch segmented = segmenter.infer_segmentation(image, runtime);
 vie::ClassificationRuntimeConfig labels;
 labels.top_k = 5;
 vie::ModelConfig classification;
-classification.manifest = classification_manifest;  // task、classification 和预处理由调用者填写
+classification.manifest = classification_manifest;  // 识别器可填 task、protocol 和 classification；颜色、resize、类别名仍由调用者填写
 classification.model_path = "model.onnx";
 classification.device = vie::DeviceType::Cpu;
 vie::InferenceEngine classifier;
@@ -110,4 +110,4 @@ classifier.load(classification);
 vie::ClassificationBatch ranked = classifier.infer_classification(image, labels);
 ```
 
-`yolov8_seg_raw` 有 CPU 和 CUDA 解码。它按名称读取 `output0` 和 prototype，复用检测的置信度过滤、坐标映射和 NMS，并保留 prediction index 以收集 mask 系数。重建是 `M = a · P`，不再做 Sigmoid；二值规则必须显式写成 `M > 0`。`retina_masks=false` 时 mask 是模型输入尺寸，`true` 时是原图尺寸。CUDA 路径把 mask 留在 CUDA Tensor 上，失败时不会退回 CPU。Kernel 使用默认 stream，不是 `DeviceContext` 自己的 stream。缺 `retina_masks`、NMS 或 mask 内存预算时返回 `UnresolvedField`。`InferenceEngine::infer_segmentation()` 走这条路径；`infer()` 遇到分割 Manifest 返回 `Unsupported`。姿态、OBB 和 TensorRT 还没有实现。分类没有 Recognizer，输出 shape 也不会被当成 ImageNet。
+`yolov8_seg_raw` 有 CPU 和 CUDA 解码。它按名称读取 `output0` 和 prototype，复用检测的置信度过滤、坐标映射和 NMS，并保留 prediction index 以收集 mask 系数。重建是 `M = a · P`，不再做 Sigmoid；二值规则必须显式写成 `M > 0`。`retina_masks=false` 时 mask 是模型输入尺寸，`true` 时是原图尺寸。CUDA 路径把 mask 留在 CUDA Tensor 上，失败时不会退回 CPU。Kernel 使用默认 stream，不是 `DeviceContext` 自己的 stream。缺 `retina_masks`、NMS 或 mask 内存预算时返回 `UnresolvedField`。`InferenceEngine::infer_segmentation()` 走这条路径；`infer()` 遇到分割 Manifest 返回 `Unsupported`。姿态、OBB 和 TensorRT 还没有实现。分类识别只接受全局池化后的单个 logits 头，不填写颜色、resize、归一化或类别名，也不把 1000 维当成 ImageNet。

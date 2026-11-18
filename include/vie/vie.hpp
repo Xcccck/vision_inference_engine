@@ -18,6 +18,7 @@
 #include "vie/model/manifest.hpp"
 #include "vie/model/manifest_validator.hpp"
 #include "vie/model/model_config.hpp"
+#include "vie/recognizer/classification_recognizer.hpp"
 #include "vie/recognizer/manifest_generator.hpp"
 #include "vie/recognizer/model_recognizer.hpp"
 #include "vie/recognizer/recognition.hpp"
