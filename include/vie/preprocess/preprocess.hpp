@@ -11,9 +11,12 @@ namespace vie {
 // Model-independent geometry. scale_x and scale_y are the ratios after integer
 // rounding of the resized content box, so a letterbox of a non-square image
 // can have scale_x != scale_y. uniform_scale is the ratio chosen before that
-// rounding. Decoder mapping is:
-//   x_original = (x_model - pad_left) / scale_x
-//   y_original = (y_model - pad_top) / scale_y
+// rounding. Letterbox stores the border in pad_*. Shortest-side center crop
+// stores the window origin in crop_*; its pads stay 0 and resized_* is the
+// image before the crop. Both modes use one origin:
+//   origin_x = pad_left - crop_x
+//   x_original = (x_model - origin_x) / scale_x
+//   x_model = x_original * scale_x + origin_x
 struct GeometryTransform {
   int original_width = 0;
   int original_height = 0;
@@ -28,8 +31,18 @@ struct GeometryTransform {
   int pad_top = 0;
   int pad_right = 0;
   int pad_bottom = 0;
+  int crop_x = 0;
+  int crop_y = 0;
   ResizeMode resize_mode = ResizeMode::None;
 };
+
+inline int geometry_model_origin_x(const GeometryTransform& geometry) {
+  return geometry.pad_left - geometry.crop_x;
+}
+
+inline int geometry_model_origin_y(const GeometryTransform& geometry) {
+  return geometry.pad_top - geometry.crop_y;
+}
 
 struct PreprocessResult {
   Tensor output;
@@ -41,11 +54,18 @@ struct PreprocessResult {
 
 // Sampling convention, shared by CPU and CUDA:
 // source = (content_index + 0.5) * (source_size / resized_size) - 0.5
-// Nearest uses floor(source + 0.5). Bilinear uses floor and replicates edges.
+// Nearest uses floor(source + 0.5), with halves rounding away from zero.
+// Bilinear uses floor and replicates edges. This is the half-pixel convention.
+// It is not the torchvision or PIL bilinear kernel.
 // Letterbox content size is round(source * uniform_scale), then clamped so it
 // still fits the target. Leftover pixels are split with integer division:
 // pad_left = pad / 2, pad_right = pad - pad_left. Stretch has no single ratio,
 // so its uniform_scale is 0 and only scale_x and scale_y are meaningful.
+// Shortest-side resize pins the short edge to short_side. The long edge is
+// round-half-away-from-zero of long * short_side / short, computed in integer
+// arithmetic. Center crop then keeps crop_width by crop_height. An odd leftover
+// gives the extra pixel to the right and to the bottom:
+// crop_x = (resized_width - crop_width) / 2.
 GeometryTransform make_geometry(const PreprocessConfig& config, int source_width, int source_height);
 
 class ImagePreprocessor {

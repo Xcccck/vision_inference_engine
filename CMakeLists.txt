@@ -203,6 +203,7 @@ if(VIE_BUILD_TESTS)
     tests/test_rtdetr_recognizer.cpp
     tests/test_rtdetr_decoder.cpp
     tests/test_preprocess.cpp
+    tests/test_preprocess_resize_crop.cpp
     tests/test_decoder.cpp
     tests/test_segmentation.cpp
     tests/test_yolov8_seg.cpp

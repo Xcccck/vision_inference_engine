@@ -6,7 +6,7 @@
 
 namespace vie {
 
-enum class ResizeMode { None, Stretch, Letterbox };
+enum class ResizeMode { None, Stretch, Letterbox, ShortestSide };
 
 enum class Interpolation { Nearest, Bilinear };
 
@@ -29,6 +29,13 @@ struct PreprocessConfig {
   std::vector<float> mean;
   std::vector<float> std;
   float padding_value = 0.f;
+  // ShortestSide only. The short edge is pinned to short_side, the long edge
+  // is rounded, then a center crop of crop_width by crop_height is taken.
+  // target_width and target_height must equal that crop. Other modes keep
+  // these at 0.
+  int short_side = 0;
+  int crop_width = 0;
+  int crop_height = 0;
 };
 
 const char* to_string(ResizeMode mode);

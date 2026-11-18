@@ -177,7 +177,8 @@ RtdetrCudaLaunch launch_rtdetr_cuda(const float* data, int queries, int num_clas
   const int blocks = (queries + threads - 1) / threads;
   decode_queries<<<blocks, threads, 0, stream>>>(
       data, queries, num_classes, threshold, static_cast<float>(geometry.output_width),
-      static_cast<float>(geometry.output_height), geometry.pad_left, geometry.pad_top, geometry.scale_x,
+      static_cast<float>(geometry.output_height), geometry_model_origin_x(geometry),
+      geometry_model_origin_y(geometry), geometry.scale_x,
       geometry.scale_y, static_cast<float>(geometry.original_width), static_cast<float>(geometry.original_height),
       static_cast<GpuKept*>(kept.data), static_cast<Counters*>(counters_buf.data));
   cuda_check(cudaGetLastError(), "rtdetr decode kernel");

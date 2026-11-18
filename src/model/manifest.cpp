@@ -155,8 +155,8 @@ void read_input(const json& value, InputDesc& input) {
   input.layout = read_enum(value, "layout", layout_from_string, Layout::Unknown);
   input.color = read_vocab(value, "color", is_known_color, "rgb, bgr");
   input.normalization = read_vocab(value, "normalization", is_known_normalization,
-                                   "scale_0_1, scale_1_255, imagenet, none");
-  input.resize = read_vocab(value, "resize", is_known_resize, "letterbox, stretch, crop");
+                                   "scale_0_1, scale_1_255, imagenet, none, explicit");
+  input.resize = read_vocab(value, "resize", is_known_resize, "letterbox, stretch, crop, shortest_side");
   input.interpolation =
       read_vocab(value, "interpolation",
                  [](std::string_view text) { return text == "nearest" || text == "bilinear"; },
@@ -167,6 +167,34 @@ void read_input(const json& value, InputDesc& input) {
     if (!std::isfinite(number)) schema_error("padding_value must be finite");
     input.padding_value = number;
   }
+  auto read_positive_int = [&](const char* key, std::optional<int>& slot) {
+    if (!value.contains(key) || value.at(key).is_null()) return;
+    if (!value.at(key).is_number_integer()) schema_error(std::string(key) + " must be an integer");
+    const int number = value.at(key).get<int>();
+    if (number < 1) schema_error(std::string(key) + " must be positive");
+    slot = number;
+  };
+  read_positive_int("short_side", input.short_side);
+  read_positive_int("crop_width", input.crop_width);
+  read_positive_int("crop_height", input.crop_height);
+  if (value.contains("scale") && !value.at("scale").is_null()) {
+    if (!value.at("scale").is_number()) schema_error("scale must be a number");
+    const float number = value.at("scale").get<float>();
+    if (!std::isfinite(number)) schema_error("scale must be finite");
+    input.scale = number;
+  }
+  auto read_channels = [&](const char* key, std::vector<float>& slot) {
+    if (!value.contains(key) || value.at(key).is_null()) return;
+    if (!value.at(key).is_array()) schema_error(std::string(key) + " must be an array");
+    for (const auto& item : value.at(key)) {
+      if (!item.is_number()) schema_error(std::string(key) + " entries must be numbers");
+      const float number = item.get<float>();
+      if (!std::isfinite(number)) schema_error(std::string(key) + " entries must be finite");
+      slot.push_back(number);
+    }
+  };
+  read_channels("mean", input.mean);
+  read_channels("std", input.std);
 }
 
 OutputDesc read_output(const json& value, std::size_t index) {
@@ -351,6 +379,12 @@ json manifest_json(const ModelManifest& manifest) {
                    {"pre_nms_top_k", manifest.nms.pre_nms_top_k ? json(*manifest.nms.pre_nms_top_k) : json(nullptr)},
                    {"class_aware", manifest.nms.class_aware ? json(*manifest.nms.class_aware) : json(nullptr)}}},
       {"provenance", std::move(provenance)}};
+  if (manifest.input.short_side.has_value()) document["input"]["short_side"] = *manifest.input.short_side;
+  if (manifest.input.crop_width.has_value()) document["input"]["crop_width"] = *manifest.input.crop_width;
+  if (manifest.input.crop_height.has_value()) document["input"]["crop_height"] = *manifest.input.crop_height;
+  if (manifest.input.scale.has_value()) document["input"]["scale"] = *manifest.input.scale;
+  if (!manifest.input.mean.empty()) document["input"]["mean"] = manifest.input.mean;
+  if (!manifest.input.std.empty()) document["input"]["std"] = manifest.input.std;
   if (segmentation_active(manifest)) {
     json names = json::array();
     for (const std::string& name : manifest.segmentation.class_names) names.push_back(name);
@@ -504,6 +538,12 @@ std::vector<std::string> manifest_field_paths(const ModelManifest& manifest) {
       "nms.pre_nms_top_k",
       "nms.class_aware",
   };
+  if (manifest.input.short_side.has_value()) paths.push_back("input.short_side");
+  if (manifest.input.crop_width.has_value()) paths.push_back("input.crop_width");
+  if (manifest.input.crop_height.has_value()) paths.push_back("input.crop_height");
+  if (manifest.input.scale.has_value()) paths.push_back("input.scale");
+  if (!manifest.input.mean.empty()) paths.push_back("input.mean");
+  if (!manifest.input.std.empty()) paths.push_back("input.std");
   if (manifest.decoder.num_queries.has_value()) paths.push_back("decoder.num_queries");
   if (segmentation_active(manifest)) {
     paths.insert(paths.end(),
@@ -554,6 +594,12 @@ bool field_is_set(const ModelManifest& manifest, std::string_view path) {
   if (path == "input.resize") return !manifest.input.resize.empty();
   if (path == "input.interpolation") return !manifest.input.interpolation.empty();
   if (path == "input.padding_value") return manifest.input.padding_value.has_value();
+  if (path == "input.short_side") return manifest.input.short_side.has_value();
+  if (path == "input.crop_width") return manifest.input.crop_width.has_value();
+  if (path == "input.crop_height") return manifest.input.crop_height.has_value();
+  if (path == "input.scale") return manifest.input.scale.has_value();
+  if (path == "input.mean") return !manifest.input.mean.empty();
+  if (path == "input.std") return !manifest.input.std.empty();
   if (path == "decoder.protocol") return !manifest.decoder.protocol.empty();
   if (path == "decoder.box_format") return !manifest.decoder.box_format.empty();
   if (path == "decoder.box_decode") return !manifest.decoder.box_decode.empty();

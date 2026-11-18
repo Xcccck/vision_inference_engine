@@ -284,12 +284,12 @@ SegmentationBatch YoloV8SegmentationDecoder::decode_timed(const DecoderInput& in
     } else {
       const auto resize_start = std::chrono::steady_clock::now();
       for (int y = 0; y < mask_h; ++y) {
-        const double src_y = (static_cast<double>(geometry.pad_top) +
+        const double src_y = (static_cast<double>(geometry_model_origin_y(geometry)) +
                               (static_cast<double>(y) + 0.5) * geometry.scale_y) *
                                  proto_per_model_y -
                              0.5;
         for (int x = 0; x < mask_w; ++x) {
-          const double src_x = (static_cast<double>(geometry.pad_left) +
+          const double src_x = (static_cast<double>(geometry_model_origin_x(geometry)) +
                                 (static_cast<double>(x) + 0.5) * geometry.scale_x) *
                                    proto_per_model_x -
                                0.5;

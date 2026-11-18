@@ -81,15 +81,15 @@ inline std::vector<std::uint8_t> binary_mask(const float* proto, int channels, i
     }
   } else {
     for (int y = 0; y < mask_h; ++y) {
-      const double src_y =
-          (static_cast<double>(geometry.pad_top) + (static_cast<double>(y) + 0.5) * geometry.scale_y) *
-              proto_per_model_y -
-          0.5;
+      const double src_y = (static_cast<double>(vie::geometry_model_origin_y(geometry)) +
+                            (static_cast<double>(y) + 0.5) * geometry.scale_y) *
+                               proto_per_model_y -
+                           0.5;
       for (int x = 0; x < mask_w; ++x) {
-        const double src_x =
-            (static_cast<double>(geometry.pad_left) + (static_cast<double>(x) + 0.5) * geometry.scale_x) *
-                proto_per_model_x -
-            0.5;
+        const double src_x = (static_cast<double>(vie::geometry_model_origin_x(geometry)) +
+                              (static_cast<double>(x) + 0.5) * geometry.scale_x) *
+                                 proto_per_model_x -
+                             0.5;
         scaled[static_cast<std::size_t>(y) * static_cast<std::size_t>(mask_w) + static_cast<std::size_t>(x)] =
             bilinear(logits, proto_w, proto_h, src_x, src_y);
       }

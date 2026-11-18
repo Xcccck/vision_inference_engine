@@ -401,3 +401,30 @@ Registry 在分类候选和 Detection、Segmentation 或 RT-DETR 候选同时出
 `/tmp/resnet50_untrained_static.onnx` 被识别为 `cnn_classifier`，输出 `logits`，类别轴 1，1000 类，`score_type=logits`。测试在生成结果之外补了 stretch 和 `scale_0_1`，再调用 `infer_classification()`。这不是自动预处理，也不是 ImageNet 预测。CPU EP 的 `d2h_bytes` 为 0，严格 CUDA EP 为 4000。
 
 没有实现 center crop、类别名、Softmax Decoder、多标签和 CUDA Top-K。没有开始 Phase 6.4。
+
+## 17. Phase 6.4 实现记录
+
+预处理仍是公共的 `PreprocessConfig` 和 `ImagePreprocessor`。新增 `ResizeMode::ShortestSide`。配置字段是 `short_side`、`crop_width`、`crop_height`，并且 `target_width`、`target_height` 必须等于裁剪尺寸。Stretch 和 Letterbox 的几何与像素路径保持原样。旧 Manifest 词 `crop` 仍然返回 Unsupported。
+
+顺序是：颜色通道对调、短边缩放、中心裁剪、`y = (x * scale - mean) / std`、布局转换。uint8 先变成 0..255 的 float，float32 使用存储值。公式只执行一次。mean 和 std 各 3 个数，对应输出通道。std 为 0 或长度不对时返回 InvalidArgument。`imagenet` 仍是调用者写明的命名配方，识别器不会填写它。
+
+短边钉成 `short_side`。长边用整数公式 `(2 * long * short_side + short) / (2 * short)`，正数的一半远离 0。宽高比只在这一像素取整上产生 `scale_x` 与 `scale_y` 的差别。裁剪不能大于缩放后的图像，也不能大于 `short_side`；越界返回 InvalidArgument，不补边、不拉伸。奇数余数用整数除法：`crop_x = (resized_width - crop_width) / 2`，多出的像素在右侧和下侧。
+
+采样公式仍是 `source = (content + 0.5) * (source / resized) - 0.5`。最近邻是 `floor(source + 0.5)`，负数一半远离 0，边界复制。双线性用 `floor` 和边界复制。CPU 与一份按这个公式写的独立采样器逐像素一致。这不是 torchvision 的通用兼容声明。用 torchvision 0.29.2、`antialias=False` 核对过：
+
+- 7×5、短边 4：VIE 得到 6×4，torchvision 向 0 截断得到 5×4。
+- 640×480、短边 256：两边都是 341×256。
+- 2×1 升到短边 2 的双线性四个采样，两边都是 0、2.5、7.5、10。
+- 6×4 裁 3×3：VIE 起点是 (1, 0)，torchvision 的 `round` 对 1.5 取偶数，起点是 (2, 0)。
+
+`GeometryTransform` 增加 `crop_x`、`crop_y`。Letterbox 的 `pad_*` 不变，裁剪模式的 pad 为 0，`resized_*` 是裁剪前的尺寸。统一原点是 `pad_left - crop_x`。原图坐标是 `(x_model - origin) / scale`。检测、分割和 RT-DETR 的映射改用这个原点；`crop` 为 0 时与原来的 pad 公式相同。
+
+Manifest 仍是 schema 1.0。未设置时不写出新键，Detection 和 Segmentation 的 JSON 不增加 `short_side` 或 `mean`。`resize=shortest_side` 要求 `short_side`、`crop_width`、`crop_height`，并且具体输入 shape 的高宽等于裁剪。`normalization=explicit` 要求 `scale`、三项 `mean`、三项非 0 的 `std`。缺字段时不可执行。这些字段由调用者以 `user` provenance 填写。识别器看到 ResNet 结构时仍不写颜色、短边或 mean/std。
+
+CUDA 复用原来的单 kernel。Host 把原点 `pad_left - crop_x` 传进去，采样公式不变。7×5、短边 6、裁成 4×3、BGR 转 RGB、explicit 归一化的双线性输出与 CPU 逐值相等。没有新的 CUDA kernel。
+
+CPU 计时是一次 warmup 之后的一次调用。图像是 640×480 uint8 HWC RGB，没有通道对调，没有 H2D，双线性，NCHW，`scale=1/255`，mean `(0.485, 0.456, 0.406)`，std `(0.229, 0.224, 0.225)`。短边路径先得到 341×256，再从 (58, 16) 裁出 224×224，预处理 2.666 ms。同一张图 stretch 到 224×224 是 2.571 ms。这是一次样本，不是中位数。
+
+同一张图经过识别器生成的 Manifest，再由测试填入上述配方，走 CPU EP 的 `infer_classification()`：预处理 3.686 ms，execute 14.290 ms，Top-K 0.079 ms，合计 18.062 ms。输出 `[1,1000]`，4000 字节，Top-5 有限。权重是 `weights=None`，下标不是 ImageNet 类别。
+
+没有 center crop 以外的裁剪模式，没有自动推断预处理，没有 Softmax Decoder，没有 CUDA Top-K。没有开始 Phase 6.5。

@@ -291,3 +291,41 @@ TEST(PreprocessBenchmark, CudaStages) {
   write_pair("full", full_stat);
   EXPECT_GT(std::get<0>(std::get<1>(full_stat)), 0);
 }
+
+TEST(PreprocessCuda, ShortestSideCenterCropMatchesCpu) {
+  vie::PreprocessConfig config;
+  config.resize_mode = vie::ResizeMode::ShortestSide;
+  config.short_side = 6;
+  config.crop_width = 4;
+  config.crop_height = 3;
+  config.target_width = 4;
+  config.target_height = 3;
+  config.interpolation = vie::Interpolation::Bilinear;
+  config.input_color = vie::ColorOrder::Bgr;
+  config.output_color = vie::ColorOrder::Rgb;
+  config.input_layout = vie::ImageLayout::Hwc;
+  config.output_layout = vie::ImageLayout::Chw;
+  config.output_dtype = vie::DataType::Fp32;
+  config.normalize_enabled = true;
+  config.scale = 1.f / 255.f;
+  config.mean = {0.1f, 0.2f, 0.3f};
+  config.std = {0.5f, 0.4f, 0.2f};
+  const std::vector<std::uint8_t> pixels = make_pixels(7, 5);
+  vie::ImagePreprocessor preprocessor;
+  preprocessor.configure(config);
+  const vie::PreprocessResult host =
+      preprocessor.execute(host_image(pixels, 7, 5), vie::DeviceContext{});
+  DeviceImage device(pixels);
+  vie::DeviceContext cuda_device(vie::DeviceType::Cuda, 0);
+  const vie::PreprocessResult gpu = preprocessor.execute(device_view(device.data, 7, 5), cuda_device);
+  const vie::Tensor copied = gpu.output.to(vie::DeviceContext{});
+  ASSERT_EQ(host.output.numel(), copied.numel());
+  EXPECT_EQ(gpu.geometry.resized_width, host.geometry.resized_width);
+  EXPECT_EQ(gpu.geometry.crop_x, host.geometry.crop_x);
+  EXPECT_EQ(gpu.geometry.crop_y, host.geometry.crop_y);
+  const float* left = host.output.data_as<float>();
+  const float* right = copied.data_as<float>();
+  for (std::size_t i = 0; i < host.output.numel(); ++i) {
+    EXPECT_FLOAT_EQ(left[i], right[i]) << i;
+  }
+}

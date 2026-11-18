@@ -388,7 +388,8 @@ SegmentationBatch decode_yolov8_seg_cuda(const DecoderInput& input, const Decode
   }
   cuda_check(cudaEventRecord(resize_started), "cudaEventRecord");
   resize_kernel<<<mask_blocks, threads>>>(static_cast<float*>(logits.data), proto_w, proto_h, static_cast<float*>(scaled.data),
-                                          instances, mask_w, mask_h, retina ? 1 : 0, geometry.pad_left, geometry.pad_top,
+                                          instances, mask_w, mask_h, retina ? 1 : 0, geometry_model_origin_x(geometry),
+                                          geometry_model_origin_y(geometry),
                                           geometry.scale_x, geometry.scale_y, proto_per_model_x, proto_per_model_y,
                                           static_cast<int*>(fault.data));
   cuda_check(cudaEventRecord(resize_stopped), "cudaEventRecord");
