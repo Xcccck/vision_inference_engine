@@ -463,6 +463,147 @@ TEST(YoloV8PoseDecoder, FiltersNmsAndRejectsIllegalTensors) {
   VIE_EXPECT_ERROR(vie::ErrorCode::Unsupported, decoder.decode({}, {}));
 }
 
+TEST(YoloV8PoseDecoder, LayoutsNmsPoliciesAndEmptyCandidates) {
+  constexpr int kChannels = 12;
+  // cx, cy, width, height, class 0, class 1, then (x, y, confidence) twice.
+  const std::vector<std::vector<float>> people{
+      {10.f, 10.f, 10.f, 10.f, 0.95f, 0.10f, 5.f, 6.f, 0.4f, -5.f, 8.f, 0.01f},
+      {40.f, 40.f, 8.f, 8.f, 0.20f, 0.85f, 37.f, 38.f, 0.3f, 39.f, 41.f, 0.9f}};
+  auto channel_major = [&](const std::vector<std::vector<float>>& rows) {
+    const int predictions = static_cast<int>(rows.size());
+    std::vector<float> flat(static_cast<std::size_t>(kChannels * predictions), 0.f);
+    for (int prediction = 0; prediction < predictions; ++prediction) {
+      for (int channel = 0; channel < kChannels; ++channel) {
+        flat[static_cast<std::size_t>(channel * predictions + prediction)] =
+            rows[static_cast<std::size_t>(prediction)][static_cast<std::size_t>(channel)];
+      }
+    }
+    return flat;
+  };
+  auto prediction_major = [&](const std::vector<std::vector<float>>& rows) {
+    std::vector<float> flat;
+    for (const std::vector<float>& row : rows) flat.insert(flat.end(), row.begin(), row.end());
+    return flat;
+  };
+
+  const vie::YoloV8PoseDecoder decoder;
+  const vie::GeometryTransform geometry = identity_geometry();
+  vie::PoseDecodeConfig axis1 = keep_config();
+  const vie::PoseBatch rows = decoder.decode_pose(
+      decode_input(pose_tensor(channel_major(people), kChannels, 2), geometry), axis1, vie::DeviceContext{});
+  vie::PoseDecodeConfig axis2 = keep_config();
+  axis2.channel_axis = 2;
+  const std::vector<float> flat = prediction_major(people);
+  const vie::Tensor transposed = vie::Tensor::from_host(vie::DeviceContext{}, vie::DataType::Fp32, {1, 2, kChannels},
+                                                        flat.data(), flat.size() * sizeof(float));
+  const vie::PoseBatch columns = decoder.decode_pose(decode_input(transposed, geometry), axis2, vie::DeviceContext{});
+  ASSERT_EQ(rows.results[0].objects.size(), 2u);
+  ASSERT_EQ(columns.results[0].objects.size(), rows.results[0].objects.size());
+  for (std::size_t index = 0; index < rows.results[0].objects.size(); ++index) {
+    const vie::PoseObject& left = rows.results[0].objects[index];
+    const vie::PoseObject& right = columns.results[0].objects[index];
+    EXPECT_EQ(left.anchor_index, right.anchor_index) << index;
+    EXPECT_EQ(left.class_id, right.class_id) << index;
+    EXPECT_FLOAT_EQ(left.score, right.score) << index;
+    EXPECT_FLOAT_EQ(left.cx, right.cx) << index;
+    EXPECT_FLOAT_EQ(left.height, right.height) << index;
+    ASSERT_EQ(left.keypoints.size(), right.keypoints.size());
+    for (std::size_t point = 0; point < left.keypoints.size(); ++point) {
+      EXPECT_FLOAT_EQ(left.keypoints[point].x, right.keypoints[point].x) << index << " " << point;
+      EXPECT_FLOAT_EQ(left.keypoints[point].confidence, right.keypoints[point].confidence) << index << " " << point;
+      EXPECT_EQ(left.keypoints[point].inside_image, right.keypoints[point].inside_image) << index << " " << point;
+    }
+  }
+
+  // The same box on two anchors whose best classes differ.
+  const std::vector<std::vector<float>> overlap{
+      {20.f, 20.f, 10.f, 10.f, 0.95f, 0.10f, 18.f, 22.f, 0.5f, 21.f, 19.f, 0.6f},
+      {20.f, 20.f, 10.f, 10.f, 0.10f, 0.90f, 18.f, 22.f, 0.5f, 21.f, 19.f, 0.6f}};
+  const std::vector<float> overlap_data = channel_major(overlap);
+  const vie::Tensor overlap_tensor = pose_tensor(overlap_data, kChannels, 2);
+  vie::PoseDecodeConfig class_aware = keep_config();
+  class_aware.class_aware = true;
+  const vie::PoseBatch separated =
+      decoder.decode_pose(decode_input(overlap_tensor, geometry), class_aware, vie::DeviceContext{});
+  ASSERT_EQ(separated.results[0].objects.size(), 2u);
+  EXPECT_EQ(separated.results[0].objects[0].class_id, 0);
+  EXPECT_EQ(separated.results[0].objects[1].class_id, 1);
+  EXPECT_EQ(separated.results[0].candidates_before_nms, 2);
+  vie::PoseDecodeConfig shared = keep_config();
+  shared.class_aware = false;
+  const vie::PoseBatch merged =
+      decoder.decode_pose(decode_input(overlap_tensor, geometry), shared, vie::DeviceContext{});
+  ASSERT_EQ(merged.results[0].objects.size(), 1u);
+  EXPECT_EQ(merged.results[0].objects[0].anchor_index, 0);
+
+  // NMS off keeps every mapped candidate in sorted order, up to max_detections.
+  vie::PoseDecodeConfig no_nms = keep_config();
+  no_nms.nms_enabled = false;
+  no_nms.iou_threshold.reset();
+  no_nms.class_aware.reset();
+  const vie::PoseBatch unfiltered =
+      decoder.decode_pose(decode_input(overlap_tensor, geometry), no_nms, vie::DeviceContext{});
+  ASSERT_EQ(unfiltered.results[0].objects.size(), 2u);
+  EXPECT_EQ(unfiltered.results[0].objects[0].anchor_index, 0);
+  EXPECT_EQ(unfiltered.results[0].objects[1].anchor_index, 1);
+  EXPECT_EQ(unfiltered.results[0].candidates_before_nms, 2);
+
+  // Every class above the threshold becomes its own candidate on one anchor.
+  const std::vector<std::vector<float>> both{
+      {20.f, 20.f, 10.f, 10.f, 0.95f, 0.90f, 18.f, 22.f, 0.5f, 21.f, 19.f, 0.6f}};
+  const vie::Tensor both_tensor = pose_tensor(channel_major(both), kChannels, 1);
+  vie::PoseDecodeConfig all_classes = keep_config();
+  all_classes.class_selection = vie::ClassSelection::AllAboveThreshold;
+  const vie::PoseBatch multi =
+      decoder.decode_pose(decode_input(both_tensor, geometry), all_classes, vie::DeviceContext{});
+  ASSERT_EQ(multi.results[0].objects.size(), 2u);
+  EXPECT_EQ(multi.results[0].objects[0].class_id, 0);
+  EXPECT_NEAR(multi.results[0].objects[0].score, 0.95f, 1e-6f);
+  EXPECT_EQ(multi.results[0].objects[1].class_id, 1);
+  EXPECT_NEAR(multi.results[0].objects[1].score, 0.90f, 1e-6f);
+  EXPECT_EQ(multi.results[0].objects[0].anchor_index, 0);
+  EXPECT_EQ(multi.results[0].objects[1].anchor_index, 0);
+
+  // Nothing above the threshold is an empty result, not an error.
+  vie::PoseDecodeConfig nothing = keep_config();
+  nothing.confidence_threshold = 0.99f;
+  const vie::PoseBatch empty =
+      decoder.decode_pose(decode_input(overlap_tensor, geometry), nothing, vie::DeviceContext{});
+  EXPECT_TRUE(empty.results[0].objects.empty());
+  EXPECT_EQ(empty.results[0].candidates_after_filter, 0);
+  EXPECT_EQ(empty.results[0].candidates_before_nms, 0);
+  EXPECT_GT(empty.results[0].output_bytes, 0u);
+
+  // A bad channel in a kept anchor fails the whole call.
+  auto at = [](int channel, int prediction) { return static_cast<std::size_t>(channel * 2 + prediction); };
+  std::vector<float> bad_box = overlap_data;
+  bad_box[at(0, 0)] = std::nanf("");
+  VIE_EXPECT_ERROR(vie::ErrorCode::InvalidArgument, decoder.decode_pose(
+                     decode_input(pose_tensor(bad_box, kChannels, 2), geometry), keep_config(), vie::DeviceContext{}));
+  std::vector<float> bad_confidence = overlap_data;
+  bad_confidence[at(8, 0)] = std::nanf("");
+  VIE_EXPECT_ERROR(vie::ErrorCode::InvalidArgument, decoder.decode_pose(
+                     decode_input(pose_tensor(bad_confidence, kChannels, 2), geometry), keep_config(),
+                     vie::DeviceContext{}));
+  std::vector<float> bad_probability = overlap_data;
+  bad_probability[at(4, 0)] = 1.5f;
+  VIE_EXPECT_ERROR(vie::ErrorCode::InvalidArgument, decoder.decode_pose(
+                     decode_input(pose_tensor(bad_probability, kChannels, 2), geometry), keep_config(),
+                     vie::DeviceContext{}));
+
+  // A bad keypoint inside an anchor that the threshold already dropped is not
+  // read, so it does not fail the call.
+  std::vector<std::vector<float>> half{people};
+  half[1][4] = 0.2f;
+  half[1][5] = 0.3f;
+  std::vector<float> half_data = channel_major(half);
+  half_data[at(8, 1)] = std::nanf("");
+  const vie::PoseBatch survived = decoder.decode_pose(
+      decode_input(pose_tensor(half_data, kChannels, 2), geometry), keep_config(), vie::DeviceContext{});
+  ASSERT_EQ(survived.results[0].objects.size(), 1u);
+  EXPECT_EQ(survived.results[0].objects[0].anchor_index, 0);
+}
+
 TEST(YoloV8PoseRecognizer, AcceptsTheProvenHeadAndRejectsLookalikes) {
   const vie::ModelAnalysisReport report = analyze_graph(pose_graph(true, false, false, 12));
   const vie::RecognitionResult result = vie::default_recognizer_registry().recognize(report);
@@ -548,6 +689,119 @@ TEST(PoseApi, RejectsTheWrongTask) {
   detection_config.backend = vie::BackendKind::Mock;
   detector.load(detection_config);
   VIE_EXPECT_ERROR(vie::ErrorCode::Unsupported, detector.infer_pose(image, {}));
+}
+
+TEST(PoseManifest, RejectsIncompleteAndInconsistentPoseFields) {
+  auto has_issue = [](const std::vector<vie::SchemaIssue>& issues, const std::string& path) {
+    for (const vie::SchemaIssue& issue : issues) {
+      if (issue.path == path) return true;
+    }
+    return false;
+  };
+  const vie::ManifestValidation valid = vie::ManifestValidator{}.validate(runnable_pose_manifest());
+  EXPECT_TRUE(valid.schema_ok()) << vie::format_issues(valid.schema_issues);
+  EXPECT_TRUE(valid.runnable()) << vie::format_issues(valid.unresolved_critical);
+
+  // An unset pose field is a critical gap, not a schema error.
+  for (const char* path : {"pose.output_name", "pose.channel_axis", "pose.keypoint_count", "pose.keypoint_dimensions",
+                           "pose.keypoint_layout", "pose.score_type"}) {
+    vie::ModelManifest manifest = runnable_pose_manifest();
+    const std::string key(path);
+    if (key == "pose.output_name") manifest.pose.output_name.clear();
+    if (key == "pose.channel_axis") manifest.pose.channel_axis.reset();
+    if (key == "pose.keypoint_count") manifest.pose.keypoint_count.reset();
+    if (key == "pose.keypoint_dimensions") manifest.pose.keypoint_dimensions.reset();
+    if (key == "pose.keypoint_layout") manifest.pose.keypoint_layout.clear();
+    if (key == "pose.score_type") manifest.pose.score_type.clear();
+    manifest.provenance.erase(path);
+    manifest.ensure_provenance();
+    const vie::ManifestValidation missing = vie::ManifestValidator{}.validate(manifest);
+    EXPECT_TRUE(missing.schema_ok()) << path << ": " << vie::format_issues(missing.schema_issues);
+    EXPECT_TRUE(has_issue(missing.unresolved_critical, path)) << path;
+    EXPECT_FALSE(missing.runnable()) << path;
+  }
+
+  vie::ModelManifest dimensions = runnable_pose_manifest();
+  dimensions.pose.keypoint_dimensions = 2;
+  EXPECT_TRUE(has_issue(vie::ManifestValidator{}.validate(dimensions).schema_issues, "pose.keypoint_dimensions"));
+
+  vie::ModelManifest layout = runnable_pose_manifest();
+  layout.pose.keypoint_layout = "xy";
+  EXPECT_TRUE(has_issue(vie::ManifestValidator{}.validate(layout).schema_issues, "pose.keypoint_layout"));
+
+  vie::ModelManifest score_type = runnable_pose_manifest();
+  score_type.pose.score_type = "logits";
+  EXPECT_TRUE(has_issue(vie::ManifestValidator{}.validate(score_type).schema_issues, "pose.score_type"));
+
+  vie::ModelManifest axis_mismatch = runnable_pose_manifest();
+  axis_mismatch.pose.channel_axis = 2;
+  EXPECT_TRUE(
+      has_issue(vie::ManifestValidator{}.validate(axis_mismatch).schema_issues, "pose.channel_axis"));
+
+  vie::ModelManifest wrong_name = runnable_pose_manifest();
+  wrong_name.pose.output_name = "output1";
+  EXPECT_TRUE(has_issue(vie::ManifestValidator{}.validate(wrong_name).schema_issues, "pose.output_name"));
+
+  vie::ModelManifest wrong_length = runnable_pose_manifest();
+  wrong_length.outputs[0].shape = {1, 11, 4};
+  EXPECT_TRUE(has_issue(vie::ManifestValidator{}.validate(wrong_length).schema_issues, "pose.channel_axis"));
+
+  vie::ModelManifest wrong_protocol = runnable_pose_manifest();
+  wrong_protocol.decoder.protocol = "yolov8_detect_raw";
+  wrong_protocol.decoder.box_decode.clear();
+  EXPECT_TRUE(
+      has_issue(vie::ManifestValidator{}.validate(wrong_protocol).schema_issues, "decoder.protocol"));
+
+  // A detection manifest may not smuggle pose fields.
+  const std::vector<std::string> pose_paths{"pose.output_name", "pose.channel_axis", "pose.keypoint_count",
+                                             "pose.keypoint_dimensions", "pose.keypoint_layout", "pose.score_type"};
+  vie::ModelManifest detection_only = runnable_pose_manifest();
+  detection_only.task = vie::TaskType::Detection;
+  detection_only.decoder.protocol = "mock";
+  detection_only.decoder.box_format = "xyxy";
+  detection_only.decoder.box_decode.clear();
+  detection_only.provenance.erase("decoder.box_decode");
+  detection_only.ensure_provenance();
+  EXPECT_TRUE(has_issue(vie::ManifestValidator{}.validate(detection_only).schema_issues, "pose"));
+
+  // The pose object survives a round trip and rejects illegal types and values.
+  const std::string text = runnable_pose_manifest().to_json_string(-1);
+  const vie::ModelManifest loaded = vie::ModelManifest::from_json_string(text);
+  EXPECT_EQ(*loaded.pose.keypoint_count, 2);
+  EXPECT_EQ(*loaded.pose.keypoint_dimensions, 3);
+  EXPECT_EQ(loaded.pose.keypoint_layout, "xy_confidence");
+  auto patched = [&text](const std::string& from, const std::string& to) {
+    std::string out = text;
+    const std::size_t found = out.find(from);
+    EXPECT_NE(found, std::string::npos) << from;
+    out.replace(found, from.size(), to);
+    return out;
+  };
+  VIE_EXPECT_ERROR(vie::ErrorCode::SchemaError,
+                   vie::ModelManifest::from_json_string(
+                       patched("\"keypoint_dimensions\":3", "\"keypoint_dimensions\":5")));
+  VIE_EXPECT_ERROR(vie::ErrorCode::SchemaError,
+                   vie::ModelManifest::from_json_string(
+                       patched("\"keypoint_count\":2", "\"keypoint_count\":0")));
+  VIE_EXPECT_ERROR(vie::ErrorCode::SchemaError,
+                   vie::ModelManifest::from_json_string(
+                       patched("\"pose\":{\"channel_axis\":1", "\"pose\":{\"channel_axis\":3")));
+  VIE_EXPECT_ERROR(vie::ErrorCode::SchemaError,
+                   vie::ModelManifest::from_json_string(
+                       patched("\"keypoint_layout\":\"xy_confidence\"", "\"keypoint_layout\":\"xy\"")));
+
+  vie::ModelManifest without_pose = runnable_pose_manifest();
+  without_pose.task = vie::TaskType::Detection;
+  without_pose.decoder.protocol = "mock";
+  without_pose.decoder.box_format = "xyxy";
+  without_pose.decoder.box_decode.clear();
+  without_pose.pose = {};
+  for (const std::string& path : pose_paths) without_pose.provenance.erase(path);
+  without_pose.provenance.erase("decoder.box_decode");
+  without_pose.ensure_provenance();
+  const std::string pose_free = without_pose.to_json_string(-1);
+  EXPECT_EQ(pose_free.find("\"pose\":{"), std::string::npos) << pose_free;
+  EXPECT_TRUE(vie::ModelManifest::from_json_string(pose_free).pose.output_name.empty());
 }
 
 TEST(YoloV8PoseRecognizer, RealExportWhenPresent) {

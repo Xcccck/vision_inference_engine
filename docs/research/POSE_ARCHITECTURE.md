@@ -33,6 +33,8 @@ Manifest schema 1.0 已经能带可选对象。识别器只看图结构。
 
 权重和 ONNX 都在 `/tmp/vie_phase72`，不进入 Git。导出脚本是 `tools/export_yolov8n_pose.py`。它不导入 VIE。
 
+上面的 SHA256 钉住的是这次实际使用的文件。重新跑一遍导出会得到字节不同的 ONNX，节点集合、输入输出 shape 和 `has_nms=False` 完全一致，PyTorch 前向的原始输出逐字节相同，独立参考的 `reference_poses.txt` 也逐字节相同。PyTorch 导出本身不做字节级复现，所以 SHA256 是工件指纹，不是复现校验。
+
 检查点的 `nc` 是 1，`kpt_shape` 是 `[17, 3]`。公共数据结构不把 17 写死，关键点个数来自 Manifest，并必须和输出通道数一致。
 
 ## 3. ONNX 输入输出
@@ -150,37 +152,52 @@ CPU EP 的原始张量与 PyTorch 的最大绝对差是 0.000732422，低于测�
 
 ## 12. 性能
 
-输入 640×640，warmup 3 次，采样 10 次。百分位是升序后的 `floor(fraction * (n - 1))`。单位是毫秒。候选 300，NMS 后 20。这些数字只描述这一台机器和这一份模型。
+输入 640×640 的同一份图案，warmup 3 次，采样 10 次。百分位是升序后的 `floor(fraction * (n - 1))`。单位是毫秒。候选 300，NMS 后 20。这些数字只描述这一台机器（RTX 4080 Laptop、ONNX Runtime 1.20.1）和这一份模型，不是通用结论。
 
-CPU EP（CPU 包 `/opt/onnxruntime-linux-x64-1.20.1`，`build-ort`）：
+CPU EP（`build-ort`，CUDA OFF + ONNX Runtime CPU 包，`CMAKE_BUILD_TYPE` 为空，所以 VIE 自身代码没有优化开关）：
 
 | 阶段 | 平均 | P50 | P95 |
 |---|---|---|---|
-| preprocess | 27.3606 | 27.5371 | 28.6995 |
-| execute | 28.2807 | 28.0802 | 29.2356 |
+| preprocess | 29.7002 | 29.6034 | 32.6361 |
+| execute | 27.7349 | 28.3021 | 29.2807 |
 | d2h | 0 | 0 | 0 |
-| validate | 9.09164 | 8.32427 | 11.6361 |
-| pose decode | 0.264756 | 0.257909 | 0.325694 |
-| NMS | 0.13192 | 0.124732 | 0.155582 |
-| total | 71.5915 | 70.9281 | 75.157 |
+| validate | 9.92124 | 9.75035 | 12.1948 |
+| pose decode | 0.263353 | 0.264592 | 0.30313 |
+| NMS | 0.126103 | 0.116662 | 0.154068 |
+| total | 74.3116 | 75.2783 | 78.9338 |
 
-`d2h_bytes` 是 0。validate、关键点映射和 NMS 是分开计时的。
+`d2h_bytes` 是 0。validate、关键点映射和 NMS 是分开计时的。同一份 CPU EP 在 `build-ort-gpu`（Release）里跑出的 total 平均是 37.7644，preprocess 7.6617，validate 3.07373，说明上面这份 CPU 数字主要受未优化的 VIE 代码影响，不是 ORT 的差别。
 
-严格 CUDA EP（GPU 包 `/opt/onnxruntime-linux-x64-gpu-1.20.1`，禁止 CPU fallback）：
+严格 CUDA EP（`build-ort-gpu`，Release，GPU 包 `/opt/onnxruntime-linux-x64-gpu-1.20.1`，禁止 CPU fallback）：
 
 | 阶段 | 平均 | P50 | P95 |
 |---|---|---|---|
-| preprocess | 0.631059 | 0.598069 | 0.66018 |
-| execute | 4.86301 | 4.44959 | 5.74282 |
-| d2h | 0.343428 | 0.291052 | 0.382338 |
-| validate | 1.94941 | 1.93943 | 2.03296 |
-| pose decode | 0.0556313 | 0.05431 | 0.057108 |
-| NMS | 0.0302596 | 0.030169 | 0.03056 |
-| total | 8.62583 | 8.06068 | 9.82329 |
+| preprocess | 0.740894 | 0.756252 | 0.825212 |
+| execute | 5.81293 | 5.67731 | 6.52816 |
+| d2h | 0.330836 | 0.293671 | 0.371425 |
+| validate | 1.63644 | 1.62577 | 1.67451 |
+| pose decode | 0.0471349 | 0.046008 | 0.047874 |
+| NMS | 0.0244959 | 0.024377 | 0.025962 |
+| total | 9.24294 | 9.03705 | 9.93485 |
 
 `d2h_bytes` 是 1,881,600。
 
-## 13. 已知限制
+## 13. 构建组合与测试
+
+四种组合都跑过完整测试。`tests/test_pose.cpp` 的适用测试在每个组合里都是执行，不是跳过。
+
+| 组合 | 构建目录 | 用例总数 | 失败 | 跳过 | Pose 用例 |
+|---|---|---|---|---|---|
+| CUDA OFF + ORT OFF | `build` | 138 | 0 | 0 | 7 |
+| CUDA OFF + ORT CPU | `build-ort` | 167 | 0 | 0 | 9 |
+| CUDA ON + ORT CPU | `build-cuda` | 199 | 0 | 0 | 9 |
+| CUDA ON + ORT GPU | `build-ort-gpu` | 212 | 0 | 1 | 10 |
+
+`build` 里没有 ONNX Runtime，`YoloV8PoseReal.*` 不参与编译，跑的是几何、Decoder、识别器、Manifest 和 API 七个用例。`build-cuda` 有 CUDA 但只有 CPU 包，`StrictCudaMatchesCpu` 同样不编译。`build-ort-gpu` 的跳过是 `ClassificationEngine.MissingBackendIsExplicit`，原因是这份构建同时链接了两个 ONNX Runtime Backend，那条用例要验证的是 Backend 缺失，本机构造不出来。它与 Pose 无关，也没有算进通过数。
+
+Pose 的九个用例覆盖几何逆映射、`yolov8_pose_raw` 解码、两种通道布局与 NMS 策略、识别器结构与真实导出、Manifest 校验、API 类型检查、CPU EP 与独立参考的一致性以及 CPU 计时。`build-ort-gpu` 在此基础上多一个严格 CUDA EP 的一致性用例。
+
+## 14. 已知限制
 
 - batch 只支持 1，输出 rank 必须是 3。
 - 关键点维度只接受 3，layout 只接受 `xy_confidence`。
@@ -193,3 +210,4 @@ CPU EP（CPU 包 `/opt/onnxruntime-linux-x64-1.20.1`，`build-ort`）：
 - IoU 阈值 0 会抑制后续所有框，因为比较是大于等于。
 - 分数接近时，CPU 与 CUDA 的排序可以不同。
 - 这次比较用的是固定图案，不是 COCO 标注，不能当成姿态精度。
+- ONNX 文件字节不随重新导出复现，结构一致即可；表中 SHA256 只对本次使用的工件有效。
