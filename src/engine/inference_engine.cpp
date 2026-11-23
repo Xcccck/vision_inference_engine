@@ -332,12 +332,14 @@ void InferenceEngine::load(const ModelConfig& config) {
   std::unique_ptr<IInferenceBackend> backend = backends_.create(kind);
   
   // Configure CUDA-specific options before prepare if applicable
+#if defined(VIE_HAS_ONNXRUNTIME_CUDA)
   if (kind == BackendKind::OnnxRuntimeCuda && config.cuda_cpu_ep_fallback) {
     auto* cuda_backend = dynamic_cast<OnnxRuntimeCudaBackend*>(backend.get());
     if (cuda_backend) {
       cuda_backend->set_cpu_ep_fallback(true);
     }
   }
+#endif
   
   backend->prepare(backend_config);
   
