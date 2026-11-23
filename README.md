@@ -22,6 +22,37 @@ Phase 2 增加 `OnnxAnalyzer`。它只读 ONNX ModelProto 的结构：原始声�
 /home/workspace/vision_inference_engine/build/vie_analyze_onnx testdata/onnx/fixed_shapes.onnx
 ```
 
+## 模型检查工具
+
+`vie_model_inspect` 检查一个 ONNX 模型能否被 VIE 正确解析、识别和运行。
+
+```bash
+# 基础检查：分析、识别、生成 Manifest、验证
+vie_model_inspect model.onnx
+
+# JSON 报告
+vie_model_inspect model.onnx --json --report report.json
+
+# 验证用户提供的 Manifest
+vie_model_inspect model.onnx --manifest model.json
+
+# 测试 CPU EP 执行（需要完整 Manifest）
+vie_model_inspect model.onnx --cpu
+
+# 测试 CUDA EP 执行（需要 CUDA 构建和完整 Manifest）
+vie_model_inspect model.onnx --cuda
+```
+
+诊断状态说明：
+
+- `analyzer_failed`：ONNX 文件无法解析
+- `recognition_failed`：没有 Recognizer 接受该模型
+- `manifest_invalid`：Manifest 缺少关键语义字段（color、normalization、resize）
+- `recognized`：模型被识别，但 Manifest 不完整
+- `cpu_tested` / `cuda_tested`：对应 EP 执行成功
+
+详见 [docs/MODEL_COMPATIBILITY.md](docs/MODEL_COMPATIBILITY.md)。
+
 ## 构建与测试
 
 ```bash

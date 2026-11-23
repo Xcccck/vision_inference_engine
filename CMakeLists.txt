@@ -106,6 +106,7 @@ add_library(vie
   src/core/cuda_memory.cpp
   src/model/manifest.cpp
   src/model/manifest_validator.cpp
+  src/model/model_inspection.cpp
   src/backend/backend_registry.cpp
   src/backend/mock_backend.cpp
   src/decoder/decoder_registry.cpp
@@ -216,6 +217,7 @@ if(VIE_BUILD_TESTS)
     tests/test_decoder.cpp
     tests/test_segmentation.cpp
     tests/test_yolov8_seg.cpp
+    tests/test_model_inspection.cpp
   )
   target_link_libraries(vie_tests PRIVATE vie::vie GTest::gtest GTest::gtest_main)
   target_compile_options(vie_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -247,17 +249,21 @@ add_executable(vie_recognize_onnx examples/recognize_onnx.cpp)
 target_link_libraries(vie_recognize_onnx PRIVATE vie::vie)
 target_compile_options(vie_recognize_onnx PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
+add_executable(vie_model_inspect tools/vie_model_inspect.cpp)
+target_link_libraries(vie_model_inspect PRIVATE vie::vie)
+target_compile_options(vie_model_inspect PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
 if(VIE_ENABLE_ONNXRUNTIME)
   if(VIE_ENABLE_ONNXRUNTIME_CUDA)
-    set_property(TARGET vie_analyze_onnx vie_recognize_onnx
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect
       APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_GPU_LIB_DIR}")
   else()
-    set_property(TARGET vie_analyze_onnx vie_recognize_onnx
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect
       APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_LIB_DIR}")
   endif()
 endif()
 if(VIE_ENABLE_CUDA)
-  set_property(TARGET vie_analyze_onnx vie_recognize_onnx
+  set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect
     APPEND PROPERTY BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
 endif()
 
