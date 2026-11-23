@@ -60,6 +60,17 @@ bool is_obb_angle_range(std::string_view text) { return text == "[-pi/4,3pi/4]";
 
 bool is_obb_score_type(std::string_view text) { return text == "probabilities"; }
 
+bool is_pose_layout(std::string_view text) { return text == "xy_confidence"; }
+
+bool is_pose_score_type(std::string_view text) { return text == "probabilities"; }
+
+bool pose_active(const ModelManifest& manifest) {
+  const PoseDesc& pose = manifest.pose;
+  return manifest.task == TaskType::Pose || !pose.output_name.empty() || pose.channel_axis.has_value() ||
+         pose.keypoint_count.has_value() || pose.keypoint_dimensions.has_value() || !pose.keypoint_layout.empty() ||
+         !pose.score_type.empty();
+}
+
 bool obb_active(const ModelManifest& manifest) {
   const ObbDesc& obb = manifest.obb;
   return manifest.task == TaskType::Obb || !obb.output_name.empty() || obb.channel_axis.has_value() ||
@@ -440,6 +451,16 @@ json manifest_json(const ModelManifest& manifest) {
         {"class_names",
          manifest.classification.class_names.empty() ? json(nullptr) : json(std::move(names))}};
   }
+  if (pose_active(manifest)) {
+    document["pose"] = json{
+        {"output_name", string_or_null(manifest.pose.output_name)},
+        {"channel_axis", manifest.pose.channel_axis ? json(*manifest.pose.channel_axis) : json(nullptr)},
+        {"keypoint_count", manifest.pose.keypoint_count ? json(*manifest.pose.keypoint_count) : json(nullptr)},
+        {"keypoint_dimensions",
+         manifest.pose.keypoint_dimensions ? json(*manifest.pose.keypoint_dimensions) : json(nullptr)},
+        {"keypoint_layout", string_or_null(manifest.pose.keypoint_layout)},
+        {"score_type", string_or_null(manifest.pose.score_type)}};
+  }
   if (obb_active(manifest)) {
     document["obb"] = json{
         {"output_name", string_or_null(manifest.obb.output_name)},
@@ -499,6 +520,33 @@ void read_segmentation(const json& value, SegmentationDesc& segmentation) {
     if (bytes < 1) schema_error("max_mask_bytes must be >= 1");
     segmentation.max_mask_bytes = static_cast<std::size_t>(bytes);
   }
+}
+
+void read_pose(const json& value, PoseDesc& pose) {
+  if (!value.is_object()) schema_error("pose must be an object");
+  pose.output_name = read_free_string(value, "output_name", false);
+  if (value.contains("channel_axis") && !value.at("channel_axis").is_null()) {
+    if (!value.at("channel_axis").is_number_integer()) schema_error("pose.channel_axis must be an integer");
+    const int axis = value.at("channel_axis").get<int>();
+    if (axis != 1 && axis != 2) schema_error("pose.channel_axis must be 1 or 2");
+    pose.channel_axis = axis;
+  }
+  if (value.contains("keypoint_count") && !value.at("keypoint_count").is_null()) {
+    if (!value.at("keypoint_count").is_number_integer()) schema_error("pose.keypoint_count must be an integer");
+    const int count = value.at("keypoint_count").get<int>();
+    if (count < 1) schema_error("pose.keypoint_count must be >= 1");
+    pose.keypoint_count = count;
+  }
+  if (value.contains("keypoint_dimensions") && !value.at("keypoint_dimensions").is_null()) {
+    if (!value.at("keypoint_dimensions").is_number_integer()) {
+      schema_error("pose.keypoint_dimensions must be an integer");
+    }
+    const int dimensions = value.at("keypoint_dimensions").get<int>();
+    if (dimensions != 3) schema_error("pose.keypoint_dimensions must be 3");
+    pose.keypoint_dimensions = dimensions;
+  }
+  pose.keypoint_layout = read_vocab(value, "keypoint_layout", is_pose_layout, "xy_confidence");
+  pose.score_type = read_vocab(value, "score_type", is_pose_score_type, "probabilities");
 }
 
 void read_obb(const json& value, ObbDesc& obb) {
@@ -597,6 +645,10 @@ std::vector<std::string> manifest_field_paths(const ModelManifest& manifest) {
     paths.insert(paths.end(), {"obb.output_name", "obb.channel_axis", "obb.angle_unit", "obb.angle_range",
                                "obb.score_type"});
   }
+  if (pose_active(manifest)) {
+    paths.insert(paths.end(), {"pose.output_name", "pose.channel_axis", "pose.keypoint_count",
+                               "pose.keypoint_dimensions", "pose.keypoint_layout", "pose.score_type"});
+  }
   for (std::size_t i = 0; i < manifest.outputs.size(); ++i) {
     const std::string prefix = "outputs." + std::to_string(i) + ".";
     paths.push_back(prefix + "name");
@@ -680,6 +732,12 @@ bool field_is_set(const ModelManifest& manifest, std::string_view path) {
   if (path == "classification.class_axis") return manifest.classification.class_axis.has_value();
   if (path == "classification.score_type") return !manifest.classification.score_type.empty();
   if (path == "classification.class_names") return !manifest.classification.class_names.empty();
+  if (path == "pose.output_name") return !manifest.pose.output_name.empty();
+  if (path == "pose.channel_axis") return manifest.pose.channel_axis.has_value();
+  if (path == "pose.keypoint_count") return manifest.pose.keypoint_count.has_value();
+  if (path == "pose.keypoint_dimensions") return manifest.pose.keypoint_dimensions.has_value();
+  if (path == "pose.keypoint_layout") return !manifest.pose.keypoint_layout.empty();
+  if (path == "pose.score_type") return !manifest.pose.score_type.empty();
   if (path == "obb.output_name") return !manifest.obb.output_name.empty();
   if (path == "obb.channel_axis") return manifest.obb.channel_axis.has_value();
   if (path == "obb.angle_unit") return !manifest.obb.angle_unit.empty();
@@ -783,6 +841,9 @@ ModelManifest ModelManifest::from_json_string(std::string_view json_text) {
     }
     if (document.contains("obb") && !document.at("obb").is_null()) {
       read_obb(document.at("obb"), manifest.obb);
+    }
+    if (document.contains("pose") && !document.at("pose").is_null()) {
+      read_pose(document.at("pose"), manifest.pose);
     }
     if (document.contains("provenance") && !document.at("provenance").is_null()) {
       read_provenance(document.at("provenance"), manifest);

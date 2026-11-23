@@ -1,6 +1,6 @@
 # Vision Inference Engine（VIE）
 
-命名空间：`vie`。这是一个通用视觉推理框架，当前接通了 ONNX 上的 YOLOv8 Detection、YOLOv8 Segmentation、YOLOv8-OBB、Ultralytics RT-DETR-L 的 Detection，以及单标签 Classification。它不会把任意 ONNX 模型认成这些家族。TensorRT 和姿态还没有实现。
+命名空间：`vie`。这是一个通用视觉推理框架，当前接通了 ONNX 上的 YOLOv8 Detection、YOLOv8 Segmentation、YOLOv8-OBB、Ultralytics RT-DETR-L 的 Detection，以及单标签 Classification。它不会把任意 ONNX 模型认成这些家族。TensorRT 还没有实现。YOLOv8-Pose 走 `infer_pose`，协议是 `yolov8_pose_raw`。
 
 Phase 1 做了这些事：
 
@@ -43,7 +43,7 @@ Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`inte
 ## 已接通的路径
 
 - 模型格式：ONNX。Mock 只用于管线测试。
-- 任务：YOLOv8 Detection 和 Ultralytics RT-DETR Detection（都走 `infer`），YOLOv8 Segmentation（`infer_segmentation`），YOLOv8-OBB（`infer_obb`），以及单标签分类（`infer_classification`）。Decoder 按 Manifest 里的 protocol 选择，不按模型家族分支。RT-DETR 在 CPU 和 CUDA 上各有一个 Decoder，按设备选择。OBB 的旋转 NMS 只在 CPU 上。
+- 任务：YOLOv8 Detection 和 Ultralytics RT-DETR Detection（都走 `infer`），YOLOv8 Segmentation（`infer_segmentation`），YOLOv8-OBB（`infer_obb`），YOLOv8-Pose（`infer_pose`），以及单标签分类（`infer_classification`）。Decoder 按 Manifest 里的 protocol 选择，不按模型家族分支。RT-DETR 在 CPU 和 CUDA 上各有一个 Decoder，按设备选择。OBB 的旋转 NMS 和 Pose 的人体框 NMS 只在 CPU 上。
 - Backend：构建打开 ONNX Runtime 时有 CPU EP；同时打开 CUDA 和 GPU 包时另有 CUDA EP。CUDA EP 默认禁止 CPU fallback。
 - 预处理和解码：CPU 始终可用；CUDA 只在 `VIE_ENABLE_CUDA` 时编译。
 
@@ -52,10 +52,10 @@ Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`inte
 - NMS 阈值的自动确定
 - TensorRT / PyTorch 解析
 - 图像文件解码
-- 姿态
 - 运行时 Softmax、多标签和 CUDA Top-K。模型自己输出的概率走 `classification_probabilities_raw`，解码时不再做 Softmax
 - resize 模式 `crop`
-- 并发推理。`load`、`infer`、`infer_segmentation`、`infer_classification` 和 `infer_obb` 共用同一个 session，没有锁。重叠调用是数据竞争，库不会把它们串成队列。
+- 多人跟踪、ReID、动作识别，以及 CUDA 上的 Pose Decoder 和 CUDA NMS
+- 并发推理。`load`、`infer`、`infer_segmentation`、`infer_classification`、`infer_obb` 和 `infer_pose` 共用同一个 session，没有锁。重叠调用是数据竞争，库不会把它们串成队列。
 
 `device()` 只描述最近一次成功的 `load`。第一次 `load` 失败时 `loaded()` 仍为 false，`device()` 仍是默认的 CPU 上下文，这不是一次 CPU 推理。再次 `load` 失败不会拆掉已经成功的 session。
 
@@ -110,7 +110,7 @@ classifier.load(classification);
 vie::ClassificationBatch ranked = classifier.infer_classification(image, labels);
 ```
 
-`yolov8_seg_raw` 有 CPU 和 CUDA 解码。它按名称读取 `output0` 和 prototype，复用检测的置信度过滤、坐标映射和 NMS，并保留 prediction index 以收集 mask 系数。重建是 `M = a · P`，不再做 Sigmoid；二值规则必须显式写成 `M > 0`。`retina_masks=false` 时 mask 是模型输入尺寸，`true` 时是原图尺寸。CUDA 路径把 mask 留在 CUDA Tensor 上，失败时不会退回 CPU。Kernel 使用默认 stream，不是 `DeviceContext` 自己的 stream。缺 `retina_masks`、NMS 或 mask 内存预算时返回 `UnresolvedField`。`InferenceEngine::infer_segmentation()` 走这条路径；`infer()` 遇到分割 Manifest 返回 `Unsupported`。姿态和 TensorRT 还没有实现。
+`yolov8_seg_raw` 有 CPU 和 CUDA 解码。它按名称读取 `output0` 和 prototype，复用检测的置信度过滤、坐标映射和 NMS，并保留 prediction index 以收集 mask 系数。重建是 `M = a · P`，不再做 Sigmoid；二值规则必须显式写成 `M > 0`。`retina_masks=false` 时 mask 是模型输入尺寸，`true` 时是原图尺寸。CUDA 路径把 mask 留在 CUDA Tensor 上，失败时不会退回 CPU。Kernel 使用默认 stream，不是 `DeviceContext` 自己的 stream。缺 `retina_masks`、NMS 或 mask 内存预算时返回 `UnresolvedField`。`InferenceEngine::infer_segmentation()` 走这条路径；`infer()` 遇到分割 Manifest 返回 `Unsupported`。TensorRT 还没有实现。
 
 `yolov8_obb_raw` 读取已经解码好的 `cx, cy, width, height, class probabilities, angle`。角度是弧度，范围 `[-pi/4, 3pi/4]`，宽边方向是 `(cos, sin)`。`infer_obb()` 用调用者给出的置信度、IoU 和 Top-K 做旋转矩形的多边形 NMS，再把框映射回原图。各向同性缩放保持角度；各向异性缩放先反映射四个顶点，再拟合最小面积矩形。顶点离开原图的框会被丢掉，不会裁成可见碎片。CUDA EP 把整份输出拷回 CPU 后使用同一个 Decoder，这次拷贝计入 `d2h_bytes`。`infer()` 遇到 OBB Manifest 返回 `Unsupported`。
 
@@ -130,6 +130,26 @@ obb.device = vie::DeviceType::Cpu;
 vie::InferenceEngine oriented;
 oriented.load(obb);
 vie::ObbBatch found = oriented.infer_obb(image, obb_runtime);
+```
+
+`yolov8_pose_raw` 读取已经解码好的 `cx, cy, width, height, class probabilities`，后面是若干组 `x, y, confidence`。关键点个数来自 Manifest，不写死成 17。`confidence` 是图内 Sigmoid 之后的概率，Ultralytics 把这一通道叫做 visible；它不是 COCO 的 0/1/2 可见性，也不是人体检测分数。低关键点分数不会删掉人体。`infer_pose()` 用调用者给出的置信度、IoU 和 Top-K 对人体框做 NMS，框和关键点分别映射回原图。关键点使用各自的 `scale_x`、`scale_y` 和 crop/pad 原点，不从框中心反推，也不裁到图像边缘；落在原图外时 `inside_image` 为 false。CUDA EP 把整份输出拷回 CPU 后使用同一个 Decoder，这次拷贝计入 `d2h_bytes`。`infer()` 遇到 Pose Manifest 返回 `Unsupported`。颜色、resize 和归一化仍由调用者填写。
+
+```cpp
+vie::PoseRuntimeConfig pose_runtime;
+pose_runtime.confidence_threshold = 0.25f;
+pose_runtime.iou_threshold = 0.45f;
+pose_runtime.class_selection = vie::ClassSelection::BestClass;
+pose_runtime.class_aware = true;
+pose_runtime.nms_enabled = true;
+pose_runtime.pre_nms_top_k = 1000;
+pose_runtime.max_detections = 300;
+vie::ModelConfig pose;
+pose.manifest = pose_manifest;  // 识别器可填 task、protocol 和 pose；颜色、resize、归一化仍由调用者填写
+pose.model_path = "yolov8n-pose.onnx";
+pose.device = vie::DeviceType::Cpu;
+vie::InferenceEngine posed;
+posed.load(pose);
+vie::PoseBatch people = posed.infer_pose(image, pose_runtime);
 ```
 
 分类识别接受全局池化后的单个线性头。输出前没有 Softmax 时协议是 `classification_logits_raw`；同一条路径上、axis 与类别轴一致的 Softmax 使用 `classification_probabilities_raw`。它不填写颜色、resize、归一化或类别名，也不把 1000 维当成 ImageNet。Sigmoid 和单独的 Softmax 不会被认成单标签分类。

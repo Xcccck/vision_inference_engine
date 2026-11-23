@@ -351,6 +351,68 @@ ModelManifest ManifestGenerator::generate(const ModelAnalysisReport& report,
       }
     }
   }
+  if (selected != nullptr && selected->architecture == "yolov8_pose") {
+    const std::string because = joined_evidence(*selected);
+    manifest.model_family = selected->family;
+    manifest.task = TaskType::Pose;
+    put(manifest, "model_family", Certainty::Inferred, because);
+    put(manifest, "task", Certainty::Inferred, because);
+    if (selected->decoder.num_classes.has_value()) {
+      manifest.num_classes = selected->decoder.num_classes;
+      put(manifest, "num_classes", Certainty::Inferred, because);
+    }
+    if (manifest.input.shape.size() == 4 && manifest.input.shape[1] == 3) {
+      manifest.input.layout = Layout::Nchw;
+      put(manifest, "input.layout", Certainty::Inferred, "declared input axis 1 is static 3");
+    }
+    manifest.decoder.protocol = selected->decoder.protocol;
+    put(manifest, "decoder.protocol", Certainty::Inferred, because);
+    manifest.decoder.box_format = "cxcywh";
+    put(manifest, "decoder.box_format", Certainty::Inferred, because);
+    manifest.decoder.box_decode = "decoded_cxcywh";
+    put(manifest, "decoder.box_decode", Certainty::Inferred,
+        "the box branch is a stride Mul of Div and Sub, so the center and size are already model-input pixels");
+    manifest.decoder.box_channels = 4;
+    put(manifest, "decoder.box_channels", Certainty::Inferred, because);
+    manifest.decoder.scores_are_probabilities = true;
+    put(manifest, "decoder.scores_are_probabilities", Certainty::Inferred, because);
+    if (selected->decoder.channel_axis >= 0) {
+      manifest.decoder.channel_axis = selected->decoder.channel_axis;
+      put(manifest, "decoder.channel_axis", Certainty::Inferred, because);
+    }
+    if (selected->decoder.reg_max.has_value()) {
+      manifest.decoder.reg_max = selected->decoder.reg_max;
+      put(manifest, "decoder.reg_max", Certainty::Inferred, because);
+    }
+    manifest.pose.output_name = selected->decoder.output_name;
+    put(manifest, "pose.output_name", Certainty::Observed, "declared output name");
+    if (selected->decoder.channel_axis >= 0) {
+      manifest.pose.channel_axis = selected->decoder.channel_axis;
+      put(manifest, "pose.channel_axis", Certainty::Inferred, because);
+    }
+    if (selected->decoder.keypoint_count.has_value()) {
+      manifest.pose.keypoint_count = selected->decoder.keypoint_count;
+      put(manifest, "pose.keypoint_count", Certainty::Inferred, because);
+    }
+    if (selected->decoder.keypoint_dimensions.has_value()) {
+      manifest.pose.keypoint_dimensions = selected->decoder.keypoint_dimensions;
+      put(manifest, "pose.keypoint_dimensions", Certainty::Inferred,
+          "the keypoint branch sigmoids one sliced field and the conv width is divisible by 3");
+    }
+    if (!selected->decoder.keypoint_layout.empty()) {
+      manifest.pose.keypoint_layout = selected->decoder.keypoint_layout;
+      put(manifest, "pose.keypoint_layout", Certainty::Inferred,
+          "each keypoint group is x, y, and the sigmoid of the third channel; that value is not a COCO visibility label");
+    }
+    manifest.pose.score_type = "probabilities";
+    put(manifest, "pose.score_type", Certainty::Inferred, "the class branch is a Sigmoid");
+    for (std::size_t index = 0; index < manifest.outputs.size(); ++index) {
+      if (manifest.outputs[index].name == selected->decoder.output_name) {
+        manifest.outputs[index].semantic = "poses";
+        put(manifest, "outputs." + std::to_string(index) + ".semantic", Certainty::Inferred, because);
+      }
+    }
+  }
   if (selected != nullptr && selected->architecture == "single_label_classification") {
     const std::string because = joined_evidence(*selected);
     if (!selected->family.empty()) {

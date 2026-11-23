@@ -2,6 +2,7 @@
 
 #include "vie/core/tensor.hpp"
 #include "vie/decoder/obb.hpp"
+#include "vie/decoder/pose.hpp"
 #include "vie/decoder/segmentation.hpp"
 
 #include <map>
@@ -73,6 +74,11 @@ class IModelDecoder {
   // for an oriented-box decoder. Rotated NMS in this phase is CPU-only.
   virtual ObbBatch decode_obb(const DecoderInput& input, const ObbDecodeConfig& config,
                               const DeviceContext& device) const;
+
+  // Pose path. The default refuses so a detection decoder cannot be mistaken
+  // for a keypoint decoder. Pose NMS in this phase is CPU-only.
+  virtual PoseBatch decode_pose(const DecoderInput& input, const PoseDecodeConfig& config,
+                                const DeviceContext& device) const;
 };
 
 }  // namespace vie

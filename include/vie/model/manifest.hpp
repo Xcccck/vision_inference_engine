@@ -80,6 +80,19 @@ struct SegmentationDesc {
   std::optional<std::size_t> max_mask_bytes;
 };
 
+// YOLOv8-Pose output contract. Runtime thresholds stay on the call, not here.
+// keypoint_count comes from the proved keypoint convs, not from a filename.
+// keypoint_layout "xy_confidence" means groups of x, y, and the third-channel
+// sigmoid. That sigmoid is not a COCO visibility label.
+struct PoseDesc {
+  std::string output_name;
+  std::optional<int> channel_axis;
+  std::optional<int> keypoint_count;
+  std::optional<int> keypoint_dimensions;
+  std::string keypoint_layout;
+  std::string score_type;
+};
+
 // YOLOv8-OBB output contract. Runtime thresholds stay on the call, not here.
 // angle_range is the image of a proven affine, not a guess from the channel count.
 struct ObbDesc {
@@ -130,6 +143,7 @@ class ModelManifest {
   SegmentationDesc segmentation;
   ClassificationDesc classification;
   ObbDesc obb;
+  PoseDesc pose;
   std::map<std::string, FieldProvenance> provenance;
 
   static ModelManifest from_json_string(std::string_view json_text);

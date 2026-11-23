@@ -43,6 +43,10 @@ struct DecoderCandidate {
   // Classification only. Unset for detection and segmentation candidates.
   std::optional<int> class_axis;
   std::string score_type;
+  // Pose only. Unset unless the keypoint branch was proved.
+  std::optional<int> keypoint_count;
+  std::optional<int> keypoint_dimensions;
+  std::string keypoint_layout;
 };
 
 struct RecognitionCandidate {

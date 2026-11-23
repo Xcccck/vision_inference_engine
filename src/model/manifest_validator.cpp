@@ -361,6 +361,73 @@ ManifestValidation ManifestValidator::validate(const ModelManifest& manifest) co
        !manifest.obb.angle_unit.empty() || !manifest.obb.angle_range.empty() || !manifest.obb.score_type.empty())) {
     report.schema_issues.push_back({"obb", "obb fields require task obb"});
   }
+  if (manifest.task == TaskType::Pose && manifest.decoder.protocol != "yolov8_pose_raw") {
+    report.schema_issues.push_back({"decoder.protocol", "task pose requires yolov8_pose_raw"});
+  }
+  if (manifest.decoder.protocol == "yolov8_pose_raw" && manifest.task != TaskType::Pose) {
+    report.schema_issues.push_back({"task", "yolov8_pose_raw requires task pose"});
+  }
+  if (manifest.decoder.protocol == "yolov8_pose_raw") {
+    require("pose.output_name", !manifest.pose.output_name.empty(), "pose output name is unresolved");
+    require("pose.channel_axis", manifest.pose.channel_axis.has_value(), "pose channel axis is unresolved");
+    require("pose.keypoint_count", manifest.pose.keypoint_count.has_value() && *manifest.pose.keypoint_count >= 1,
+            "pose keypoint count is unresolved");
+    require("pose.keypoint_dimensions", manifest.pose.keypoint_dimensions == 3,
+            "pose keypoint dimensions are unresolved");
+    require("pose.keypoint_layout", manifest.pose.keypoint_layout == "xy_confidence",
+            "pose keypoint layout is unresolved");
+    require("pose.score_type", manifest.pose.score_type == "probabilities", "pose score type is unresolved");
+    require("decoder.box_format", manifest.decoder.box_format == "cxcywh", "pose box format must be cxcywh");
+    require("decoder.box_channels", manifest.decoder.box_channels == 4, "pose box channels must be 4");
+    require("decoder.box_decode", manifest.decoder.box_decode == "decoded_cxcywh",
+            "pose boxes must already be decoded cxcywh pixels");
+    require("decoder.scores_are_probabilities", manifest.decoder.scores_are_probabilities == true,
+            "pose class scores must already be probabilities");
+    if (manifest.pose.channel_axis.has_value() && manifest.decoder.channel_axis.has_value() &&
+        *manifest.pose.channel_axis != *manifest.decoder.channel_axis) {
+      report.schema_issues.push_back({"pose.channel_axis", "does not match decoder.channel_axis"});
+    }
+  }
+  if (manifest.pose.keypoint_count.has_value() && *manifest.pose.keypoint_count < 1) {
+    report.schema_issues.push_back({"pose.keypoint_count", "must be >= 1"});
+  }
+  if (manifest.pose.keypoint_dimensions.has_value() && *manifest.pose.keypoint_dimensions != 3) {
+    report.schema_issues.push_back({"pose.keypoint_dimensions", "must be 3"});
+  }
+  if (!manifest.pose.keypoint_layout.empty() && manifest.pose.keypoint_layout != "xy_confidence") {
+    report.schema_issues.push_back({"pose.keypoint_layout", "unsupported keypoint layout"});
+  }
+  if (!manifest.pose.score_type.empty() && manifest.pose.score_type != "probabilities") {
+    report.schema_issues.push_back({"pose.score_type", "unsupported score type"});
+  }
+  if (manifest.task != TaskType::Pose && manifest.decoder.protocol != "yolov8_pose_raw" &&
+      (!manifest.pose.output_name.empty() || manifest.pose.channel_axis.has_value() ||
+       manifest.pose.keypoint_count.has_value() || manifest.pose.keypoint_dimensions.has_value() ||
+       !manifest.pose.keypoint_layout.empty() || !manifest.pose.score_type.empty())) {
+    report.schema_issues.push_back({"pose", "pose fields require task pose"});
+  }
+  if (!manifest.pose.output_name.empty()) {
+    const OutputDesc* named = nullptr;
+    for (const OutputDesc& output : manifest.outputs) {
+      if (output.name == manifest.pose.output_name) named = &output;
+    }
+    if (named == nullptr) {
+      report.schema_issues.push_back({"pose.output_name", "does not match an output"});
+    } else if (manifest.pose.channel_axis.has_value() && manifest.pose.keypoint_count.has_value() &&
+               manifest.pose.keypoint_dimensions.has_value() && !named->shape.empty() &&
+               is_concrete_shape(named->shape) && manifest.num_classes.has_value()) {
+      const int axis = *manifest.pose.channel_axis;
+      const std::int64_t expect = static_cast<std::int64_t>(4 + *manifest.num_classes +
+                                                            *manifest.pose.keypoint_count *
+                                                                *manifest.pose.keypoint_dimensions);
+      if (named->shape.size() != 3 || axis < 0 || axis >= static_cast<int>(named->shape.size())) {
+        report.schema_issues.push_back({"pose.channel_axis", "is outside rank 3"});
+      } else if (named->shape[static_cast<std::size_t>(axis)] != expect) {
+        report.schema_issues.push_back(
+            {"pose.channel_axis", "length is not 4 + num_classes + keypoint_count * keypoint_dimensions"});
+      }
+    }
+  }
   if (!manifest.obb.output_name.empty()) {
     const OutputDesc* named = nullptr;
     for (const OutputDesc& output : manifest.outputs) {

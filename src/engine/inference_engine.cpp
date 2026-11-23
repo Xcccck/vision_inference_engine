@@ -7,6 +7,7 @@
 #include "vie/decoder/rtdetr_cuda_decoder.hpp"
 #include "vie/decoder/yolov8_detect_decoder.hpp"
 #include "vie/decoder/yolov8_obb_decoder.hpp"
+#include "vie/decoder/yolov8_pose_decoder.hpp"
 #include "vie/decoder/yolov8_seg_decoder.hpp"
 #include "vie/model/manifest_validator.hpp"
 #include "vie/preprocess/preprocess.hpp"
@@ -254,6 +255,7 @@ InferenceEngine::InferenceEngine() {
   decoders_.register_factory("mock", [] { return std::make_unique<MockDecoder>(); });
   decoders_.register_factory("yolov8_detect_raw", [] { return std::make_unique<YoloV8DetectionDecoder>(); });
   decoders_.register_factory("yolov8_obb_raw", [] { return std::make_unique<YoloV8ObbDecoder>(); });
+  decoders_.register_factory("yolov8_pose_raw", [] { return std::make_unique<YoloV8PoseDecoder>(); });
   decoders_.register_factory("yolov8_seg_raw", [] { return std::make_unique<YoloV8SegmentationDecoder>(); });
   decoders_.register_factory("rtdetr_detection_raw", [] { return std::make_unique<RtdetrDetectionDecoder>(); });
   decoders_.register_factory("classification_logits_raw",
@@ -376,6 +378,9 @@ DetectionBatch InferenceEngine::infer(const ImageInput& image, DetectionInferTim
   }
   if (manifest_.task == TaskType::Obb) {
     throw VieError(ErrorCode::Unsupported, "task obb does not produce DetectionBatch; call infer_obb()");
+  }
+  if (manifest_.task == TaskType::Pose) {
+    throw VieError(ErrorCode::Unsupported, "task pose does not produce DetectionBatch; call infer_pose()");
   }
   const auto total_start = std::chrono::steady_clock::now();
   const PreprocessResult prepared = preprocess(image);
@@ -612,6 +617,88 @@ ObbBatch InferenceEngine::infer_obb(const ImageInput& image, const ObbRuntimeCon
     timing->validate_ms = batch.results.empty() ? 0 : batch.results[0].validate_ms;
     timing->nms_ms = batch.results.empty() ? 0 : batch.results[0].nms_ms;
     timing->decode_ms = d2h_ms + timing->validate_ms + timing->nms_ms;
+    timing->total_ms = elapsed_ms(total_start);
+    timing->output_bytes = output_bytes;
+    timing->d2h_bytes = d2h_bytes;
+    timing->candidates_before_nms = batch.results.empty() ? 0 : batch.results[0].candidates_before_nms;
+    timing->results_after_nms = batch.results.empty() ? 0 : static_cast<int>(batch.results[0].objects.size());
+    timing->includes_sync = device_.device() == DeviceType::Cuda;
+    timing->includes_h2d = false;
+    timing->includes_d2h = d2h_bytes > 0;
+  }
+  return batch;
+}
+
+PoseBatch InferenceEngine::infer_pose(const ImageInput& image, const PoseRuntimeConfig& runtime,
+                                      PoseInferTiming* timing) {
+  if (!loaded_ || backend_ == nullptr || decoder_ == nullptr) {
+    throw VieError(ErrorCode::InvalidArgument, "engine is not loaded");
+  }
+  if (manifest_.task != TaskType::Pose) {
+    throw VieError(ErrorCode::Unsupported, "infer_pose() requires task pose");
+  }
+  if (manifest_.decoder.protocol != "yolov8_pose_raw") {
+    throw VieError(ErrorCode::Unsupported, "infer_pose() requires decoder protocol yolov8_pose_raw");
+  }
+  PoseDecodeConfig config;
+  config.output_name = manifest_.pose.output_name;
+  config.channel_axis = manifest_.pose.channel_axis.value_or(-1);
+  config.num_classes = manifest_.num_classes.value_or(0);
+  config.keypoint_count = manifest_.pose.keypoint_count.value_or(0);
+  config.keypoint_dimensions = manifest_.pose.keypoint_dimensions.value_or(0);
+  config.class_selection = runtime.class_selection;
+  config.confidence_threshold = runtime.confidence_threshold;
+  config.nms_enabled = runtime.nms_enabled;
+  config.class_aware = runtime.class_aware;
+  config.iou_threshold = runtime.iou_threshold;
+  config.max_detections = runtime.max_detections;
+  config.pre_nms_top_k = runtime.pre_nms_top_k;
+
+  const auto total_start = std::chrono::steady_clock::now();
+  const PreprocessResult prepared = preprocess(image);
+  const double preprocess_ms = elapsed_ms(total_start);
+  require_same_device(prepared.output, device_, "preprocess output");
+  BackendRequest request;
+  request.inputs.emplace(manifest_.input.name, prepared.output);
+  const auto execute_start = std::chrono::steady_clock::now();
+  const BackendOutput output = execute(request);
+  const double execute_ms = elapsed_ms(execute_start);
+  const auto found = output.tensors.find(config.output_name);
+  if (found == output.tensors.end()) {
+    throw VieError(ErrorCode::InvalidArgument, "pose output '" + config.output_name + "' is missing");
+  }
+  require_same_device(found->second.tensor, device_, "backend output '" + config.output_name + "'");
+  Tensor scores = found->second.tensor;
+  const std::size_t output_bytes = scores.nbytes();
+  std::size_t d2h_bytes = 0;
+  double d2h_ms = 0;
+  if (scores.is_cuda()) {
+    const auto d2h_start = std::chrono::steady_clock::now();
+    scores = scores.to(DeviceContext(DeviceType::Cpu, 0));
+    d2h_ms = elapsed_ms(d2h_start);
+    d2h_bytes = output_bytes;
+  }
+  DecoderInput decoded;
+  decoded.geometry = prepared.geometry;
+  decoded.outputs.emplace(config.output_name, std::move(scores));
+  PoseBatch batch = decoder_->decode_pose(decoded, config, DeviceContext{});
+  if (!batch.results.empty()) {
+    batch.results[0].output_bytes = output_bytes;
+    batch.results[0].d2h_bytes = d2h_bytes;
+    batch.results[0].d2h_ms = d2h_ms;
+    batch.results[0].preprocess_ms = preprocess_ms;
+    batch.results[0].execute_ms = execute_ms;
+    batch.results[0].decode_ms = d2h_ms + batch.results[0].validate_ms + batch.results[0].pose_decode_ms +
+                                 batch.results[0].nms_ms;
+  }
+  if (timing != nullptr) {
+    timing->preprocess_ms = preprocess_ms;
+    timing->execute_ms = execute_ms;
+    timing->d2h_ms = d2h_ms;
+    timing->validate_ms = batch.results.empty() ? 0 : batch.results[0].validate_ms;
+    timing->pose_decode_ms = batch.results.empty() ? 0 : batch.results[0].pose_decode_ms;
+    timing->nms_ms = batch.results.empty() ? 0 : batch.results[0].nms_ms;
+    timing->decode_ms = d2h_ms + timing->validate_ms + timing->pose_decode_ms + timing->nms_ms;
     timing->total_ms = elapsed_ms(total_start);
     timing->output_bytes = output_bytes;
     timing->d2h_bytes = d2h_bytes;
