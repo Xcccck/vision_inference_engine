@@ -33,6 +33,10 @@ struct ClassificationResult {
   int execution_device_id = 0;
   std::size_t output_bytes = 0;
   std::size_t d2h_bytes = 0;
+  // CPU time inside the decoder. validate_ms is the numeric check. topk_ms is
+  // only the sort. The engine adds the explicit D2H separately.
+  double validate_ms = 0;
+  double topk_ms = 0;
 };
 
 // One result per image. The first decoder fills a single result for batch 1.
@@ -50,10 +54,28 @@ struct ClassificationDecodeRequest {
   std::vector<std::string> class_names;
 };
 
+// Fixed protocol tolerance for a single-label probability vector. The sum is
+// accumulated in FP64. Values outside [0, 1], or a sum farther than this from
+// 1, are rejected and are not renormalized.
+inline constexpr double kClassificationProbabilitySumTolerance = 1e-3;
+
 // Protocol classification_logits_raw. Rank-2 FP32 logits, batch 1. It does not
-// run Softmax. A CUDA tensor is refused; the engine copies the logits vector
-// to CPU before calling this decoder.
+// run Softmax. A CUDA tensor is refused; the engine copies the vector to CPU
+// before calling this decoder.
 class ClassificationDecoder : public IModelDecoder {
+ public:
+  std::string protocol() const override;
+  RawPredictions decode(const std::map<std::string, Tensor>& outputs,
+                        const DecoderContext& context) const override;
+  ClassificationBatch decode_classification(const DecoderInput& input,
+                                            const ClassificationDecodeRequest& request,
+                                            const DeviceContext& device) const override;
+};
+
+// Protocol classification_probabilities_raw. Rank-2 FP32 probabilities that
+// the model already produced. It does not run Softmax, Sigmoid, or any
+// renormalization. A CUDA tensor is refused.
+class ClassificationProbabilitiesDecoder : public IModelDecoder {
  public:
   std::string protocol() const override;
   RawPredictions decode(const std::map<std::string, Tensor>& outputs,

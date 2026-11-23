@@ -125,6 +125,7 @@ bool bias_matches(const GraphIndex& index, const std::string& name, int num_clas
 
 struct LinearHead {
   const OnnxNode* node = nullptr;
+  const OnnxNode* softmax = nullptr;
   std::string bias_name;
   std::vector<std::string> path;
 };
@@ -140,6 +141,12 @@ std::optional<LinearHead> classification_head(const GraphIndex& index, const std
     if (node == nullptr || node->inputs.empty()) return std::nullopt;
     head.path.push_back(node->op_type);
     if (passthrough(node->op_type)) {
+      current = node->inputs[0];
+      continue;
+    }
+    if (node->op_type == "Softmax") {
+      if (head.softmax != nullptr || node->inputs.empty()) return std::nullopt;
+      head.softmax = node;
       current = node->inputs[0];
       continue;
     }
@@ -212,6 +219,35 @@ bool weight_produces_classes(const OnnxNode& node, const InitializerInfo& weight
   return classes == num_classes && features >= 1;
 }
 
+std::optional<int> softmax_axis(const OnnxNode& node, const ModelAnalysisReport& report) {
+  constexpr int kRank = 2;
+  std::optional<std::int64_t> opset;
+  for (const OnnxOpset& item : report.opsets) {
+    if (item.domain == "ai.onnx") {
+      opset = item.version;
+      break;
+    }
+  }
+  const std::optional<std::int64_t> attribute = scalar_attribute(node, "axis");
+  std::int64_t axis = 0;
+  if (attribute.has_value()) {
+    axis = *attribute;
+  } else if (opset.has_value() && *opset >= 13) {
+    axis = -1;
+  } else if (opset.has_value()) {
+    axis = 1;
+  } else {
+    return std::nullopt;
+  }
+  if (axis < 0) axis += kRank;
+  if (axis < 0 || axis >= kRank) return std::nullopt;
+  // Before opset 13, Softmax runs from the axis through the end of the tensor.
+  // On rank 2 that is a single class axis only when the axis is the last one.
+  if (opset.has_value() && *opset < 13 && axis != kRank - 1) return std::nullopt;
+  if (!opset.has_value() && !attribute.has_value()) return std::nullopt;
+  return static_cast<int>(axis);
+}
+
 bool has_conv(const ModelAnalysisReport& report) {
   for (const OperatorStat& stat : report.operators) {
     if (stat.domain == "ai.onnx" && stat.op_type == "Conv" && stat.count > 0) return true;
@@ -267,6 +303,14 @@ std::optional<RecognitionCandidate> ClassificationRecognizer::consider(
   const std::optional<PoolPath> pool = pool_feeding(index, head->node->inputs[0]);
   if (!pool.has_value()) return std::nullopt;
 
+  const bool probabilities = head->softmax != nullptr;
+  int resolved_softmax_axis = -1;
+  if (probabilities) {
+    const std::optional<int> axis = softmax_axis(*head->softmax, report);
+    if (!axis.has_value() || *axis != layout->class_axis) return std::nullopt;
+    resolved_softmax_axis = *axis;
+  }
+
   RecognitionCandidate candidate;
   candidate.recognizer_id = id();
   candidate.architecture = "single_label_classification";
@@ -289,16 +333,23 @@ std::optional<RecognitionCandidate> ClassificationRecognizer::consider(
     for (const std::string& hop : pool->hops) pool_detail += " " + hop;
   }
   candidate.evidence.push_back({"global_pool_path", pool_detail});
-  candidate.evidence.push_back(
-      {"logits_output", "the path from the linear head to '" + output.name +
-                            "' has no Softmax, Sigmoid, or other output activation"});
+  if (probabilities) {
+    candidate.evidence.push_back(
+        {"softmax_probabilities", "Softmax axis " + std::to_string(resolved_softmax_axis) +
+                                      " follows the linear head and matches the class axis"});
+  } else {
+    candidate.evidence.push_back(
+        {"logits_output", "the path from the linear head to '" + output.name +
+                              "' has no Softmax, Sigmoid, or other output activation"});
+  }
   candidate.evidence.push_back(
       {"single_label_output", "the graph declares one output and that output is the linear class vector"});
-  candidate.decoder.protocol = "classification_logits_raw";
+  candidate.decoder.protocol =
+      probabilities ? "classification_probabilities_raw" : "classification_logits_raw";
   candidate.decoder.output_name = output.name;
   candidate.decoder.num_classes = layout->num_classes;
   candidate.decoder.class_axis = layout->class_axis;
-  candidate.decoder.score_type = "logits";
+  candidate.decoder.score_type = probabilities ? "probabilities" : "logits";
   return candidate;
 }
 

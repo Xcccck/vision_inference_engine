@@ -256,6 +256,8 @@ InferenceEngine::InferenceEngine() {
   decoders_.register_factory("rtdetr_detection_raw", [] { return std::make_unique<RtdetrDetectionDecoder>(); });
   decoders_.register_factory("classification_logits_raw",
                              [] { return std::make_unique<ClassificationDecoder>(); });
+  decoders_.register_factory("classification_probabilities_raw",
+                             [] { return std::make_unique<ClassificationProbabilitiesDecoder>(); });
 #if defined(VIE_HAS_ONNXRUNTIME)
   backends_.register_factory(BackendKind::OnnxRuntime,
                              [] { return std::make_unique<OnnxRuntimeBackend>(); });
@@ -469,9 +471,11 @@ ClassificationBatch InferenceEngine::infer_classification(const ImageInput& imag
   if (manifest_.task != TaskType::Classification) {
     throw VieError(ErrorCode::Unsupported, "infer_classification() requires task classification");
   }
-  if (manifest_.decoder.protocol != "classification_logits_raw") {
+  if (manifest_.decoder.protocol != "classification_logits_raw" &&
+      manifest_.decoder.protocol != "classification_probabilities_raw") {
     throw VieError(ErrorCode::Unsupported,
-                   "infer_classification() requires decoder protocol classification_logits_raw");
+                   "infer_classification() requires classification_logits_raw or "
+                   "classification_probabilities_raw");
   }
   if (!runtime.top_k.has_value()) {
     throw VieError(ErrorCode::UnresolvedField, "classification top_k is unresolved");
@@ -493,13 +497,13 @@ ClassificationBatch InferenceEngine::infer_classification(const ImageInput& imag
     throw VieError(ErrorCode::InvalidArgument, "classification output '" + output_name + "' is missing");
   }
   require_same_device(found->second.tensor, device_, "backend output '" + output_name + "'");
-  Tensor logits = found->second.tensor;
-  const std::size_t output_bytes = logits.nbytes();
+  Tensor scores = found->second.tensor;
+  const std::size_t output_bytes = scores.nbytes();
   std::size_t d2h_bytes = 0;
   double d2h_ms = 0;
-  if (logits.is_cuda()) {
+  if (scores.is_cuda()) {
     const auto d2h_start = std::chrono::steady_clock::now();
-    logits = logits.to(DeviceContext(DeviceType::Cpu, 0));
+    scores = scores.to(DeviceContext(DeviceType::Cpu, 0));
     d2h_ms = elapsed_ms(d2h_start);
     d2h_bytes = output_bytes;
   }
@@ -512,10 +516,10 @@ ClassificationBatch InferenceEngine::infer_classification(const ImageInput& imag
   decoded.score_type = manifest_.classification.score_type;
   decoded.class_names = manifest_.classification.class_names;
   DecoderInput decoder_input;
-  decoder_input.outputs.emplace(output_name, std::move(logits));
-  const auto topk_start = std::chrono::steady_clock::now();
+  decoder_input.outputs.emplace(output_name, std::move(scores));
   ClassificationBatch batch = decoder_->decode_classification(decoder_input, decoded, DeviceContext{});
-  const double topk_ms = elapsed_ms(topk_start);
+  const double validate_ms = batch.results.empty() ? 0.0 : batch.results[0].validate_ms;
+  const double topk_ms = batch.results.empty() ? 0.0 : batch.results[0].topk_ms;
   if (!batch.results.empty()) {
     batch.results[0].output_bytes = output_bytes;
     batch.results[0].d2h_bytes = d2h_bytes;
@@ -524,8 +528,9 @@ ClassificationBatch InferenceEngine::infer_classification(const ImageInput& imag
     timing->preprocess_ms = preprocess_ms;
     timing->execute_ms = execute_ms;
     timing->d2h_ms = d2h_ms;
+    timing->validate_ms = validate_ms;
     timing->topk_ms = topk_ms;
-    timing->decode_ms = d2h_ms + topk_ms;
+    timing->decode_ms = d2h_ms + validate_ms + topk_ms;
     timing->total_ms = elapsed_ms(total_start);
     timing->output_bytes = output_bytes;
     timing->d2h_bytes = d2h_bytes;

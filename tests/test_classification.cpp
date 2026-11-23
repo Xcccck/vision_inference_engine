@@ -1,3 +1,4 @@
+#include "onnx_test_writer.hpp"
 #include "test_util.hpp"
 
 #include "vie/decoder/classification.hpp"
@@ -7,12 +8,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <tuple>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -142,7 +145,7 @@ vie::ImageInput tiny_image(std::vector<std::uint8_t>& storage) {
 }  // namespace
 
 TEST(ClassificationManifest, RoundTripKeepsClassificationFields) {
-  vie::ModelManifest manifest = classification_manifest(3, "classification_logits_raw");
+  vie::ModelManifest manifest = classification_manifest(3, "classification_probabilities_raw");
   manifest.classification.class_names = {"cat", "dog", "bird"};
   manifest.classification.score_type = "probabilities";
   const vie::ModelManifest loaded =
@@ -222,6 +225,27 @@ TEST(ClassificationManifest, RejectsNameCountAndIllegalAxis) {
   axis.classification.class_axis = 2;
   const vie::ManifestValidation illegal = vie::ManifestValidator{}.validate(axis);
   EXPECT_FALSE(illegal.schema_ok());
+
+  vie::ModelManifest logits_with_probabilities =
+      classification_manifest(3, "classification_logits_raw");
+  logits_with_probabilities.classification.score_type = "probabilities";
+  const vie::ManifestValidation swapped = vie::ManifestValidator{}.validate(logits_with_probabilities);
+  EXPECT_FALSE(swapped.schema_ok());
+  EXPECT_NE(vie::format_issues(swapped.schema_issues).find("classification_probabilities_raw"),
+            std::string::npos);
+
+  vie::ModelManifest probabilities_with_logits =
+      classification_manifest(3, "classification_probabilities_raw");
+  const vie::ManifestValidation other = vie::ManifestValidator{}.validate(probabilities_with_logits);
+  EXPECT_FALSE(other.schema_ok());
+  EXPECT_NE(vie::format_issues(other.schema_issues).find("classification_logits_raw"),
+            std::string::npos);
+
+  EXPECT_THROW(vie::ModelManifest::from_json_string(R"({
+    "schema_version": "1.0",
+    "classification": {"score_type": "sigmoid"}
+  })"),
+               vie::VieError);
 }
 
 TEST(ClassificationDecoder, TopKMatchesIndependentReference) {
@@ -323,6 +347,210 @@ TEST(ClassificationDecoder, ClassAxisZeroReadsTheSlowDimension) {
   EXPECT_EQ(batch.results[0].execution_device, vie::DeviceType::Cpu);
 }
 
+vie::ClassificationDecodeRequest probability_request(int classes, int top_k) {
+  vie::ClassificationDecodeRequest request = logits_request(classes, top_k);
+  request.output_name = "probabilities";
+  request.score_type = "probabilities";
+  return request;
+}
+
+vie::DecoderInput named_probabilities(vie::Tensor tensor) {
+  vie::DecoderInput input;
+  input.outputs.emplace("probabilities", std::move(tensor));
+  return input;
+}
+
+double reference_probability_sum(const std::vector<float>& scores) {
+  double sum = 0.0;
+  for (const float score : scores) sum += static_cast<double>(score);
+  return sum;
+}
+
+void expect_probability_reference(const std::vector<float>& scores, int top_k, int class_axis,
+                                  const std::vector<std::string>& names = {}) {
+  const std::vector<std::int64_t> shape =
+      class_axis == 0 ? std::vector<std::int64_t>{static_cast<std::int64_t>(scores.size()), 1}
+                      : std::vector<std::int64_t>{1, static_cast<std::int64_t>(scores.size())};
+  vie::ClassificationDecodeRequest request = probability_request(static_cast<int>(scores.size()), top_k);
+  request.class_axis = class_axis;
+  request.class_names = names;
+  const vie::ClassificationBatch batch = vie::ClassificationProbabilitiesDecoder{}.decode_classification(
+      named_probabilities(fp32_logits(shape, scores)), request, vie::DeviceContext{});
+  const std::vector<vie::Classification> expected = reference_top_k(scores, top_k);
+  ASSERT_EQ(batch.results.size(), 1u);
+  EXPECT_EQ(batch.results[0].protocol, "classification_probabilities_raw");
+  EXPECT_EQ(batch.results[0].score_type, "probabilities");
+  EXPECT_EQ(batch.results[0].num_classes, static_cast<int>(scores.size()));
+  EXPECT_EQ(batch.results[0].top_k, top_k);
+  EXPECT_EQ(batch.results[0].execution_device, vie::DeviceType::Cpu);
+  EXPECT_NEAR(reference_probability_sum(scores), 1.0, 1e-3);
+  ASSERT_EQ(batch.results[0].labels.size(), expected.size());
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(batch.results[0].labels[i].class_id, expected[i].class_id);
+    EXPECT_FLOAT_EQ(batch.results[0].labels[i].score, expected[i].score);
+    EXPECT_FLOAT_EQ(batch.results[0].labels[i].score, scores[static_cast<std::size_t>(expected[i].class_id)]);
+    if (!names.empty()) {
+      EXPECT_EQ(batch.results[0].labels[i].class_name,
+                names[static_cast<std::size_t>(expected[i].class_id)]);
+    }
+  }
+}
+
+TEST(ClassificationProbabilitiesDecoder, TopKKeepsRawValues) {
+  expect_probability_reference({0.2f, 0.3f, 0.5f}, 1, 1);
+  expect_probability_reference({0.2f, 0.3f, 0.5f}, 3, 1, {"a", "b", "c"});
+  expect_probability_reference({0.2f, 0.3f, 0.5f}, 2, 0);
+  expect_probability_reference({0.25f, 0.25f, 0.25f, 0.25f}, 4, 1);
+  expect_probability_reference({1.f, 0.f}, 1, 1);
+
+  float edge = static_cast<float>(1e-3);
+  if (static_cast<double>(edge) > 1e-3) edge = std::nextafter(edge, 0.f);
+  while (static_cast<double>(std::nextafter(edge, 1.f)) <= 1e-3) edge = std::nextafter(edge, 1.f);
+  expect_probability_reference({1.f, 0.f, edge}, 2, 1);
+  EXPECT_LE(std::fabs(reference_probability_sum({1.f, 0.f, edge}) - 1.0), 1e-3);
+}
+
+TEST(ClassificationProbabilitiesDecoder, RejectsIllegalVectors) {
+  vie::ClassificationProbabilitiesDecoder decoder;
+  const vie::DeviceContext cpu;
+  auto scores = [](std::vector<float> values) {
+    return named_probabilities(fp32_logits({1, static_cast<std::int64_t>(values.size())}, values));
+  };
+  const std::string nan = thrown_message([&] {
+    decoder.decode_classification(scores({0.f, std::nanf(""), 1.f}), probability_request(3, 1), cpu);
+  });
+  EXPECT_NE(nan.find("probabilities"), std::string::npos);
+  EXPECT_NE(nan.find("class_id 1"), std::string::npos);
+  EXPECT_NE(nan.find("NaN"), std::string::npos);
+
+  const std::string positive_inf = thrown_message([&] {
+    decoder.decode_classification(scores({0.f, std::numeric_limits<float>::infinity(), 0.f}),
+                                  probability_request(3, 1), cpu);
+  });
+  EXPECT_NE(positive_inf.find("class_id 1"), std::string::npos);
+  EXPECT_NE(positive_inf.find("positive infinity"), std::string::npos);
+
+  const std::string negative_inf = thrown_message([&] {
+    decoder.decode_classification(scores({-std::numeric_limits<float>::infinity(), 1.f}),
+                                  probability_request(2, 1), cpu);
+  });
+  EXPECT_NE(negative_inf.find("class_id 0"), std::string::npos);
+  EXPECT_NE(negative_inf.find("negative infinity"), std::string::npos);
+
+  const std::string below = thrown_message([&] {
+    decoder.decode_classification(scores({-0.1f, 1.1f}), probability_request(2, 1), cpu);
+  });
+  EXPECT_NE(below.find("class_id 0"), std::string::npos);
+  EXPECT_NE(below.find("below 0"), std::string::npos);
+
+  const std::string above = thrown_message([&] {
+    decoder.decode_classification(scores({0.2f, 1.2f}), probability_request(2, 1), cpu);
+  });
+  EXPECT_NE(above.find("class_id 1"), std::string::npos);
+  EXPECT_NE(above.find("above 1"), std::string::npos);
+
+  const std::string short_sum = thrown_message([&] {
+    decoder.decode_classification(scores({0.2f, 0.3f, 0.4f}), probability_request(3, 1), cpu);
+  });
+  EXPECT_NE(short_sum.find("probabilities"), std::string::npos);
+  EXPECT_NE(short_sum.find("sum"), std::string::npos);
+
+  const std::string zeros = thrown_message([&] {
+    decoder.decode_classification(scores({0.f, 0.f, 0.f}), probability_request(3, 1), cpu);
+  });
+  EXPECT_NE(zeros.find("sum"), std::string::npos);
+
+  float over = static_cast<float>(1e-3);
+  if (static_cast<double>(over) <= 1e-3) over = std::nextafter(over, 1.f);
+  const std::string outside = thrown_message([&] {
+    decoder.decode_classification(scores({1.f, 0.f, over}), probability_request(3, 1), cpu);
+  });
+  EXPECT_NE(outside.find("tolerance"), std::string::npos);
+  EXPECT_GT(std::fabs(reference_probability_sum({1.f, 0.f, over}) - 1.0), 1e-3);
+
+  VIE_EXPECT_ERROR(vie::ErrorCode::InvalidArgument,
+                   decoder.decode_classification(named_probabilities(fp32_logits({0, 2}, {})),
+                                                 probability_request(2, 1), cpu));
+  VIE_EXPECT_ERROR(vie::ErrorCode::InvalidArgument,
+                   decoder.decode_classification(named_probabilities(fp32_logits({2}, {0.5f, 0.5f})),
+                                                 probability_request(2, 1), cpu));
+  VIE_EXPECT_ERROR(vie::ErrorCode::InvalidArgument, decoder.decode_classification(
+                                                        named_probabilities(vie::Tensor::zeros(
+                                                            cpu, vie::DataType::Int32, {1, 2})),
+                                                        probability_request(2, 1), cpu));
+  vie::ClassificationDecodeRequest axis = probability_request(2, 1);
+  axis.class_axis = 2;
+  VIE_EXPECT_ERROR(vie::ErrorCode::InvalidArgument,
+                   decoder.decode_classification(scores({0.5f, 0.5f}), axis, cpu));
+  VIE_EXPECT_ERROR(vie::ErrorCode::InvalidArgument,
+                   decoder.decode_classification(named_probabilities(fp32_logits({2, 2}, {0.5f, 0.5f, 0.5f, 0.5f})),
+                                                 probability_request(2, 1), cpu));
+  VIE_EXPECT_ERROR(vie::ErrorCode::InvalidArgument,
+                   decoder.decode_classification(scores({0.5f, 0.5f}), probability_request(2, 0), cpu));
+  VIE_EXPECT_ERROR(vie::ErrorCode::InvalidArgument,
+                   decoder.decode_classification(scores({0.5f, 0.5f}), probability_request(2, 3), cpu));
+  vie::ClassificationDecodeRequest names = probability_request(2, 1);
+  names.class_names = {"only"};
+  VIE_EXPECT_ERROR(vie::ErrorCode::InvalidArgument,
+                   decoder.decode_classification(scores({0.5f, 0.5f}), names, cpu));
+
+  vie::ClassificationDecodeRequest logits = probability_request(2, 1);
+  logits.score_type = "logits";
+  const std::string as_logits = thrown_message([&] {
+    decoder.decode_classification(scores({0.5f, 0.5f}), logits, cpu);
+  });
+  EXPECT_NE(as_logits.find("logits"), std::string::npos);
+  VIE_EXPECT_ERROR(vie::ErrorCode::Unsupported,
+                   decoder.decode_classification(scores({0.5f, 0.5f}), logits, cpu));
+  vie::ClassificationDecodeRequest probabilities = logits_request(2, 1);
+  probabilities.score_type = "probabilities";
+  VIE_EXPECT_ERROR(vie::ErrorCode::Unsupported,
+                   vie::ClassificationDecoder{}.decode_classification(
+                       named_logits(fp32_logits({1, 2}, {0.5f, 0.5f})), probabilities, cpu));
+}
+
+TEST(ClassificationProbabilitiesDecoder, RecordsCpuTimingWithoutChangingScores) {
+  constexpr int kClasses = 1000;
+  constexpr int kWarmup = 1;
+  constexpr int kSamples = 5;
+  std::vector<float> logits(static_cast<std::size_t>(kClasses), 0.f);
+  std::vector<float> probabilities(static_cast<std::size_t>(kClasses), 0.f);
+  for (int index = 0; index < kClasses; ++index) logits[static_cast<std::size_t>(index)] = static_cast<float>((index % 7) - 3);
+  probabilities[7] = 1.f;
+  auto measure = [](auto& decoder, const vie::ClassificationDecodeRequest& request, vie::DecoderInput input) {
+    std::vector<double> validate_ms;
+    std::vector<double> topk_ms;
+    vie::ClassificationBatch last;
+    for (int sample = 0; sample < kWarmup + kSamples; ++sample) {
+      last = decoder.decode_classification(input, request, vie::DeviceContext{});
+      if (sample >= kWarmup) {
+        validate_ms.push_back(last.results.at(0).validate_ms);
+        topk_ms.push_back(last.results.at(0).topk_ms);
+      }
+    }
+    return std::tuple<vie::ClassificationBatch, double, double>{
+        last, std::accumulate(validate_ms.begin(), validate_ms.end(), 0.0) / kSamples,
+        std::accumulate(topk_ms.begin(), topk_ms.end(), 0.0) / kSamples};
+  };
+  vie::ClassificationDecoder logits_decoder;
+  vie::ClassificationProbabilitiesDecoder probability_decoder;
+  const auto [logits_batch, logits_validate, logits_topk] = measure(
+      logits_decoder, logits_request(kClasses, 5),
+      named_logits(fp32_logits({1, kClasses}, logits)));
+  const auto [probability_batch, probability_validate, probability_topk] = measure(
+      probability_decoder, probability_request(kClasses, 5),
+      named_probabilities(fp32_logits({1, kClasses}, probabilities)));
+  EXPECT_EQ(logits_batch.results[0].labels[0].class_id, reference_top_k(logits, 1)[0].class_id);
+  EXPECT_FLOAT_EQ(probability_batch.results[0].labels[0].score, 1.f);
+  EXPECT_EQ(probability_batch.results[0].labels[0].class_id, 7);
+  std::ofstream record("/tmp/vie_phase65_decoder_timing.txt");
+  record << "classes 1000 dtype fp32 batch 1 device cpu includes_d2h 0 warmup " << kWarmup
+         << " samples " << kSamples << "\n";
+  record << "logits validate_ms_mean " << logits_validate << " topk_ms_mean " << logits_topk << "\n";
+  record << "probabilities validate_ms_mean " << probability_validate << " topk_ms_mean " << probability_topk
+         << "\n";
+}
+
 TEST(ClassificationEngine, MockTopKAndTaskDispatch) {
   vie::InferenceEngine engine;
   vie::ModelConfig config;
@@ -353,8 +581,9 @@ TEST(ClassificationEngine, MockTopKAndTaskDispatch) {
   EXPECT_EQ(timing.d2h_bytes, 0u);
   EXPECT_FALSE(timing.includes_d2h);
   EXPECT_GE(timing.execute_ms, 0.0);
+  EXPECT_GE(timing.validate_ms, 0.0);
   EXPECT_GE(timing.topk_ms, 0.0);
-  EXPECT_DOUBLE_EQ(timing.decode_ms, timing.d2h_ms + timing.topk_ms);
+  EXPECT_DOUBLE_EQ(timing.decode_ms, timing.d2h_ms + timing.validate_ms + timing.topk_ms);
 
   vie::InferenceEngine detection;
   vie::ModelConfig detection_config;
@@ -368,8 +597,15 @@ TEST(ClassificationEngine, MockTopKAndTaskDispatch) {
   ASSERT_EQ(predictions.detections.size(), 1u);
   EXPECT_FLOAT_EQ(predictions.detections[0].score, 0.9f);
 
+  vie::ModelConfig swapped;
+  swapped.manifest = classification_manifest(3, "classification_logits_raw");
+  swapped.manifest->classification.score_type = "probabilities";
+  vie::InferenceEngine swapped_engine;
+  VIE_EXPECT_ERROR(vie::ErrorCode::SchemaError, swapped_engine.load(swapped));
+
   vie::ModelConfig mismatch;
   mismatch.manifest = classification_manifest(4, "mock");
+  mismatch.manifest->classification.score_type.clear();
   vie::InferenceEngine wrong_protocol;
   wrong_protocol.load(mismatch);
   VIE_EXPECT_ERROR(vie::ErrorCode::Unsupported,
@@ -556,6 +792,182 @@ TEST(ClassificationOnnx, UntrainedResNetExecutesAndDecodes) {
 #else
   std::ofstream record("/tmp/vie_phase62_cpu_pkg.txt");
   record_path(record, "cpu_package_cpu_ep", timing, batch);
+#endif
+}
+
+OnnxTestWriter typed_int_attr(std::string_view name, std::int64_t value) {
+  OnnxTestWriter message = attr_int(name, value);
+  message.i64(20, 2);
+  return message;
+}
+
+std::string write_softmax_model() {
+  const float weight[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  const float bias[2] = {1.f, 0.f};
+  const std::string weight_raw(reinterpret_cast<const char*>(weight), sizeof(weight));
+  const std::string bias_raw(reinterpret_cast<const char*>(bias), sizeof(bias));
+  OnnxTestWriter graph;
+  graph.text(2, "softmax_classifier");
+  graph.message(1, node_message("GlobalAveragePool", {"images"}, {"pooled"}));
+  graph.message(1, node_message("Flatten", {"pooled"}, {"flat"}, {typed_int_attr("axis", 1)}));
+  graph.message(1, node_message("Gemm", {"flat", "weight", "bias"}, {"pre"}, {typed_int_attr("transB", 1)}));
+  graph.message(1, node_message("Softmax", {"pre"}, {"probabilities"}, {typed_int_attr("axis", 1)}));
+  graph.message(5, tensor_message("weight", 1, {2, 3}, {}, weight_raw, false));
+  graph.message(5, tensor_message("bias", 1, {2}, {}, bias_raw, false));
+  graph.message(11, value_info("images", tensor_type(1, true, {static_dim(1), static_dim(3), static_dim(8),
+                                                              static_dim(8)})));
+  graph.message(12, value_info("probabilities", tensor_type(1, true, {static_dim(1), static_dim(2)})));
+  OnnxTestWriter model;
+  model.i64(1, 10);
+  model.message(7, graph);
+  model.message(8, opset_import("", 17));
+  const std::filesystem::path path = std::filesystem::temp_directory_path() / "vie_softmax_classifier.onnx";
+  std::ofstream output(path, std::ios::binary);
+  output.write(model.str().data(), static_cast<std::streamsize>(model.str().size()));
+  if (!output) throw std::runtime_error("failed to write the softmax fixture");
+  return path.string();
+}
+
+vie::ModelManifest softmax_manifest() {
+  vie::ModelManifest manifest = classification_manifest(2, "classification_probabilities_raw");
+  manifest.model_format = vie::ModelFormat::Onnx;
+  manifest.input.normalization = "none";
+  manifest.classification.output_name = "probabilities";
+  manifest.classification.score_type = "probabilities";
+  manifest.outputs.clear();
+  vie::OutputDesc output;
+  output.name = "probabilities";
+  output.shape = {1, 2};
+  output.dtype = vie::DataType::Fp32;
+  manifest.outputs.push_back(std::move(output));
+  manifest.ensure_provenance();
+  return manifest;
+}
+
+TEST(ClassificationOnnx, SyntheticSoftmaxGraphUsesProbabilitiesProtocol) {
+  const std::string model = write_softmax_model();
+  const double partition = std::exp(1.0) + std::exp(0.0);
+  const float expected_first = static_cast<float>(std::exp(1.0) / partition);
+  const float expected_second = static_cast<float>(std::exp(0.0) / partition);
+  vie::ModelConfig config;
+  config.model_path = model;
+  config.manifest = softmax_manifest();
+  config.backend = vie::BackendKind::OnnxRuntime;
+  config.device = vie::DeviceType::Cpu;
+  vie::InferenceEngine engine;
+  engine.load(config);
+  EXPECT_EQ(engine.decoders().create("classification_probabilities_raw")->protocol(),
+            "classification_probabilities_raw");
+
+  std::vector<std::uint8_t> pixels(8 * 8 * 3, 0);
+  vie::ImageInput image;
+  image.data = pixels.data();
+  image.width = 8;
+  image.height = 8;
+  image.channels = 3;
+  image.color = vie::ColorOrder::Rgb;
+  image.layout = vie::ImageLayout::Hwc;
+  image.dtype = vie::DataType::Uint8;
+  vie::ClassificationRuntimeConfig runtime;
+  runtime.top_k = 2;
+  vie::ClassificationInferTiming ignored;
+  engine.infer_classification(image, runtime, &ignored);
+
+  constexpr int kSamples = 5;
+  double execute_ms = 0;
+  double d2h_ms = 0;
+  double validate_ms = 0;
+  double topk_ms = 0;
+  double decode_ms = 0;
+  vie::ClassificationBatch batch;
+  vie::ClassificationInferTiming timing;
+  for (int sample = 0; sample < kSamples; ++sample) {
+    batch = engine.infer_classification(image, runtime, &timing);
+    execute_ms += timing.execute_ms;
+    d2h_ms += timing.d2h_ms;
+    validate_ms += timing.validate_ms;
+    topk_ms += timing.topk_ms;
+    decode_ms += timing.decode_ms;
+  }
+  execute_ms /= kSamples;
+  d2h_ms /= kSamples;
+  validate_ms /= kSamples;
+  topk_ms /= kSamples;
+  decode_ms /= kSamples;
+
+  ASSERT_EQ(batch.results[0].labels.size(), 2u);
+  EXPECT_EQ(batch.results[0].protocol, "classification_probabilities_raw");
+  EXPECT_EQ(batch.results[0].score_type, "probabilities");
+  EXPECT_EQ(batch.results[0].labels[0].class_id, 0);
+  EXPECT_EQ(batch.results[0].labels[1].class_id, 1);
+  EXPECT_NEAR(batch.results[0].labels[0].score, expected_first, 1e-5);
+  EXPECT_NEAR(batch.results[0].labels[1].score, expected_second, 1e-5);
+  const double sum = static_cast<double>(batch.results[0].labels[0].score) +
+                     static_cast<double>(batch.results[0].labels[1].score);
+  EXPECT_NEAR(sum, 1.0, 1e-5);
+  EXPECT_GE(batch.results[0].labels[0].score, 0.f);
+  EXPECT_LE(batch.results[0].labels[0].score, 1.f);
+  EXPECT_EQ(timing.d2h_bytes, 0u);
+  EXPECT_EQ(timing.output_bytes, 8u);
+  EXPECT_FALSE(timing.includes_d2h);
+
+  std::ofstream record("/tmp/vie_phase65_softmax_timing.txt");
+  record << "classes 2 dtype fp32 batch 1 warmup 1 samples " << kSamples << "\n";
+  record << "cpu_ep execute_ms_mean " << execute_ms << " d2h_ms_mean " << d2h_ms << " d2h_bytes 0"
+         << " validate_ms_mean " << validate_ms << " topk_ms_mean " << topk_ms
+         << " decode_ms_mean " << decode_ms << " includes_d2h 0\n";
+
+#if defined(VIE_HAS_ONNXRUNTIME_CUDA)
+  vie::ModelConfig cuda_config = config;
+  cuda_config.device = vie::DeviceType::Cuda;
+  cuda_config.backend = vie::BackendKind::OnnxRuntimeCuda;
+  vie::InferenceEngine cuda_engine;
+  cuda_engine.load(cuda_config);
+  void* device_pixels = nullptr;
+  ASSERT_EQ(cudaMalloc(&device_pixels, pixels.size()), cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(device_pixels, pixels.data(), pixels.size(), cudaMemcpyHostToDevice), cudaSuccess);
+  vie::ImageInput gpu_image = image;
+  gpu_image.data = device_pixels;
+  gpu_image.device = vie::DeviceType::Cuda;
+  cuda_engine.infer_classification(gpu_image, runtime, &ignored);
+  double cuda_execute = 0;
+  double cuda_d2h = 0;
+  double cuda_validate = 0;
+  double cuda_topk = 0;
+  double cuda_decode = 0;
+  vie::ClassificationInferTiming cuda_timing;
+  vie::ClassificationBatch cuda_batch;
+  for (int sample = 0; sample < kSamples; ++sample) {
+    cuda_batch = cuda_engine.infer_classification(gpu_image, runtime, &cuda_timing);
+    cuda_execute += cuda_timing.execute_ms;
+    cuda_d2h += cuda_timing.d2h_ms;
+    cuda_validate += cuda_timing.validate_ms;
+    cuda_topk += cuda_timing.topk_ms;
+    cuda_decode += cuda_timing.decode_ms;
+  }
+  cuda_execute /= kSamples;
+  cuda_d2h /= kSamples;
+  cuda_validate /= kSamples;
+  cuda_topk /= kSamples;
+  cuda_decode /= kSamples;
+  ASSERT_EQ(cuda_batch.results[0].labels.size(), 2u);
+  EXPECT_EQ(cuda_batch.results[0].labels[0].class_id, batch.results[0].labels[0].class_id);
+  EXPECT_EQ(cuda_batch.results[0].labels[1].class_id, batch.results[0].labels[1].class_id);
+  EXPECT_NEAR(cuda_batch.results[0].labels[0].score, batch.results[0].labels[0].score, 1e-5);
+  EXPECT_NEAR(cuda_batch.results[0].labels[1].score, batch.results[0].labels[1].score, 1e-5);
+  EXPECT_EQ(cuda_timing.d2h_bytes, 8u);
+  EXPECT_EQ(cuda_batch.results[0].d2h_bytes, 8u);
+  EXPECT_TRUE(cuda_timing.includes_d2h);
+  EXPECT_EQ(cuda_batch.results[0].execution_device, vie::DeviceType::Cpu);
+  const vie::PreprocessResult prepared = cuda_engine.preprocess(gpu_image);
+  vie::BackendRequest cuda_request;
+  cuda_request.inputs.emplace("images", prepared.output);
+  const vie::BackendOutput cuda_output = cuda_engine.execute(cuda_request);
+  EXPECT_TRUE(cuda_output.tensors.at("probabilities").tensor.is_cuda());
+  record << "cuda_ep execute_ms_mean " << cuda_execute << " d2h_ms_mean " << cuda_d2h
+         << " d2h_bytes 8 validate_ms_mean " << cuda_validate << " topk_ms_mean " << cuda_topk
+         << " decode_ms_mean " << cuda_decode << " includes_d2h 1\n";
+  cudaFree(device_pixels);
 #endif
 }
 #endif

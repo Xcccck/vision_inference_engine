@@ -289,13 +289,28 @@ ManifestValidation ManifestValidator::validate(const ModelManifest& manifest) co
     report.schema_issues.push_back(
         {"segmentation.class_names", "count does not match num_classes"});
   }
-  if (manifest.decoder.protocol == "classification_logits_raw") {
+  const bool classification_protocol =
+      manifest.decoder.protocol == "classification_logits_raw" ||
+      manifest.decoder.protocol == "classification_probabilities_raw";
+  if (classification_protocol) {
     require("classification.output_name", !manifest.classification.output_name.empty(),
             "classification output name is unresolved");
     require("classification.class_axis", manifest.classification.class_axis.has_value(),
             "classification class axis is unresolved");
     require("classification.score_type", !manifest.classification.score_type.empty(),
             "classification score type is unresolved");
+  }
+  if (manifest.classification.score_type == "logits" &&
+      manifest.decoder.protocol != "classification_logits_raw") {
+    report.schema_issues.push_back(
+        {"classification.score_type",
+         "logits requires decoder protocol classification_logits_raw"});
+  }
+  if (manifest.classification.score_type == "probabilities" &&
+      manifest.decoder.protocol != "classification_probabilities_raw") {
+    report.schema_issues.push_back(
+        {"classification.score_type",
+         "probabilities requires decoder protocol classification_probabilities_raw"});
   }
   if (manifest.classification.class_axis.has_value() && *manifest.classification.class_axis < 0) {
     report.schema_issues.push_back({"classification.class_axis", "must be >= 0"});

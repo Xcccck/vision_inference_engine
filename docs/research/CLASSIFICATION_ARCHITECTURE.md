@@ -428,3 +428,46 @@ CPU 计时是一次 warmup 之后的一次调用。图像是 640×480 uint8 HWC 
 同一张图经过识别器生成的 Manifest，再由测试填入上述配方，走 CPU EP 的 `infer_classification()`：预处理 3.686 ms，execute 14.290 ms，Top-K 0.079 ms，合计 18.062 ms。输出 `[1,1000]`，4000 字节，Top-5 有限。权重是 `weights=None`，下标不是 ImageNet 类别。
 
 没有 center crop 以外的裁剪模式，没有自动推断预处理，没有 Softmax Decoder，没有 CUDA Top-K。没有开始 Phase 6.5。
+
+## 18. Phase 6.5 实现记录
+
+单标签分类现在有两条输出协议。`classification_logits_raw` 继续接收 FP32 logits：不要求数值落在 `[0,1]`，不要求和为 1，不执行 Softmax。`classification_probabilities_raw` 接收模型已经输出的 FP32 概率。它不执行 Softmax、Sigmoid，也不把向量重新归一化。两条协议各自检查自己的数值语义，排序交给同一个只负责 Top-K 的函数。
+
+概率检查在读取类别向量时完成，不另复制一份 Tensor。每个值必须有限且位于 `[0,1]`。和用 FP64 累加，容差是协议常量 `kClassificationProbabilitySumTolerance = 1e-3`：
+
+\[
+\left|\sum_i p_i - 1\right| \le 10^{-3}
+\]
+
+`[0.2, 0.3, 0.5]` 通过。`[0.2, 0.3, 0.4]`、全 0、含 NaN 或 Inf、小于 0 或大于 1 都拒绝。刚好落在容差边界上的向量通过，再大一个 float 的偏差拒绝。错误文本带输出名；单个元素非法时带 `class_id`。现有测试没有出现需要放宽容差的模型输出，因此保持 `1e-3`。
+
+Top-K 规则两条协议相同：score 降序，score 相同时 `class_id` 升序。`top_k` 必须大于 0 且不超过类别数。结果里的 score 是模型原值。logits 结果不转换成概率，概率结果不再做 Softmax。
+
+`ClassificationResult` 原有 `protocol`、`score_type`、`num_classes`、`top_k`、`execution_device`、`output_bytes`、`d2h_bytes`。`execution_device` 仍是执行 Top-K 的 CPU。本阶段只增加 `validate_ms` 和 `topk_ms`，分别是数值检查和排序。`ClassificationInferTiming.decode_ms` 改为 `d2h_ms + validate_ms + topk_ms`。`d2h_bytes` 仍只计 VIE 把整条输出向量拷回 CPU 的字节，不含 ORT 内部搬运。1000 类 FP32、batch 1 是 4000 字节；2 类是 8 字节。两条协议的字节数按输出 Tensor 计算，不按协议分开。
+
+Manifest 仍是 schema 1.0，不新增顶层对象。`score_type=logits` 必须配 `classification_logits_raw`，`score_type=probabilities` 必须配 `classification_probabilities_raw`。不一致是 schema 错误。未知 `score_type` 仍在解析时拒绝。两条分类协议都要求 `output_name`、`class_axis`、`score_type`。mock 协议不带 `score_type` 时仍可加载。Detection、Segmentation、RT-DETR 的 JSON 不写出 `classification`。
+
+识别器可以证明一条窄路径时生成 probabilities 候选：单个 FP32 输入、单个 FP32 rank-2 输出、类别轴是末轴且至少 2 类、`GlobalAveragePool` 或 `GlobalMaxPool` 接到 Gemm 或 MatMul 分类头，分类头之后恰好一个 Softmax，Softmax axis 与类别轴一致。axis 属性存在时按 rank 归一化负轴。属性缺失时只使用 `ai.onnx` opset：13 及以上默认 -1，更早的默认 1；opset 未知则不猜。opset 13 之前的 Softmax 从指定轴一直做到张量末尾，rank-2 上只有末轴才接受。证据码是 `softmax_probabilities`，协议是 `classification_probabilities_raw`。没有 Softmax 的原路径仍是 `logits_output` 和 `classification_logits_raw`。Sigmoid、LpNormalization、axis 对不上、以及只有 Softmax 没有池化和线性头的图保持 Unknown。ManifestGenerator 按 `score_type` 写输出 semantic，probabilities 候选不再标成 logits。
+
+CPU 路径是 CPU Tensor、ORT CPU EP、CPU Tensor、CPU Decoder、Top-K。严格 CUDA EP 是 CUDA Tensor、ORT CUDA EP、CUDA Tensor、显式 D2H、同一个 CPU Decoder、Top-K。没有 probabilities CUDA kernel，没有 CUDA Top-K，CUDA 失败不改走 CPU EP。
+
+仓库里没有带真实 Softmax 的预训练分类模型。测试用合成图 `GlobalAveragePool → Flatten → Gemm → Softmax`，静态 FP32，单输入 `[1,3,8,8]`，单输出 `[1,2]`。权重为 0，bias 为 `[1, 0]`，零输入的输出等于 `softmax([1, 0])`。Softmax 是图里的节点。对照值用独立的 `exp` 计算，不调用生产 Decoder。CPU EP 与严格 CUDA EP 的 Top-2 类别和分数在 `1e-5` 内一致，两项之和接近 1，CUDA 的 `d2h_bytes` 为 8。这只验证协议，不是分类准确率。
+
+计时是 1 次 warmup 之后 5 次的平均值，不是单次，也不据此比较两条协议的快慢。纯 Decoder，1000 类，FP32，batch 1，CPU，无 D2H：
+
+| 构建 | logits 校验 ms | logits Top-K ms | probabilities 校验 ms | probabilities Top-K ms |
+| --- | ---: | ---: | ---: | ---: |
+| CUDA ON + ORT CPU | 0.000492 | 0.026405 | 0.001627 | 0.008603 |
+| CUDA ON + ORT GPU 进程内的 CPU Decoder | 0.000416 | 0.019263 | 0.001527 | 0.008128 |
+
+合成 Softmax 图，2 类，FP32，batch 1，同样 1 次 warmup、5 次平均：
+
+| 路径 | execute ms | D2H ms | D2H 字节 | 校验 ms | Top-K ms | decode ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| CPU EP（CUDA ON + ORT CPU 构建） | 0.011862 | 0 | 0 | 0.000093 | 0.000087 | 0.000180 |
+| GPU 包内的 CPU EP | 0.020902 | 0 | 0 | 0.000114 | 0.000147 | 0.000262 |
+| 严格 CUDA EP | 0.112763 | 0.064535 | 8 | 0.000087 | 0.000114 | 0.064737 |
+
+四种构建都通过。CUDA OFF + ORT OFF 为 122。CUDA OFF + ORT CPU 为 145。CUDA ON + ORT CPU 为 177。CUDA ON + ORT GPU 为 187，其中 `MissingBackendIsExplicit` 因两套 Backend 都存在而跳过。Detection、Segmentation、RT-DETR、logits、Recognizer 和 Manifest 兼容测试包含在这些计数里。
+
+仍未实现：多标签、Sigmoid Decoder、运行时 Softmax、CUDA Top-K、FP16、batch 大于 1、动态类别数、自动类别名。没有开始 Phase 6.6。

@@ -48,14 +48,15 @@ struct ClassificationRuntimeConfig {
   std::optional<int> top_k;
 };
 
-// execute_ms is the backend. d2h_ms and d2h_bytes are the explicit logits copy
-// this engine performs. output_bytes is the model output tensor. topk_ms is
-// the CPU sort. decode_ms is d2h_ms plus topk_ms. ORT's own transfers are not
-// included in d2h_bytes.
+// execute_ms is the backend. d2h_ms and d2h_bytes are the explicit copy of the
+// classification vector. output_bytes is that tensor. validate_ms is the CPU
+// numeric check and topk_ms is only the sort. decode_ms is d2h_ms plus those
+// two. ORT's own transfers are not included in d2h_bytes.
 struct ClassificationInferTiming {
   double preprocess_ms = 0;
   double execute_ms = 0;
   double d2h_ms = 0;
+  double validate_ms = 0;
   double topk_ms = 0;
   double decode_ms = 0;
   double total_ms = 0;
@@ -117,7 +118,8 @@ class InferenceEngine {
   SegmentationBatch infer_segmentation(const ImageInput& image, const SegmentationRuntimeConfig& runtime,
                                        SegmentationInferTiming* timing = nullptr);
   // Preprocess, execute, then decode_classification. Only task classification
-  // with protocol classification_logits_raw is accepted. A CUDA logits tensor
+  // with classification_logits_raw or classification_probabilities_raw is
+  // accepted. A CUDA output tensor
   // is copied to CPU here; the decoder then runs Top-K on that CPU tensor.
   ClassificationBatch infer_classification(const ImageInput& image, const ClassificationRuntimeConfig& runtime,
                                            ClassificationInferTiming* timing = nullptr);

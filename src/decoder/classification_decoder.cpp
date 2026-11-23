@@ -1,8 +1,9 @@
 #include "vie/decoder/classification.hpp"
 
+#include "classification_topk.hpp"
 #include "vie/core/error.hpp"
 
-#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <string>
 #include <utility>
@@ -97,6 +98,7 @@ ClassificationBatch ClassificationDecoder::decode_classification(
                    "classification output '" + request.output_name + "' batch dimension must be 1");
   }
 
+  const auto validate_start = std::chrono::steady_clock::now();
   const float* packed = tensor->data_as<float>();
   const std::int64_t stride = tensor->strides()[axis];
   std::vector<float> scores(static_cast<std::size_t>(request.num_classes));
@@ -110,15 +112,14 @@ ClassificationBatch ClassificationDecoder::decode_classification(
     }
     scores[static_cast<std::size_t>(class_id)] = score;
   }
+  const double validate_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - validate_start)
+                                 .count();
 
-  std::vector<int> order(static_cast<std::size_t>(request.num_classes));
-  for (int class_id = 0; class_id < request.num_classes; ++class_id) order[static_cast<std::size_t>(class_id)] = class_id;
-  std::sort(order.begin(), order.end(), [&](int left, int right) {
-    const float left_score = scores[static_cast<std::size_t>(left)];
-    const float right_score = scores[static_cast<std::size_t>(right)];
-    if (left_score != right_score) return left_score > right_score;
-    return left < right;
-  });
+  const auto topk_start = std::chrono::steady_clock::now();
+  const std::vector<RankedScore> ranked = rank_class_scores(scores, request.top_k);
+  const double topk_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - topk_start).count();
 
   ClassificationResult result;
   result.output_name = request.output_name;
@@ -130,12 +131,14 @@ ClassificationBatch ClassificationDecoder::decode_classification(
   result.execution_device_id = device.device_id();
   result.output_bytes = tensor->nbytes();
   result.d2h_bytes = 0;
+  result.validate_ms = validate_ms;
+  result.topk_ms = topk_ms;
   result.labels.reserve(static_cast<std::size_t>(request.top_k));
-  for (int rank = 0; rank < request.top_k; ++rank) {
-    const int class_id = order[static_cast<std::size_t>(rank)];
+  for (const RankedScore& ranked_score : ranked) {
+    const int class_id = ranked_score.class_id;
     Classification label;
     label.class_id = class_id;
-    label.score = scores[static_cast<std::size_t>(class_id)];
+    label.score = ranked_score.score;
     if (!request.class_names.empty()) {
       if (class_id < 0 || class_id >= static_cast<int>(request.class_names.size())) {
         throw VieError(ErrorCode::InvalidArgument,

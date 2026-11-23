@@ -160,6 +160,42 @@ TEST(ClassificationRecognizer, MatMulPlusBiasIsAccepted) {
   EXPECT_TRUE(saw_symbol);
 }
 
+TEST(ClassificationRecognizer, SoftmaxAfterLinearHeadIsProbabilities) {
+  const vie::RecognitionResult result = recognize_model(gemm_classifier(5, 8, "softmax"), "softmax.onnx");
+  EXPECT_EQ(result.status, vie::RecognitionStatus::Recognized) << result.explanation;
+  ASSERT_NE(result.selected(), nullptr);
+  EXPECT_EQ(result.selected()->decoder.protocol, "classification_probabilities_raw");
+  EXPECT_EQ(result.selected()->decoder.score_type, "probabilities");
+  EXPECT_EQ(result.selected()->decoder.num_classes, 5);
+  EXPECT_TRUE(has_evidence(*result.selected(), "softmax_probabilities"));
+  EXPECT_FALSE(has_evidence(*result.selected(), "logits_output"));
+
+  const vie::ModelAnalysisReport report =
+      vie::OnnxAnalyzer{}.analyze_bytes(gemm_classifier(5, 8, "softmax").str(), "softmax.onnx", ".");
+  const vie::ModelManifest manifest = vie::ManifestGenerator{}.generate(report, result, "softmax.onnx");
+  EXPECT_EQ(manifest.decoder.protocol, "classification_probabilities_raw");
+  EXPECT_EQ(manifest.classification.score_type, "probabilities");
+  ASSERT_EQ(manifest.outputs.size(), 1u);
+  EXPECT_EQ(manifest.outputs[0].semantic, "probabilities");
+  const vie::ManifestValidation validation = vie::ManifestValidator{}.validate(manifest);
+  EXPECT_TRUE(validation.schema_ok()) << vie::format_issues(validation.schema_issues);
+
+  OnnxTestWriter default_axis;
+  default_axis.message(1, node_message("GlobalAveragePool", {"images"}, {"pooled"}));
+  default_axis.message(1, node_message("Flatten", {"pooled"}, {"flat"}, {attr_int("axis", 1)}));
+  default_axis.message(1, node_message("Gemm", {"flat", "weight", "bias"}, {"pre"}, {attr_int("transB", 1)}));
+  default_axis.message(1, node_message("Softmax", {"pre"}, {"probs"}));
+  default_axis.message(5, tensor_message("weight", 1, {4, 3}, {}, "", false));
+  default_axis.message(5, tensor_message("bias", 1, {4}, {}, "", false));
+  default_axis.message(11, value_info("images", tensor_type(1, true, {static_dim(1), static_dim(3), static_dim(8),
+                                                                     static_dim(8)})));
+  default_axis.message(12, value_info("probs", tensor_type(1, true, {static_dim(1), static_dim(4)})));
+  const vie::RecognitionResult implied = recognize_model(wrap_model(default_axis), "default_axis.onnx");
+  EXPECT_EQ(implied.status, vie::RecognitionStatus::Recognized) << implied.explanation;
+  ASSERT_NE(implied.selected(), nullptr);
+  EXPECT_EQ(implied.selected()->decoder.score_type, "probabilities");
+}
+
 TEST(ClassificationRecognizer, DeclinesStructuresThatAreNotSingleLabelLogits) {
   auto expect_unknown = [](const OnnxTestWriter& model, const char* name) {
     const vie::RecognitionResult result = recognize_model(model, name);
@@ -167,10 +203,27 @@ TEST(ClassificationRecognizer, DeclinesStructuresThatAreNotSingleLabelLogits) {
     EXPECT_EQ(result.selected(), nullptr);
   };
 
-  expect_unknown(gemm_classifier(5, 8, "softmax"), "softmax");
   expect_unknown(gemm_classifier(5, 8, "sigmoid"), "sigmoid");
   expect_unknown(gemm_classifier(5, 8, "normalize"), "normalize");
   expect_unknown(gemm_classifier(1, 8, "identity"), "regression");
+
+  OnnxTestWriter wrong_axis;
+  wrong_axis.message(1, node_message("GlobalAveragePool", {"images"}, {"pooled"}));
+  wrong_axis.message(1, node_message("Flatten", {"pooled"}, {"flat"}, {attr_int("axis", 1)}));
+  wrong_axis.message(1, node_message("Gemm", {"flat", "weight", "bias"}, {"pre"}, {attr_int("transB", 1)}));
+  wrong_axis.message(1, node_message("Softmax", {"pre"}, {"logits"}, {attr_int("axis", 0)}));
+  wrong_axis.message(5, tensor_message("weight", 1, {5, 8}, {}, "", false));
+  wrong_axis.message(5, tensor_message("bias", 1, {5}, {}, "", false));
+  wrong_axis.message(11, value_info("images", tensor_type(1, true, {static_dim(1), static_dim(3), static_dim(8),
+                                                                   static_dim(8)})));
+  wrong_axis.message(12, value_info("logits", tensor_type(1, true, {static_dim(1), static_dim(5)})));
+  expect_unknown(wrap_model(wrong_axis), "softmax_axis_0");
+
+  OnnxTestWriter softmax_only;
+  softmax_only.message(1, node_message("Softmax", {"features"}, {"probs"}, {attr_int("axis", 1)}));
+  softmax_only.message(11, value_info("features", tensor_type(1, true, {static_dim(1), static_dim(4)})));
+  softmax_only.message(12, value_info("probs", tensor_type(1, true, {static_dim(1), static_dim(4)})));
+  expect_unknown(wrap_model(softmax_only), "softmax_only");
 
   OnnxTestWriter pool_only;
   pool_only.message(1, node_message("GlobalAveragePool", {"images"}, {"pooled"}));

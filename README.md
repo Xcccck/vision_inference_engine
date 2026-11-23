@@ -1,6 +1,6 @@
 # Vision Inference Engine（VIE）
 
-命名空间：`vie`。这是一个通用视觉推理框架，当前接通了 ONNX 上的 YOLOv8 Detection、YOLOv8 Segmentation，以及 Ultralytics RT-DETR-L 的 Detection。它不会把任意 ONNX 模型认成这些家族。TensorRT、姿态、OBB 和分类还没有实现。
+命名空间：`vie`。这是一个通用视觉推理框架，当前接通了 ONNX 上的 YOLOv8 Detection、YOLOv8 Segmentation、Ultralytics RT-DETR-L 的 Detection，以及单标签 Classification。它不会把任意 ONNX 模型认成这些家族。TensorRT、姿态和 OBB 还没有实现。
 
 Phase 1 做了这些事：
 
@@ -53,7 +53,7 @@ Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`inte
 - TensorRT / PyTorch 解析
 - 图像文件解码
 - 姿态、OBB
-- Softmax、多标签和 CUDA Top-K。`score_type=probabilities` 可以写入 Manifest，第一版 Decoder 返回 `Unsupported`
+- 运行时 Softmax、多标签和 CUDA Top-K。模型自己输出的概率走 `classification_probabilities_raw`，解码时不再做 Softmax
 - resize 模式 `crop`
 - 并发推理。`load`、`infer`、`infer_segmentation` 和 `infer_classification` 共用同一个 session，没有锁。重叠调用是数据竞争，库不会把它们串成队列。
 
@@ -96,7 +96,7 @@ vie::SegmentationBatch segmented = segmenter.infer_segmentation(image, runtime);
 
 检测模型调用 `infer_segmentation`，或分割模型调用 `infer`，都返回 `Unsupported`。分类模型调用 `infer` 同样返回 `Unsupported`。CUDA 推理要求 `ImageInput` 已经在同一块 GPU 上。
 
-`classification_logits_raw` 只解码 rank-2 的 FP32 logits，按分数从高到低取 Top-K，分数相同则按 `class_id` 从小到大。它不执行 Softmax。CUDA EP 的输出仍在 CUDA 上，`infer_classification()` 把整条 logits 向量拷到 CPU 后再做 Top-K，这次拷贝计入 `d2h_bytes`。结果里的执行设备是 CPU。
+`classification_logits_raw` 解码 rank-2 的 FP32 logits。`classification_probabilities_raw` 解码模型已经输出的 rank-2 FP32 概率，要求每个值在 `[0,1]` 且概率和与 1 的差不超过 `1e-3`，不会再次 Softmax，也不会把向量重新归一化。两种协议都按分数从高到低取 Top-K，分数相同则按 `class_id` 从小到大。`score_type` 必须和协议一致。CUDA EP 的输出仍在 CUDA 上，`infer_classification()` 把整条向量拷到 CPU 后再做 Top-K，这次拷贝计入 `d2h_bytes`。结果里的执行设备是 CPU。
 
 ```cpp
 vie::ClassificationRuntimeConfig labels;
@@ -110,4 +110,4 @@ classifier.load(classification);
 vie::ClassificationBatch ranked = classifier.infer_classification(image, labels);
 ```
 
-`yolov8_seg_raw` 有 CPU 和 CUDA 解码。它按名称读取 `output0` 和 prototype，复用检测的置信度过滤、坐标映射和 NMS，并保留 prediction index 以收集 mask 系数。重建是 `M = a · P`，不再做 Sigmoid；二值规则必须显式写成 `M > 0`。`retina_masks=false` 时 mask 是模型输入尺寸，`true` 时是原图尺寸。CUDA 路径把 mask 留在 CUDA Tensor 上，失败时不会退回 CPU。Kernel 使用默认 stream，不是 `DeviceContext` 自己的 stream。缺 `retina_masks`、NMS 或 mask 内存预算时返回 `UnresolvedField`。`InferenceEngine::infer_segmentation()` 走这条路径；`infer()` 遇到分割 Manifest 返回 `Unsupported`。姿态、OBB 和 TensorRT 还没有实现。分类识别只接受全局池化后的单个 logits 头，不填写颜色、resize、归一化或类别名，也不把 1000 维当成 ImageNet。
+`yolov8_seg_raw` 有 CPU 和 CUDA 解码。它按名称读取 `output0` 和 prototype，复用检测的置信度过滤、坐标映射和 NMS，并保留 prediction index 以收集 mask 系数。重建是 `M = a · P`，不再做 Sigmoid；二值规则必须显式写成 `M > 0`。`retina_masks=false` 时 mask 是模型输入尺寸，`true` 时是原图尺寸。CUDA 路径把 mask 留在 CUDA Tensor 上，失败时不会退回 CPU。Kernel 使用默认 stream，不是 `DeviceContext` 自己的 stream。缺 `retina_masks`、NMS 或 mask 内存预算时返回 `UnresolvedField`。`InferenceEngine::infer_segmentation()` 走这条路径；`infer()` 遇到分割 Manifest 返回 `Unsupported`。姿态、OBB 和 TensorRT 还没有实现。分类识别接受全局池化后的单个线性头。输出前没有 Softmax 时协议是 `classification_logits_raw`；同一条路径上、axis 与类别轴一致的 Softmax 使用 `classification_probabilities_raw`。它不填写颜色、resize、归一化或类别名，也不把 1000 维当成 ImageNet。Sigmoid 和单独的 Softmax 不会被认成单标签分类。

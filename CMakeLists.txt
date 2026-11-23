@@ -110,6 +110,7 @@ add_library(vie
   src/backend/mock_backend.cpp
   src/decoder/decoder_registry.cpp
   src/decoder/classification_decoder.cpp
+  src/decoder/classification_probabilities_decoder.cpp
   src/decoder/mock_decoder.cpp
   src/decoder/segmentation.cpp
   src/decoder/detection_ops.cpp

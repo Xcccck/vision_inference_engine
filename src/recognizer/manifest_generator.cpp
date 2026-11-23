@@ -339,7 +339,8 @@ ModelManifest ManifestGenerator::generate(const ModelAnalysisReport& report,
     }
     for (std::size_t index = 0; index < manifest.outputs.size(); ++index) {
       if (manifest.outputs[index].name == selected->decoder.output_name) {
-        manifest.outputs[index].semantic = "logits";
+        manifest.outputs[index].semantic =
+            selected->decoder.score_type == "probabilities" ? "probabilities" : "logits";
         put(manifest, "outputs." + std::to_string(index) + ".semantic", Certainty::Inferred, because);
       }
     }
