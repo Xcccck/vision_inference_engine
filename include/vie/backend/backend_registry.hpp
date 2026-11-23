@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 
 namespace vie {
 
@@ -17,6 +18,7 @@ class BackendRegistry {
   std::unique_ptr<IInferenceBackend> create(BackendKind kind) const;
 
  private:
+  mutable std::mutex mutex_;
   std::map<BackendKind, Factory> factories_;
 };
 

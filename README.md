@@ -184,3 +184,64 @@ vie::PoseBatch people = posed.infer_pose(image, pose_runtime);
 ```
 
 分类识别接受全局池化后的单个线性头。输出前没有 Softmax 时协议是 `classification_logits_raw`；同一条路径上、axis 与类别轴一致的 Softmax 使用 `classification_probabilities_raw`。它不填写颜色、resize、归一化或类别名，也不把 1000 维当成 ImageNet。Sigmoid 和单独的 Softmax 不会被认成单标签分类。
+
+## 运行时与并发推理
+
+Phase 8 引入了 Runtime 层，支持多模型管理和并发推理。
+
+### 核心组件
+
+- **ThreadPool**：固定大小线程池，支持异步任务提交和 `std::future` 返回值
+- **ModelInstance**：线程安全的模型实例包装器，自动记录推理指标
+- **ModelManager**：多模型生命周期管理（加载/卸载/查询）
+- **Runtime**：顶层协调器，集成线程池、模型管理和指标收集
+- **MetricsCollector**：线程安全的性能指标收集器
+
+### 并发模型
+
+**不同模型**：多个 `ModelInstance` 可以完全并行推理，无同步开销。每个实例拥有独立的 `InferenceEngine`、Backend 和 Decoder。
+
+**同一模型**：对同一 `ModelInstance` 的并发调用会被内部 mutex 串行化。这是因为 Backend 的 `execute()` 方法会修改 timing 状态（非线程安全）。
+
+**建议**：
+- 需要并行执行同一模型时，加载多个实例（不同 ID）
+- 线程池大小设置为并发模型数，而非总模型数
+- CUDA 模型天然支持 GPU 共享（通过 CUDA streams）
+
+### 使用示例
+
+```cpp
+// 配置并创建 Runtime
+vie::RuntimeConfig config;
+config.thread_pool_size = 4;
+config.enable_profiling = true;
+vie::Runtime runtime(config);
+
+// 加载多个模型
+auto detector = runtime.models().load("det", det_config);
+auto segmenter = runtime.models().load("seg", seg_config);
+
+// 并发提交推理任务
+auto task1 = runtime.thread_pool().submit([detector, image1] {
+  return detector->infer(image1);
+});
+auto task2 = runtime.thread_pool().submit([segmenter, image2, seg_runtime] {
+  return segmenter->infer_segmentation(image2, seg_runtime);
+});
+
+// 获取结果
+auto result1 = task1.get();
+auto result2 = task2.get();
+
+// 查看指标
+auto metrics = runtime.snapshot_metrics();
+std::cout << "Total inferences: " << metrics.total_inferences << "\n";
+std::cout << "Total time: " << metrics.total_inference_time_ms << " ms\n";
+
+// 卸载模型
+runtime.models().unload("det");
+runtime.models().unload("seg");
+```
+
+详见 [docs/RUNTIME_ARCHITECTURE.md](docs/RUNTIME_ARCHITECTURE.md) 和 [examples/multi_model_runtime.cpp](examples/multi_model_runtime.cpp)。
+

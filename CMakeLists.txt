@@ -137,6 +137,10 @@ add_library(vie
   src/recognizer/manifest_generator.cpp
   src/preprocess/preprocess.cpp
   src/preprocess/preprocess_cpu.cpp
+  src/runtime/thread_pool.cpp
+  src/runtime/runtime_metrics.cpp
+  src/runtime/model_instance.cpp
+  src/runtime/runtime.cpp
 )
 
 add_library(vie::vie ALIAS vie)
@@ -218,6 +222,7 @@ if(VIE_BUILD_TESTS)
     tests/test_segmentation.cpp
     tests/test_yolov8_seg.cpp
     tests/test_model_inspection.cpp
+    tests/test_runtime.cpp
   )
   target_link_libraries(vie_tests PRIVATE vie::vie GTest::gtest GTest::gtest_main)
   target_compile_options(vie_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -253,17 +258,21 @@ add_executable(vie_model_inspect tools/vie_model_inspect.cpp)
 target_link_libraries(vie_model_inspect PRIVATE vie::vie)
 target_compile_options(vie_model_inspect PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
+add_executable(multi_model_runtime examples/multi_model_runtime.cpp)
+target_link_libraries(multi_model_runtime PRIVATE vie::vie)
+target_compile_options(multi_model_runtime PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
 if(VIE_ENABLE_ONNXRUNTIME)
   if(VIE_ENABLE_ONNXRUNTIME_CUDA)
-    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime
       APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_GPU_LIB_DIR}")
   else()
-    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime
       APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_LIB_DIR}")
   endif()
 endif()
 if(VIE_ENABLE_CUDA)
-  set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect
+  set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime
     APPEND PROPERTY BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
 endif()
 
