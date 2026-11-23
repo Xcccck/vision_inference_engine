@@ -267,17 +267,21 @@ add_executable(runtime_benchmark tools/runtime_benchmark.cpp)
 target_link_libraries(runtime_benchmark PRIVATE vie::vie)
 target_compile_options(runtime_benchmark PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
+add_executable(real_model_benchmark tools/real_model_benchmark.cpp)
+target_link_libraries(real_model_benchmark PRIVATE vie::vie)
+target_compile_options(real_model_benchmark PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
 if(VIE_ENABLE_ONNXRUNTIME)
   if(VIE_ENABLE_ONNXRUNTIME_CUDA)
-    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime runtime_benchmark
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime runtime_benchmark real_model_benchmark
       APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_GPU_LIB_DIR}")
   else()
-    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime runtime_benchmark
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime runtime_benchmark real_model_benchmark
       APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_LIB_DIR}")
   endif()
 endif()
 if(VIE_ENABLE_CUDA)
-  set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime runtime_benchmark
+  set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime runtime_benchmark real_model_benchmark
     APPEND PROPERTY BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
 endif()
 

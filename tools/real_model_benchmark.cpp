@@ -15,6 +15,10 @@
 #include <algorithm>
 #include <vector>
 
+#if defined(VIE_HAS_ONNXRUNTIME_CUDA)
+#include <cuda_runtime.h>
+#endif
+
 namespace {
 
 struct BenchmarkResult {
@@ -92,7 +96,7 @@ vie::ModelManifest create_manifest(const std::string& model_path) {
   return manifest;
 }
 
-vie::ImageInput create_dummy_image(std::vector<uint8_t>& pixels, int width, int height) {
+vie::ImageInput create_dummy_image(std::vector<uint8_t>& pixels, int width, int height, vie::DeviceType device = vie::DeviceType::Cpu, int device_id = 0) {
   pixels.resize(width * height * 3);
   // Fill with dummy data
   for (size_t i = 0; i < pixels.size(); ++i) {
@@ -100,13 +104,29 @@ vie::ImageInput create_dummy_image(std::vector<uint8_t>& pixels, int width, int 
   }
   
   vie::ImageInput image;
-  image.data = pixels.data();
   image.width = width;
   image.height = height;
   image.channels = 3;
   image.color = vie::ColorOrder::Rgb;
   image.layout = vie::ImageLayout::Hwc;
   image.dtype = vie::DataType::Uint8;
+  image.device = device;
+  image.device_id = device_id;
+  
+  if (device == vie::DeviceType::Cuda) {
+#if defined(VIE_HAS_ONNXRUNTIME_CUDA)
+    // Allocate CUDA memory and copy data
+    uint8_t* d_data = nullptr;
+    cudaMalloc(&d_data, pixels.size());
+    cudaMemcpy(d_data, pixels.data(), pixels.size(), cudaMemcpyHostToDevice);
+    image.data = d_data;
+#else
+    throw std::runtime_error("CUDA not available in this build");
+#endif
+  } else {
+    image.data = pixels.data();
+  }
+  
   return image;
 }
 
@@ -148,7 +168,7 @@ int main(int argc, char* argv[]) {
 
     // Create dummy image (640x640 RGB)
     std::vector<uint8_t> pixels;
-    auto image = create_dummy_image(pixels, 640, 640);
+    auto image = create_dummy_image(pixels, 640, 640, device, 0);
     std::cout << "Dummy image created (640x640 RGB)\n";
 
     // Scenario A: Single instance, single thread
@@ -165,6 +185,10 @@ int main(int argc, char* argv[]) {
       model_config.device = device;
       model_config.device_id = 0;
       model_config.manifest = manifest;
+      // Enable CPU fallback for CUDA backend to handle unsupported ops
+      if (device == vie::DeviceType::Cuda) {
+        model_config.cuda_cpu_ep_fallback = true;
+      }
       
       auto model = runtime.models().load("model_a", model_config);
       
@@ -219,6 +243,10 @@ int main(int argc, char* argv[]) {
       model_config.device = device;
       model_config.device_id = 0;
       model_config.manifest = manifest;
+      // Enable CPU fallback for CUDA backend to handle unsupported ops
+      if (device == vie::DeviceType::Cuda) {
+        model_config.cuda_cpu_ep_fallback = true;
+      }
       
       auto model = runtime.models().load("model_b", model_config);
       
@@ -288,6 +316,10 @@ int main(int argc, char* argv[]) {
       model_config.device = device;
       model_config.device_id = 0;
       model_config.manifest = manifest;
+      // Enable CPU fallback for CUDA backend to handle unsupported ops
+      if (device == vie::DeviceType::Cuda) {
+        model_config.cuda_cpu_ep_fallback = true;
+      }
       
       auto model1 = runtime.models().load("model_c1", model_config);
       auto model2 = runtime.models().load("model_c2", model_config);

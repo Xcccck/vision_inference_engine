@@ -18,6 +18,8 @@ struct ModelConfig {
   DeviceType device = DeviceType::Cpu;
   int device_id = 0;
   std::optional<ModelManifest> manifest;
+  // Allow CUDA backend to fall back to CPU for unsupported ops (CUDA only)
+  bool cuda_cpu_ep_fallback = false;
 };
 
 }  // namespace vie
