@@ -325,6 +325,61 @@ ManifestValidation ManifestValidator::validate(const ModelManifest& manifest) co
     report.schema_issues.push_back(
         {"classification.class_names", "count does not match num_classes"});
   }
+  if (manifest.task == TaskType::Obb && manifest.decoder.protocol != "yolov8_obb_raw") {
+    report.schema_issues.push_back({"decoder.protocol", "task obb requires yolov8_obb_raw"});
+  }
+  if (manifest.decoder.protocol == "yolov8_obb_raw" && manifest.task != TaskType::Obb) {
+    report.schema_issues.push_back({"task", "yolov8_obb_raw requires task obb"});
+  }
+  if (manifest.decoder.protocol == "yolov8_obb_raw") {
+    require("obb.output_name", !manifest.obb.output_name.empty(), "obb output name is unresolved");
+    require("obb.channel_axis", manifest.obb.channel_axis.has_value(), "obb channel axis is unresolved");
+    require("obb.angle_unit", manifest.obb.angle_unit == "radian", "obb angle unit is unresolved");
+    require("obb.angle_range", manifest.obb.angle_range == "[-pi/4,3pi/4]", "obb angle range is unresolved");
+    require("obb.score_type", manifest.obb.score_type == "probabilities", "obb score type is unresolved");
+    require("decoder.box_format", manifest.decoder.box_format == "cxcywh_angle",
+            "obb box format must be cxcywh_angle");
+    require("decoder.box_channels", manifest.decoder.box_channels == 4, "obb box channels must be 4");
+    require("decoder.scores_are_probabilities", manifest.decoder.scores_are_probabilities == true,
+            "obb class scores must already be probabilities");
+    if (manifest.obb.channel_axis.has_value() && manifest.decoder.channel_axis.has_value() &&
+        *manifest.obb.channel_axis != *manifest.decoder.channel_axis) {
+      report.schema_issues.push_back({"obb.channel_axis", "does not match decoder.channel_axis"});
+    }
+  }
+  if (!manifest.obb.angle_unit.empty() && manifest.obb.angle_unit != "radian") {
+    report.schema_issues.push_back({"obb.angle_unit", "unsupported angle unit"});
+  }
+  if (!manifest.obb.angle_range.empty() && manifest.obb.angle_range != "[-pi/4,3pi/4]") {
+    report.schema_issues.push_back({"obb.angle_range", "unsupported angle range"});
+  }
+  if (!manifest.obb.score_type.empty() && manifest.obb.score_type != "probabilities") {
+    report.schema_issues.push_back({"obb.score_type", "unsupported score type"});
+  }
+  if (manifest.task != TaskType::Obb && manifest.decoder.protocol != "yolov8_obb_raw" &&
+      (!manifest.obb.output_name.empty() || manifest.obb.channel_axis.has_value() ||
+       !manifest.obb.angle_unit.empty() || !manifest.obb.angle_range.empty() || !manifest.obb.score_type.empty())) {
+    report.schema_issues.push_back({"obb", "obb fields require task obb"});
+  }
+  if (!manifest.obb.output_name.empty()) {
+    const OutputDesc* named = nullptr;
+    for (const OutputDesc& output : manifest.outputs) {
+      if (output.name == manifest.obb.output_name) named = &output;
+    }
+    if (named == nullptr) {
+      report.schema_issues.push_back({"obb.output_name", "does not match an output"});
+    } else if (manifest.obb.channel_axis.has_value() && !named->shape.empty() && is_concrete_shape(named->shape) &&
+               manifest.num_classes.has_value()) {
+      const int axis = *manifest.obb.channel_axis;
+      if (named->shape.size() != 3 || axis < 0 || axis >= static_cast<int>(named->shape.size())) {
+        report.schema_issues.push_back({"obb.channel_axis", "is outside rank 3"});
+      } else if (named->shape[static_cast<std::size_t>(axis)] !=
+                 static_cast<std::int64_t>(4 + *manifest.num_classes + 1)) {
+        report.schema_issues.push_back(
+            {"obb.channel_axis", "length is not 4 + num_classes + 1"});
+      }
+    }
+  }
   if (!manifest.classification.output_name.empty()) {
     const OutputDesc* named = nullptr;
     for (const OutputDesc& output : manifest.outputs) {

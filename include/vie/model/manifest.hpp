@@ -80,6 +80,16 @@ struct SegmentationDesc {
   std::optional<std::size_t> max_mask_bytes;
 };
 
+// YOLOv8-OBB output contract. Runtime thresholds stay on the call, not here.
+// angle_range is the image of a proven affine, not a guess from the channel count.
+struct ObbDesc {
+  std::string output_name;
+  std::optional<int> channel_axis;
+  std::string angle_unit;
+  std::string angle_range;
+  std::string score_type;
+};
+
 // Optional single-label classification head. Absent fields stay empty and are
 // not inferred from an output shape. Omitted from JSON when every field is unset
 // and the task is not classification.
@@ -119,6 +129,7 @@ class ModelManifest {
   NmsDesc nms;
   SegmentationDesc segmentation;
   ClassificationDesc classification;
+  ObbDesc obb;
   std::map<std::string, FieldProvenance> provenance;
 
   static ModelManifest from_json_string(std::string_view json_text);

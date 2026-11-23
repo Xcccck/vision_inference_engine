@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vie/core/tensor.hpp"
+#include "vie/decoder/obb.hpp"
 #include "vie/decoder/segmentation.hpp"
 
 #include <map>
@@ -67,6 +68,11 @@ class IModelDecoder {
   virtual ClassificationBatch decode_classification(const DecoderInput& input,
                                                     const ClassificationDecodeRequest& request,
                                                     const DeviceContext& device) const;
+
+  // OBB path. The default refuses so a detection decoder cannot be mistaken
+  // for an oriented-box decoder. Rotated NMS in this phase is CPU-only.
+  virtual ObbBatch decode_obb(const DecoderInput& input, const ObbDecodeConfig& config,
+                              const DeviceContext& device) const;
 };
 
 }  // namespace vie

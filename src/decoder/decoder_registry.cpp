@@ -2,6 +2,7 @@
 
 #include "vie/core/error.hpp"
 #include "vie/decoder/classification.hpp"
+#include "vie/decoder/obb.hpp"
 
 #include <mutex>
 
@@ -20,6 +21,10 @@ ClassificationBatch IModelDecoder::decode_classification(const DecoderInput&,
                                                          const ClassificationDecodeRequest&,
                                                          const DeviceContext&) const {
   throw VieError(ErrorCode::Unsupported, "this decoder does not produce classifications");
+}
+
+ObbBatch IModelDecoder::decode_obb(const DecoderInput&, const ObbDecodeConfig&, const DeviceContext&) const {
+  throw VieError(ErrorCode::Unsupported, "this decoder does not produce oriented boxes");
 }
 
 void DecoderRegistry::register_factory(std::string protocol, Factory factory) {

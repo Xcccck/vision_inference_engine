@@ -3,6 +3,7 @@
 #include "vie/recognizer/classification_recognizer.hpp"
 #include "vie/recognizer/rtdetr_recognizer.hpp"
 #include "vie/recognizer/yolov8_detect_recognizer.hpp"
+#include "vie/recognizer/yolov8_obb_recognizer.hpp"
 #include "vie/recognizer/yolov8_seg_recognizer.hpp"
 
 #include <algorithm>
@@ -48,11 +49,13 @@ RecognitionResult ModelRecognizerRegistry::recognize(const ModelAnalysisReport& 
   bool saw_segmentation = false;
   bool saw_rtdetr = false;
   bool saw_classification = false;
+  bool saw_obb = false;
   for (const RecognitionCandidate& candidate : matched) {
     if (candidate.architecture == "yolov8_detection") saw_detection = true;
     if (candidate.architecture == "yolov8_segmentation") saw_segmentation = true;
     if (candidate.architecture == "rtdetr_detection") saw_rtdetr = true;
     if (candidate.architecture == "single_label_classification") saw_classification = true;
+    if (candidate.architecture == "yolov8_obb") saw_obb = true;
   }
   result.candidates = std::move(matched);
   if (saw_detection && saw_segmentation) {
@@ -66,9 +69,14 @@ RecognitionResult ModelRecognizerRegistry::recognize(const ModelAnalysisReport& 
     result.explanation = "RT-DETR and YOLOv8 recognizers both accepted this graph";
     return result;
   }
-  if (saw_classification && (saw_detection || saw_segmentation || saw_rtdetr)) {
+  if (saw_classification && (saw_detection || saw_segmentation || saw_rtdetr || saw_obb)) {
     result.status = RecognitionStatus::Ambiguous;
     result.explanation = "classification and another task recognizer both accepted this graph";
+    return result;
+  }
+  if (saw_obb && (saw_detection || saw_segmentation || saw_rtdetr)) {
+    result.status = RecognitionStatus::Ambiguous;
+    result.explanation = "YOLOv8 OBB and another box recognizer both accepted this graph";
     return result;
   }
   if (tied > 1) {
@@ -85,6 +93,7 @@ RecognitionResult ModelRecognizerRegistry::recognize(const ModelAnalysisReport& 
 ModelRecognizerRegistry default_recognizer_registry() {
   ModelRecognizerRegistry registry;
   registry.add(std::make_unique<YoloV8DetectRecognizer>());
+  registry.add(std::make_unique<YoloV8ObbRecognizer>());
   registry.add(std::make_unique<YoloV8SegRecognizer>());
   registry.add(std::make_unique<RtdetrRecognizer>());
   registry.add(std::make_unique<ClassificationRecognizer>());

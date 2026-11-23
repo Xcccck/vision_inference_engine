@@ -4,6 +4,7 @@
 #include "vie/core/device_context.hpp"
 #include "vie/decoder/classification.hpp"
 #include "vie/decoder/decoder_registry.hpp"
+#include "vie/decoder/obb.hpp"
 #include "vie/decoder/segmentation.hpp"
 #include "vie/model/model_config.hpp"
 #include "vie/preprocess/preprocess.hpp"
@@ -52,6 +53,34 @@ struct ClassificationRuntimeConfig {
 // classification vector. output_bytes is that tensor. validate_ms is the CPU
 // numeric check and topk_ms is only the sort. decode_ms is d2h_ms plus those
 // two. ORT's own transfers are not included in d2h_bytes.
+// Thresholds for one infer_obb() call. They are not written back to the manifest.
+struct ObbRuntimeConfig {
+  std::optional<float> confidence_threshold;
+  std::optional<float> iou_threshold;
+  std::optional<ClassSelection> class_selection;
+  std::optional<bool> class_aware;
+  std::optional<int> pre_nms_top_k;
+  std::optional<int> max_detections;
+  std::optional<bool> nms_enabled;
+};
+
+struct ObbInferTiming {
+  double preprocess_ms = 0;
+  double execute_ms = 0;
+  double d2h_ms = 0;
+  double validate_ms = 0;
+  double nms_ms = 0;
+  double decode_ms = 0;
+  double total_ms = 0;
+  std::size_t output_bytes = 0;
+  std::size_t d2h_bytes = 0;
+  int candidates_before_nms = 0;
+  int results_after_nms = 0;
+  bool includes_sync = false;
+  bool includes_h2d = false;
+  bool includes_d2h = false;
+};
+
 struct ClassificationInferTiming {
   double preprocess_ms = 0;
   double execute_ms = 0;
@@ -88,7 +117,7 @@ struct SegmentationInferTiming {
 // package. load() throws when a critical field is unresolved or the requested
 // backend is absent. Device selection lives in load(), not in the backends.
 // One engine is not safe for concurrent load(), infer(), infer_segmentation(),
-// or infer_classification() calls. Those calls share the session with no lock;
+// infer_classification(), or infer_obb() calls. Those calls share the session with no lock;
 // overlapping them is a data race. device() is the device committed by the
 // last successful load. A failed load leaves the previous session in place,
 // and an engine that has never loaded reports the default CPU context.
@@ -123,6 +152,9 @@ class InferenceEngine {
   // is copied to CPU here; the decoder then runs Top-K on that CPU tensor.
   ClassificationBatch infer_classification(const ImageInput& image, const ClassificationRuntimeConfig& runtime,
                                            ClassificationInferTiming* timing = nullptr);
+  // Preprocess, execute, explicit D2H when the output is on CUDA, then the CPU
+  // OBB decoder and rotated NMS. Only task obb with yolov8_obb_raw is accepted.
+  ObbBatch infer_obb(const ImageInput& image, const ObbRuntimeConfig& runtime, ObbInferTiming* timing = nullptr);
   RawPredictions decode(const BackendOutput& output) const;
   RawPredictions run(const BackendRequest& request);
 

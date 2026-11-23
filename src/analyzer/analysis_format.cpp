@@ -317,6 +317,10 @@ std::string analysis_to_json(const ModelAnalysisReport& report) {
   for (const IntegerConstant& constant : report.integer_constants) {
     integer_constants.push_back(json{{"name", constant.name}, {"values", constant.values}});
   }
+  json float_constants = json::array();
+  for (const FloatConstant& constant : report.float_constants) {
+    float_constants.push_back(json{{"name", constant.name}, {"value", constant.value}});
+  }
   json operators = json::array();
   for (const OperatorStat& stat : report.operators) {
     operators.push_back(
@@ -369,6 +373,7 @@ std::string analysis_to_json(const ModelAnalysisReport& report) {
                          {"sparse_initializers", std::move(sparse)},
                          {"nodes", std::move(nodes)},
                          {"integer_constants", std::move(integer_constants)},
+                         {"float_constants", std::move(float_constants)},
                          {"operators", std::move(operators)},
                          {"propagated_shapes", std::move(propagated)},
                          {"functions", std::move(functions)},

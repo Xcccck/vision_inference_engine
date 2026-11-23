@@ -132,6 +132,13 @@ struct IntegerConstant {
   std::vector<std::int64_t> values;
 };
 
+// One finite FP32 or FP64 element. Weights are not copied. The name is the
+// initializer or Constant output that later nodes consume.
+struct FloatConstant {
+  std::string name;
+  double value = 0;
+};
+
 struct OperatorStat {
   std::string domain;
   std::string op_type;
@@ -186,6 +193,7 @@ struct ModelAnalysisReport {
   std::vector<InitializerInfo> sparse_initializers;
   std::vector<OnnxNode> nodes;
   std::vector<IntegerConstant> integer_constants;
+  std::vector<FloatConstant> float_constants;
   std::vector<OperatorStat> operators;
   std::vector<PropagatedShape> propagated_shapes;
   std::vector<FunctionSummary> functions;

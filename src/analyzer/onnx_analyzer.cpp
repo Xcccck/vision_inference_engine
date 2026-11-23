@@ -1,6 +1,8 @@
 #include "vie/analyzer/onnx_analyzer.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <fstream>
 #include <filesystem>
@@ -159,6 +161,10 @@ struct ParsedAttribute {
   std::vector<std::int64_t> ints;
   std::vector<std::int64_t> tensor_int64;
   bool tensor_int64_ready = false;
+  bool has_float = false;
+  float float_value = 0.f;
+  bool tensor_f32_ready = false;
+  double tensor_f32 = 0;
   std::vector<std::unique_ptr<ParsedGraph>> graphs;
 
   ParsedAttribute();
@@ -179,6 +185,7 @@ struct ParsedGraph {
   std::vector<std::string> outputs;
   std::vector<InitializerInfo> initializers;
   std::map<std::string, std::vector<std::int64_t>> int64_constants;
+  std::map<std::string, double> float_scalars;
 };
 
 ParsedAttribute::ParsedAttribute() = default;
@@ -188,7 +195,33 @@ struct ParsedTensor {
   InitializerInfo info;
   std::vector<std::int64_t> int64_values;
   bool int64_ready = false;
+  bool scalar_ready = false;
+  double scalar_value = 0;
 };
+
+float decode_f32(std::string_view bytes, const std::string& source) {
+  if (bytes.size() != 4) malformed(source, "float32 payload is not 4 bytes");
+  std::uint32_t bits = 0;
+  for (int index = 0; index < 4; ++index) {
+    bits |= static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[static_cast<std::size_t>(index)]))
+            << (8 * index);
+  }
+  float value = 0.f;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+double decode_f64(std::string_view bytes, const std::string& source) {
+  if (bytes.size() != 8) malformed(source, "float64 payload is not 8 bytes");
+  std::uint64_t bits = 0;
+  for (int index = 0; index < 8; ++index) {
+    bits |= static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[static_cast<std::size_t>(index)]))
+            << (8 * index);
+  }
+  double value = 0;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
 
 bool contained_external_file(const std::filesystem::path& base_dir, const std::string& location,
                              std::filesystem::path& resolved, std::string& rejection) {
@@ -475,6 +508,12 @@ class Parser {
     std::string raw;
     bool saw_location = false;
     int location = 0;
+    int f32_seen = 0;
+    float f32_first = 0.f;
+    const auto note_f32 = [&](float value) {
+      if (f32_seen == 0) f32_first = value;
+      ++f32_seen;
+    };
     const auto push_dim = [&](std::int64_t dim) {
       if (dims.size() >= kMaxTensorRank) malformed(cursor_.source(), "tensor rank exceeds 32");
       dims.push_back(dim);
@@ -496,8 +535,16 @@ class Parser {
         data_type = static_cast<int>(as_int64(tag.varint));
       } else if (tag.field == 4) {
         saw_typed = true;
-        typed_count += tag.wire == 5 ? 1 : tag.payload.size() / 4;
-        if (tag.wire == 2 && tag.payload.size() % 4 != 0) malformed(cursor_.source(), "float_data is not aligned");
+        if (tag.wire == 5) {
+          ++typed_count;
+          note_f32(decode_f32(tag.payload, cursor_.source()));
+        } else if (tag.wire == 2) {
+          if (tag.payload.size() % 4 != 0) malformed(cursor_.source(), "float_data is not aligned");
+          typed_count += tag.payload.size() / 4;
+          for (std::size_t offset = 0; offset < tag.payload.size(); offset += 4) {
+            note_f32(decode_f32(tag.payload.substr(offset, 4), cursor_.source()));
+          }
+        }
       } else if (tag.field == 5) {
         saw_typed = true;
         if (tag.wire == 0) ++typed_count;
@@ -560,6 +607,18 @@ class Parser {
     const std::uint64_t count = static_numel(dims);
     parsed.int64_ready = data_type == 7 && count != std::numeric_limits<std::uint64_t>::max() &&
                          parsed.int64_values.size() == static_cast<std::size_t>(count);
+    if (count == 1 && data_type == 1 && !saw_raw && f32_seen == 1) {
+      parsed.scalar_ready = std::isfinite(f32_first);
+      parsed.scalar_value = f32_first;
+    } else if (count == 1 && data_type == 1 && f32_seen == 0 && saw_raw && raw.size() == 4) {
+      const float value = decode_f32(raw, cursor_.source());
+      parsed.scalar_ready = std::isfinite(value);
+      parsed.scalar_value = value;
+    } else if (count == 1 && data_type == 11 && f32_seen == 0 && saw_raw && raw.size() == 8) {
+      const double value = decode_f64(raw, cursor_.source());
+      parsed.scalar_ready = std::isfinite(value);
+      parsed.scalar_value = value;
+    }
     return parsed;
   }
 
@@ -569,7 +628,10 @@ class Parser {
     Tag tag;
     while (next_tag(cursor, tag)) {
       if (tag.field == 1 && tag.wire == 2) attribute.name = std::string(tag.payload);
-      else if (tag.field == 3 && tag.wire == 0) {
+      else if (tag.field == 2 && tag.wire == 5) {
+        attribute.has_float = true;
+        attribute.float_value = decode_f32(tag.payload, cursor_.source());
+      } else if (tag.field == 3 && tag.wire == 0) {
         attribute.has_int = true;
         attribute.int_value = as_int64(tag.varint);
       } else if (tag.field == 5 && tag.wire == 2) {
@@ -577,6 +639,10 @@ class Parser {
         if (tensor.int64_ready && !tensor.int64_values.empty() && tensor.int64_values.size() <= 8) {
           attribute.tensor_int64 = tensor.int64_values;
           attribute.tensor_int64_ready = true;
+        }
+        if (tensor.scalar_ready) {
+          attribute.tensor_f32_ready = true;
+          attribute.tensor_f32 = tensor.scalar_value;
         }
       } else if (tag.field == 6 && tag.wire == 2) {
         if (depth >= 16) malformed(cursor_.source(), "subgraph nesting exceeds 16");
@@ -631,6 +697,9 @@ class Parser {
         const ParsedTensor tensor = parse_tensor(tag.payload);
         graph.initializers.push_back(tensor.info);
         if (tensor.int64_ready) graph.int64_constants[tensor.info.name] = tensor.int64_values;
+        if (tensor.scalar_ready && !tensor.info.name.empty()) {
+          graph.float_scalars.emplace(tensor.info.name, tensor.scalar_value);
+        }
       } else if (tag.field == 11 && tag.wire == 2) {
         if (depth == 0) report_.graph_inputs.push_back(parse_value(tag.payload));
       } else if (tag.field == 12 && tag.wire == 2) {
@@ -655,6 +724,9 @@ class Parser {
       if (!report_.graph_name.empty()) graph.path = report_.graph_name;
       else graph.path = "graph";
       report_.initializers = graph.initializers;
+      for (const auto& entry : graph.float_scalars) {
+        report_.float_constants.push_back(FloatConstant{entry.first, entry.second});
+      }
     }
     return graph;
   }
@@ -783,6 +855,14 @@ class Parser {
             if (attribute.has_int && (attribute.name == "value" || attribute.name == "value_int")) {
               report_.integer_constants.push_back(IntegerConstant{produced, {attribute.int_value}});
             }
+          }
+        }
+        for (const ParsedAttribute& attribute : node.attributes) {
+          if (attribute.name == "value" && attribute.tensor_f32_ready && std::isfinite(attribute.tensor_f32)) {
+            report_.float_constants.push_back(FloatConstant{produced, attribute.tensor_f32});
+          } else if (attribute.name == "value_float" && attribute.has_float &&
+                     std::isfinite(attribute.float_value)) {
+            report_.float_constants.push_back(FloatConstant{produced, attribute.float_value});
           }
         }
       }

@@ -306,6 +306,51 @@ ModelManifest ManifestGenerator::generate(const ModelAnalysisReport& report,
       put(manifest, "outputs.0.semantic", Certainty::Inferred, because);
     }
   }
+  if (selected != nullptr && selected->architecture == "yolov8_obb") {
+    const std::string because = joined_evidence(*selected);
+    manifest.model_family = selected->family;
+    manifest.task = TaskType::Obb;
+    put(manifest, "model_family", Certainty::Inferred, because);
+    put(manifest, "task", Certainty::Inferred, because);
+    if (selected->decoder.num_classes.has_value()) {
+      manifest.num_classes = selected->decoder.num_classes;
+      put(manifest, "num_classes", Certainty::Inferred, because);
+    }
+    if (manifest.input.shape.size() == 4 && manifest.input.shape[1] == 3) {
+      manifest.input.layout = Layout::Nchw;
+      put(manifest, "input.layout", Certainty::Inferred, "declared input axis 1 is static 3");
+    }
+    manifest.decoder.protocol = selected->decoder.protocol;
+    put(manifest, "decoder.protocol", Certainty::Inferred, because);
+    manifest.decoder.box_format = "cxcywh_angle";
+    put(manifest, "decoder.box_format", Certainty::Inferred, because);
+    manifest.decoder.box_channels = 4;
+    put(manifest, "decoder.box_channels", Certainty::Inferred, because);
+    manifest.decoder.scores_are_probabilities = true;
+    put(manifest, "decoder.scores_are_probabilities", Certainty::Inferred, because);
+    if (selected->decoder.channel_axis >= 0) {
+      manifest.decoder.channel_axis = selected->decoder.channel_axis;
+      put(manifest, "decoder.channel_axis", Certainty::Inferred, because);
+    }
+    manifest.obb.output_name = selected->decoder.output_name;
+    put(manifest, "obb.output_name", Certainty::Observed, "declared output name");
+    manifest.obb.channel_axis = selected->decoder.channel_axis;
+    put(manifest, "obb.channel_axis", Certainty::Inferred, because);
+    manifest.obb.angle_unit = "radian";
+    put(manifest, "obb.angle_unit", Certainty::Inferred,
+        "the angle branch is (sigmoid - 1/4) * pi, so the unit is radians");
+    manifest.obb.angle_range = "[-pi/4,3pi/4]";
+    put(manifest, "obb.angle_range", Certainty::Inferred,
+        "sigmoid maps to (0, 1), and (sigmoid - 1/4) * pi maps to [-pi/4, 3pi/4]");
+    manifest.obb.score_type = "probabilities";
+    put(manifest, "obb.score_type", Certainty::Inferred, "the class branch is a Sigmoid");
+    for (std::size_t index = 0; index < manifest.outputs.size(); ++index) {
+      if (manifest.outputs[index].name == selected->decoder.output_name) {
+        manifest.outputs[index].semantic = "oriented_boxes";
+        put(manifest, "outputs." + std::to_string(index) + ".semantic", Certainty::Inferred, because);
+      }
+    }
+  }
   if (selected != nullptr && selected->architecture == "single_label_classification") {
     const std::string because = joined_evidence(*selected);
     if (!selected->family.empty()) {

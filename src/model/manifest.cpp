@@ -54,6 +54,18 @@ bool classification_active(const ModelManifest& manifest) {
          !classification.class_names.empty();
 }
 
+bool is_obb_angle_unit(std::string_view text) { return text == "radian"; }
+
+bool is_obb_angle_range(std::string_view text) { return text == "[-pi/4,3pi/4]"; }
+
+bool is_obb_score_type(std::string_view text) { return text == "probabilities"; }
+
+bool obb_active(const ModelManifest& manifest) {
+  const ObbDesc& obb = manifest.obb;
+  return manifest.task == TaskType::Obb || !obb.output_name.empty() || obb.channel_axis.has_value() ||
+         !obb.angle_unit.empty() || !obb.angle_range.empty() || !obb.score_type.empty();
+}
+
 bool segmentation_active(const ModelManifest& manifest) {
   const SegmentationDesc& segmentation = manifest.segmentation;
   return manifest.task == TaskType::Segmentation || segmentation.mask_channels.has_value() ||
@@ -428,6 +440,14 @@ json manifest_json(const ModelManifest& manifest) {
         {"class_names",
          manifest.classification.class_names.empty() ? json(nullptr) : json(std::move(names))}};
   }
+  if (obb_active(manifest)) {
+    document["obb"] = json{
+        {"output_name", string_or_null(manifest.obb.output_name)},
+        {"channel_axis", manifest.obb.channel_axis ? json(*manifest.obb.channel_axis) : json(nullptr)},
+        {"angle_unit", string_or_null(manifest.obb.angle_unit)},
+        {"angle_range", string_or_null(manifest.obb.angle_range)},
+        {"score_type", string_or_null(manifest.obb.score_type)}};
+  }
   return document;
 }
 
@@ -479,6 +499,20 @@ void read_segmentation(const json& value, SegmentationDesc& segmentation) {
     if (bytes < 1) schema_error("max_mask_bytes must be >= 1");
     segmentation.max_mask_bytes = static_cast<std::size_t>(bytes);
   }
+}
+
+void read_obb(const json& value, ObbDesc& obb) {
+  if (!value.is_object()) schema_error("obb must be an object");
+  obb.output_name = read_free_string(value, "output_name", false);
+  if (value.contains("channel_axis") && !value.at("channel_axis").is_null()) {
+    if (!value.at("channel_axis").is_number_integer()) schema_error("obb.channel_axis must be an integer");
+    const int axis = value.at("channel_axis").get<int>();
+    if (axis != 1 && axis != 2) schema_error("obb.channel_axis must be 1 or 2");
+    obb.channel_axis = axis;
+  }
+  obb.angle_unit = read_vocab(value, "angle_unit", is_obb_angle_unit, "radian");
+  obb.angle_range = read_vocab(value, "angle_range", is_obb_angle_range, "[-pi/4,3pi/4]");
+  obb.score_type = read_vocab(value, "score_type", is_obb_score_type, "probabilities");
 }
 
 void read_classification(const json& value, ClassificationDesc& classification) {
@@ -558,6 +592,10 @@ std::vector<std::string> manifest_field_paths(const ModelManifest& manifest) {
   if (classification_active(manifest)) {
     paths.insert(paths.end(), {"classification.output_name", "classification.class_axis",
                                "classification.score_type", "classification.class_names"});
+  }
+  if (obb_active(manifest)) {
+    paths.insert(paths.end(), {"obb.output_name", "obb.channel_axis", "obb.angle_unit", "obb.angle_range",
+                               "obb.score_type"});
   }
   for (std::size_t i = 0; i < manifest.outputs.size(); ++i) {
     const std::string prefix = "outputs." + std::to_string(i) + ".";
@@ -642,6 +680,11 @@ bool field_is_set(const ModelManifest& manifest, std::string_view path) {
   if (path == "classification.class_axis") return manifest.classification.class_axis.has_value();
   if (path == "classification.score_type") return !manifest.classification.score_type.empty();
   if (path == "classification.class_names") return !manifest.classification.class_names.empty();
+  if (path == "obb.output_name") return !manifest.obb.output_name.empty();
+  if (path == "obb.channel_axis") return manifest.obb.channel_axis.has_value();
+  if (path == "obb.angle_unit") return !manifest.obb.angle_unit.empty();
+  if (path == "obb.angle_range") return !manifest.obb.angle_range.empty();
+  if (path == "obb.score_type") return !manifest.obb.score_type.empty();
 
   std::size_t index = 0;
   std::string field;
@@ -737,6 +780,9 @@ ModelManifest ModelManifest::from_json_string(std::string_view json_text) {
     }
     if (document.contains("classification") && !document.at("classification").is_null()) {
       read_classification(document.at("classification"), manifest.classification);
+    }
+    if (document.contains("obb") && !document.at("obb").is_null()) {
+      read_obb(document.at("obb"), manifest.obb);
     }
     if (document.contains("provenance") && !document.at("provenance").is_null()) {
       read_provenance(document.at("provenance"), manifest);

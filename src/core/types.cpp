@@ -131,7 +131,7 @@ bool is_known_resize(std::string_view text) {
 
 bool is_known_box_format(std::string_view text) {
   return text == "xyxy" || text == "cxcywh" || text == "xywh" || text == "xyxy_normalized" ||
-         text == "cxcywh_normalized";
+         text == "cxcywh_normalized" || text == "cxcywh_angle";
 }
 
 bool task_needs_box_format(TaskType task) {

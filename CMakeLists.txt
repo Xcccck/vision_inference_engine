@@ -116,6 +116,8 @@ add_library(vie
   src/decoder/detection_ops.cpp
   src/decoder/yolov8_cpu_decode.cpp
   src/decoder/yolov8_detect_decoder.cpp
+  src/decoder/obb_geometry.cpp
+  src/decoder/yolov8_obb_decoder.cpp
   src/decoder/rtdetr_decoder.cpp
   src/decoder/rtdetr_cuda_decoder.cpp
   src/decoder/yolov8_seg_decoder.cpp
@@ -125,6 +127,7 @@ add_library(vie
   src/recognizer/recognition.cpp
   src/recognizer/recognizer_registry.cpp
   src/recognizer/yolov8_detect_recognizer.cpp
+  src/recognizer/yolov8_obb_recognizer.cpp
   src/recognizer/yolov8_seg_recognizer.cpp
   src/recognizer/rtdetr_recognizer.cpp
   src/recognizer/classification_recognizer.cpp
@@ -202,6 +205,7 @@ if(VIE_BUILD_TESTS)
     tests/test_classification_recognizer.cpp
     tests/test_classification_real_models.cpp
     tests/test_yolov8_seg_recognizer.cpp
+    tests/test_obb.cpp
     tests/test_rtdetr_recognizer.cpp
     tests/test_rtdetr_decoder.cpp
     tests/test_preprocess.cpp
