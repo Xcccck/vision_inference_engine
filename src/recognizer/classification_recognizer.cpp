@@ -73,6 +73,15 @@ bool global_pool(const std::string& op_type) {
   return op_type == "GlobalAveragePool" || op_type == "GlobalMaxPool";
 }
 
+bool rank2_weight(const GraphIndex& index, const OnnxNode& node) {
+  if (node.inputs.size() < 2) return false;
+  const InitializerInfo* weight = initializer_of(index, node.inputs[1]);
+  if (weight == nullptr) return false;
+  std::vector<std::int64_t> dims;
+  if (!static_dims(weight->declared_shape, dims) || dims.size() != 2) return false;
+  return dims[0] >= 1 && dims[1] >= 1;
+}
+
 struct ClassLayout {
   int class_axis = -1;
   int batch_axis = -1;
@@ -179,6 +188,12 @@ std::optional<PoolPath> pool_feeding(const GraphIndex& index, const std::string&
   PoolPath path;
   std::string current = activation;
   std::set<std::string> seen;
+  // MobileNetV3's classifier is Linear -> HardSwish -> Linear. The final Gemm
+  // is the class head. One hidden linear layer and one HardSwish may sit
+  // between that head and the global pool. HardSwish is not an output
+  // activation here, and Sigmoid is not accepted on this path.
+  bool saw_hidden_linear = false;
+  bool saw_hardswish = false;
   for (int step = 0; step < 8; ++step) {
     if (!seen.insert(current).second) return std::nullopt;
     const OnnxNode* node = producer_of(index, current);
@@ -188,9 +203,25 @@ std::optional<PoolPath> pool_feeding(const GraphIndex& index, const std::string&
       path.output_name = current;
       return path;
     }
-    if (!passthrough(node->op_type) || node->inputs.empty()) return std::nullopt;
-    path.hops.push_back(node->op_type);
-    current = node->inputs[0];
+    if (passthrough(node->op_type) && !node->inputs.empty()) {
+      path.hops.push_back(node->op_type);
+      current = node->inputs[0];
+      continue;
+    }
+    if (!saw_hardswish && node->op_type == "HardSwish" && !node->inputs.empty()) {
+      saw_hardswish = true;
+      path.hops.push_back(node->op_type);
+      current = node->inputs[0];
+      continue;
+    }
+    if (!saw_hidden_linear && (node->op_type == "Gemm" || node->op_type == "MatMul") &&
+        rank2_weight(index, *node)) {
+      saw_hidden_linear = true;
+      path.hops.push_back(node->op_type);
+      current = node->inputs[0];
+      continue;
+    }
+    return std::nullopt;
   }
   return std::nullopt;
 }

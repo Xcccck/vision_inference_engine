@@ -471,3 +471,51 @@ CPU 路径是 CPU Tensor、ORT CPU EP、CPU Tensor、CPU Decoder、Top-K。严�
 四种构建都通过。CUDA OFF + ORT OFF 为 122。CUDA OFF + ORT CPU 为 145。CUDA ON + ORT CPU 为 177。CUDA ON + ORT GPU 为 187，其中 `MissingBackendIsExplicit` 因两套 Backend 都存在而跳过。Detection、Segmentation、RT-DETR、logits、Recognizer 和 Manifest 兼容测试包含在这些计数里。
 
 仍未实现：多标签、Sigmoid Decoder、运行时 Softmax、CUDA Top-K、FP16、batch 大于 1、动态类别数、自动类别名。没有开始 Phase 6.6。
+
+## 19. Real-world Model Compatibility Validation
+
+本阶段用 torchvision 0.29.2 的官方模块结构做兼容性检查。导出脚本是 `tools/export_classification_models.py`，固定 torch 2.14.1、torchvision 0.29.2、onnx 1.23.2，`weights=None`，`torch.manual_seed(0)`，legacy ONNX 导出，`dynamo=False`，opset 17。没有下载权重，文件放在 `/tmp/vie_phase66/`，不进入 Git。这些权重是模块默认初始化，推理结果不是分类准确率。
+
+| 模型 | 文件字节 | SHA256 | 输入 | 输出 |
+| --- | ---: | --- | --- | --- |
+| ResNet50，沿用已有导出 | 102057667 | `09e83b1e4299f07e070f6a28368e50d26444cbfc9f742d20952965c8b0f1faae` | `[1,3,224,224]` fp32 `input` | `[1,1000]` `logits` |
+| ResNet18 | 46733665 | `b327e3c9f737d115fedf818c826d00b9c6ad407102d266e8b7619426c7210bbc` | 同上 | `[1,1000]` `logits` |
+| ResNet18 加图内 Softmax | 46733719 | `89fe5301c6b503749dc7a3e3091442293218b2dee316143eabae1eeb664f4e2c` | 同上 | `[1,1000]` `probabilities` |
+| MobileNetV2 | 13942224 | `5a8d327c7334e48d8cdceef534b6ee1d01b7926da33346abc2171ee0a614636c` | 同上 | `[1,1000]` `logits` |
+| MobileNetV3-Small | 10154283 | `e7ec8283cc3fa5f30e613b2d90ec2f275e337fdab2e2c4331a7c863ae26b7ab0` | 同上 | `[1,1000]` `logits` |
+| EfficientNet-B0 | 21045359 | `c63db815bdec5a8dbe1337af385d11e449e462269b56724be14aa84ac024c3cc` | 同上 | `[1,1000]` `logits` |
+
+IR version 是 8，opset domain 为空、版本 17。ResNet 是 `GlobalAveragePool → Flatten → Gemm`。MobileNetV2 和 EfficientNet-B0 也是这条路径；EfficientNet 图里另有 SE 用的 Sigmoid 和多处 GlobalAveragePool，最终分类头仍接到最后一次池化。MobileNetV3-Small 的分类器是 `Gemm → HardSwish → Gemm`。官方 torchvision 导出没有 Softmax，因此是 logits。probabilities 样本是在 ResNet18 的 Gemm 之后追加一个 axis=1 的 Softmax 节点，Softmax 在 ONNX 图里。
+
+| 模型 | Analyzer | Recognizer | 输出协议 | Manifest | 执行 |
+| --- | --- | --- | --- | --- | --- |
+| ResNet50 | 通过 | 接受，`cnn_classifier` | `classification_logits_raw` | schema 通过，预处理未填写时不可执行 | CPU / 严格 CUDA 已有回归 |
+| ResNet18 | 通过 | 接受 | logits | 同上，补上测试预处理后可执行 | CPU 与严格 CUDA 通过 |
+| ResNet18 + Softmax | 通过 | 接受 | `classification_probabilities_raw` | semantic 为 probabilities | CPU 与严格 CUDA 通过 |
+| MobileNetV2 | 通过 | 接受 | logits | 同上 | CPU 与严格 CUDA 通过 |
+| MobileNetV3-Small | 通过 | 修复后接受 | logits | 同上 | CPU 与严格 CUDA 通过 |
+| EfficientNet-B0 | 通过 | 接受 | logits | 同上 | CPU 与严格 CUDA 通过 |
+
+没有和其他任务识别器冲突。类别轴都是 1，类别数 1000。生成的 Manifest 不写颜色、resize、归一化或类别名，因此 runnable 为 false。测试自行补上 RGB、stretch、nearest、`scale_0_1`，provenance 是 user。这不是从图里推断的，也不是 ImageNet mean/std。输入已经是 224×224，stretch 不改变几何。现有 ShortestSide、Center Crop、Letterbox 和 bilinear 回归没有改语义。
+
+MobileNetV3 原先被拒绝，因为最终 Gemm 的输入是 HardSwish，而 HardSwish 的输入是另一个 Gemm。最终 Gemm 的权重是 `[1000, 1024]`、`transB=1`，类别维仍然能证明。允许分类头和全局池化之间有一层 rank-2 的隐藏 Gemm 或 MatMul，以及一次 HardSwish。证据写成 `global_pool_path` 经过 `HardSwish Gemm Flatten`。第二次 HardSwish、输出上的 Sigmoid、只有 Softmax 没有线性头，仍然是 Unknown。Detection、Segmentation、RT-DETR 的识别结果不变。
+
+环境没有 Python 版 ONNX Runtime。对照是同一进程里的 PyTorch 前向，输入是确定性的 uint8 图案再除以 255，NCHW。VIE 的 CPU EP 原始输出与这份 PyTorch 向量的最大绝对误差小于 `1e-4`。logits 模型的输出与测试里独立计算的 Softmax 不同。probabilities 模型返回图内 Softmax 的值，和 PyTorch `softmax` 的误差也小于 `1e-4`，概率和约为 1。
+
+严格 CUDA EP 与 CPU EP 的 Top-5 在分数差大于 `1e-3` 时类别一致。ResNet18 上观察到的最大分数差约 `1.09e-4`，容差取 `1e-3`。`d2h_bytes` 为 4000。MobileNet 和 EfficientNet 的默认初始化在 eval 模式下输出接近 0，Top-1 与 Top-2 的间隔可能小于这个容差，这时只比较分数、不把名次抖动当成协议错误。
+
+ResNet18 CPU 计时，224×224，1000 类，无 D2H，warmup 3，样本 20。P50 和 P95 按升序后的 `floor(fraction * (n-1))` 取值：
+
+| 阶段 | 平均 ms | P50 ms | P95 ms |
+| --- | ---: | ---: | ---: |
+| preprocess | 4.457 | 4.325 | 5.975 |
+| execute | 5.873 | 5.631 | 7.332 |
+| validate | 0.008 | 0.008 | 0.010 |
+| Top-K | 0.222 | 0.207 | 0.278 |
+| total | 10.585 | 10.209 | 12.459 |
+
+引擎没有统一的 CPU 利用率计数。耗时主要在预处理和 Backend execute。本阶段没有为此改算法。
+
+已知限制：输出 rank 不是 2 的分类头、两层以上的隐藏激活、Sigmoid 输出、以及图里无法证明池化到线性头的模型仍是 Unknown。预处理参数继续由调用者填写。没有把这些随机权重的 Top-1 当成 ImageNet 类别。
+
+四种构建在本机模型文件存在时执行了真实模型测试。CUDA OFF + ORT OFF 为 124。CUDA OFF + ORT CPU 为 149。CUDA ON + ORT CPU 为 181。CUDA ON + ORT GPU 为 192，其中 `MissingBackendIsExplicit` 因两套 Backend 都存在而跳过。目录缺失时真实模型测试跳过，其余单元测试不依赖这些文件。没有开始 Phase 6.7。

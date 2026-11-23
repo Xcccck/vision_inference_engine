@@ -196,6 +196,60 @@ TEST(ClassificationRecognizer, SoftmaxAfterLinearHeadIsProbabilities) {
   EXPECT_EQ(implied.selected()->decoder.score_type, "probabilities");
 }
 
+OnnxTestWriter mlp_classifier(const std::string& tail, int hardswish_count) {
+  OnnxTestWriter graph;
+  graph.message(1, node_message("GlobalAveragePool", {"images"}, {"pooled"}));
+  graph.message(1, node_message("Flatten", {"pooled"}, {"flat"}, {attr_int("axis", 1)}));
+  graph.message(1, node_message("Gemm", {"flat", "hidden_weight", "hidden_bias"}, {"hidden"},
+                                {attr_int("transB", 1)}));
+  std::string current = "hidden";
+  for (int index = 0; index < hardswish_count; ++index) {
+    const std::string next = "activated" + std::to_string(index);
+    graph.message(1, node_message("HardSwish", {current}, {next}));
+    current = next;
+  }
+  graph.message(1, node_message("Gemm", {current, "class_weight", "class_bias"}, {"pre"},
+                                {attr_int("transB", 1)}));
+  if (tail == "softmax") {
+    graph.message(1, node_message("Softmax", {"pre"}, {"logits"}, {attr_int("axis", 1)}));
+  } else if (tail == "sigmoid") {
+    graph.message(1, node_message("Sigmoid", {"pre"}, {"logits"}));
+  } else {
+    graph.message(1, node_message("Identity", {"pre"}, {"logits"}));
+  }
+  graph.message(5, tensor_message("hidden_weight", 1, {4, 3}, {}, "", false));
+  graph.message(5, tensor_message("hidden_bias", 1, {4}, {}, "", false));
+  graph.message(5, tensor_message("class_weight", 1, {5, 4}, {}, "", false));
+  graph.message(5, tensor_message("class_bias", 1, {5}, {}, "", false));
+  graph.message(11, value_info("images", tensor_type(1, true, {static_dim(1), static_dim(3), static_dim(8),
+                                                              static_dim(8)})));
+  graph.message(12, value_info("logits", tensor_type(1, true, {static_dim(1), static_dim(5)})));
+  return wrap_model(graph);
+}
+
+TEST(ClassificationRecognizer, HiddenHardSwishBeforeTheClassGemmIsLogits) {
+  const vie::RecognitionResult result = recognize_model(mlp_classifier("identity", 1), "mlp.onnx");
+  EXPECT_EQ(result.status, vie::RecognitionStatus::Recognized) << result.explanation;
+  ASSERT_NE(result.selected(), nullptr);
+  EXPECT_EQ(result.selected()->decoder.protocol, "classification_logits_raw");
+  EXPECT_EQ(result.selected()->decoder.score_type, "logits");
+  EXPECT_EQ(result.selected()->decoder.num_classes, 5);
+  EXPECT_TRUE(has_evidence(*result.selected(), "linear_classification_head"));
+  EXPECT_TRUE(has_evidence(*result.selected(), "global_pool_path"));
+  bool saw_hardswish = false;
+  for (const vie::RecognitionEvidence& evidence : result.selected()->evidence) {
+    if (evidence.detail.find("HardSwish") != std::string::npos) saw_hardswish = true;
+  }
+  EXPECT_TRUE(saw_hardswish);
+
+  const vie::RecognitionResult probabilities =
+      recognize_model(mlp_classifier("softmax", 1), "mlp_softmax.onnx");
+  EXPECT_EQ(probabilities.status, vie::RecognitionStatus::Recognized) << probabilities.explanation;
+  ASSERT_NE(probabilities.selected(), nullptr);
+  EXPECT_EQ(probabilities.selected()->decoder.protocol, "classification_probabilities_raw");
+  EXPECT_EQ(probabilities.selected()->decoder.score_type, "probabilities");
+}
+
 TEST(ClassificationRecognizer, DeclinesStructuresThatAreNotSingleLabelLogits) {
   auto expect_unknown = [](const OnnxTestWriter& model, const char* name) {
     const vie::RecognitionResult result = recognize_model(model, name);
@@ -224,6 +278,8 @@ TEST(ClassificationRecognizer, DeclinesStructuresThatAreNotSingleLabelLogits) {
   softmax_only.message(11, value_info("features", tensor_type(1, true, {static_dim(1), static_dim(4)})));
   softmax_only.message(12, value_info("probs", tensor_type(1, true, {static_dim(1), static_dim(4)})));
   expect_unknown(wrap_model(softmax_only), "softmax_only");
+  expect_unknown(mlp_classifier("sigmoid", 1), "mlp_sigmoid");
+  expect_unknown(mlp_classifier("identity", 2), "two_hardswish");
 
   OnnxTestWriter pool_only;
   pool_only.message(1, node_message("GlobalAveragePool", {"images"}, {"pooled"}));

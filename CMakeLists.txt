@@ -200,6 +200,7 @@ if(VIE_BUILD_TESTS)
     tests/test_onnx_analyzer.cpp
     tests/test_recognizer.cpp
     tests/test_classification_recognizer.cpp
+    tests/test_classification_real_models.cpp
     tests/test_yolov8_seg_recognizer.cpp
     tests/test_rtdetr_recognizer.cpp
     tests/test_rtdetr_decoder.cpp
