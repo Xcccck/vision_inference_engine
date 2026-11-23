@@ -3,6 +3,9 @@
 namespace vie {
 
 ThreadPool::ThreadPool(std::size_t worker_count) {
+  if (worker_count == 0) {
+    throw std::invalid_argument("ThreadPool worker count must be at least 1");
+  }
   for (std::size_t i = 0; i < worker_count; ++i) {
     workers_.emplace_back([this] { worker_loop(); });
   }
