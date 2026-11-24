@@ -424,6 +424,86 @@ DetectionBatch InferenceEngine::infer(const ImageInput& image, DetectionInferTim
   return batch;
 }
 
+// Phase 9.1: Batch detection. Runs one preprocess / execute / decode pass
+// for the whole batch. Only yolov8_detect_raw on CPU currently supports
+// Batch>1; other decoders or CUDA reject a batch larger than one via their
+// own decode_batch implementation, so this function does not silently fall
+// back to looping infer().
+DetectionBatch InferenceEngine::infer_batch(const std::vector<ImageInput>& images,
+                                            DetectionInferTiming* timing) {
+  if (!loaded_) {
+    throw VieError(ErrorCode::InvalidArgument, "engine is not loaded");
+  }
+  if (images.empty()) {
+    throw VieError(ErrorCode::InvalidArgument, "infer_batch requires at least one image");
+  }
+  if (manifest_.task == TaskType::Segmentation) {
+    throw VieError(ErrorCode::Unsupported,
+                   "task segmentation does not produce DetectionBatch; call infer_segmentation()");
+  }
+  if (manifest_.task == TaskType::Classification) {
+    throw VieError(ErrorCode::Unsupported,
+                   "task classification does not produce DetectionBatch; call infer_classification()");
+  }
+  if (manifest_.task == TaskType::Obb) {
+    throw VieError(ErrorCode::Unsupported, "task obb does not produce DetectionBatch; call infer_obb()");
+  }
+  if (manifest_.task == TaskType::Pose) {
+    throw VieError(ErrorCode::Unsupported, "task pose does not produce DetectionBatch; call infer_pose()");
+  }
+  // Reject mixed devices so the batch Tensor stays on one execution device.
+  for (std::size_t i = 1; i < images.size(); ++i) {
+    if (images[i].device != images[0].device || images[i].device_id != images[0].device_id) {
+      throw VieError(ErrorCode::InvalidArgument,
+                     "infer_batch image[" + std::to_string(i) +
+                         "] device does not match image[0] device");
+    }
+  }
+
+  const auto total_start = std::chrono::steady_clock::now();
+  ImagePreprocessor preprocessor;
+  preprocessor.configure(
+      preprocess_config_from_manifest(manifest_, images[0].color, images[0].layout));
+  const BatchPreprocessResult prepared = preprocessor.execute_batch(images, device_);
+  const double preprocess_ms = elapsed_ms(total_start);
+  require_same_device(prepared.output, device_, "batch preprocess output");
+
+  BackendRequest request;
+  request.inputs.emplace(manifest_.input.name, prepared.output);
+  const auto execute_start = std::chrono::steady_clock::now();
+  const BackendOutput output = execute(request);
+  const double execute_ms = elapsed_ms(execute_start);
+
+  DecoderInput decoded;
+  for (const auto& entry : output.tensors) {
+    require_same_device(entry.second.tensor, device_, "backend output '" + entry.first + "'");
+    decoded.outputs.emplace(entry.first, entry.second.tensor);
+  }
+  decoded.geometries = prepared.geometries;
+  if (prepared.geometries.size() == 1) {
+    decoded.geometry = prepared.geometries.front();
+  }
+
+  const auto decode_start = std::chrono::steady_clock::now();
+  DetectionBatch batch =
+      decoder_->decode_batch(decoded, decoder_config_from_manifest(manifest_), device_);
+  if (batch.results.size() != images.size()) {
+    throw VieError(ErrorCode::Internal,
+                   "decoder returned " + std::to_string(batch.results.size()) +
+                       " results for a batch of " + std::to_string(images.size()));
+  }
+  if (timing != nullptr) {
+    timing->preprocess_ms = preprocess_ms;
+    timing->execute_ms = execute_ms;
+    timing->decode_ms = elapsed_ms(decode_start);
+    timing->total_ms = elapsed_ms(total_start);
+    timing->includes_sync = device_.device() == DeviceType::Cuda;
+    timing->includes_h2d = false;
+    timing->includes_d2h = device_.device() == DeviceType::Cuda;
+  }
+  return batch;
+}
+
 SegmentationBatch InferenceEngine::infer_segmentation(const ImageInput& image,
                                                      const SegmentationRuntimeConfig& runtime,
                                                      SegmentationInferTiming* timing) {

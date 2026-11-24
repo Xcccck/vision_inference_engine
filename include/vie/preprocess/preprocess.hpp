@@ -52,6 +52,18 @@ struct PreprocessResult {
   double device_ms = 0;
 };
 
+// Phase 9.1: N images preprocessed into a single [N, C, H, W] (or NHWC)
+// Tensor. Per-image GeometryTransform is preserved so the downstream decoder
+// can map coordinates independently and run NMS without cross-sample
+// interference. All images in a batch must share the same PreprocessConfig
+// (target size, resize mode, interpolation, dtype, color, layout). Per-image
+// source sizes may differ because each image gets its own GeometryTransform.
+struct BatchPreprocessResult {
+  Tensor output;
+  std::vector<GeometryTransform> geometries;
+  double device_ms = 0;
+};
+
 // Sampling convention, shared by CPU and CUDA:
 // source = (content_index + 0.5) * (source_size / resized_size) - 0.5
 // Nearest uses floor(source + 0.5), with halves rounding away from zero.
@@ -73,6 +85,16 @@ class ImagePreprocessor {
   void configure(PreprocessConfig config);
   void validate(const ImageInput& image) const;
   PreprocessResult execute(const ImageInput& image, const DeviceContext& device) const;
+
+  // Phase 9.1: Batch preprocess. Validates every image against the current
+  // PreprocessConfig (device + dtype + channels + layout), then writes each
+  // image into a contiguous slice of one [N, ...] output Tensor. Returns one
+  // GeometryTransform per image, in input order. Throws on an empty batch,
+  // on a device mismatch, or when any image fails validation; error messages
+  // include the offending image index. For CUDA, all launches happen before
+  // a single synchronization at the end.
+  BatchPreprocessResult execute_batch(const std::vector<ImageInput>& images,
+                                      const DeviceContext& device) const;
 
   const PreprocessConfig& config() const { return config_; }
 

@@ -53,6 +53,17 @@ DetectionBatch ModelInstance::infer(const ImageInput& image, DetectionInferTimin
   return result;
 }
 
+// Phase 9.1: same mutex + metrics pattern as infer(). The whole batch counts
+// as one logical inference call for concurrency accounting.
+DetectionBatch ModelInstance::infer_batch(const std::vector<ImageInput>& images,
+                                          DetectionInferTiming* timing) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  InferenceGuard guard(metrics_, id_);
+  auto result = engine_.infer_batch(images, timing);
+  guard.set_success(true);
+  return result;
+}
+
 SegmentationBatch ModelInstance::infer_segmentation(const ImageInput& image,
                                                      const SegmentationRuntimeConfig& runtime,
                                                      SegmentationInferTiming* timing) {

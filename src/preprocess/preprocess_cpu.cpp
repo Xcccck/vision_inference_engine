@@ -71,27 +71,21 @@ float sample_channel(const std::byte* base, std::size_t stride, const ImageInput
 
 }  // namespace
 
-PreprocessResult preprocess_cpu(const PreprocessConfig& config, const ImageInput& image,
-                                const DeviceContext& device, const GeometryTransform& geometry) {
-  std::vector<std::int64_t> shape;
-  Layout layout = Layout::Unknown;
-  if (config.output_layout == ImageLayout::Chw) {
-    shape = {1, 3, geometry.output_height, geometry.output_width};
-    layout = Layout::Nchw;
-  } else {
-    shape = {1, geometry.output_height, geometry.output_width, 3};
-    layout = Layout::Nhwc;
-  }
-  Tensor output = Tensor::zeros(device, config.output_dtype, shape);
-  output.set_layout(layout);
-
+// Phase 9.1: writes one preprocessed image into a caller-provided contiguous
+// buffer laid out as either NCHW (index = ((c * H) + y) * W + x) or NHWC
+// (index = ((y * W) + x) * 3 + c). Used by both preprocess_cpu (which passes
+// the freshly allocated [1, ...] tensor) and by the batch path (which slices
+// one [N, ...] tensor). The buffer must already be sized for one image.
+void preprocess_cpu_into(const PreprocessConfig& config, const ImageInput& image,
+                         const GeometryTransform& geometry, void* output_base) {
   const std::byte* base = static_cast<const std::byte*>(image.data);
   const std::size_t stride = resolved_stride(image);
   const int swap = config.input_color != config.output_color ? 1 : 0;
   const bool normalize = config.normalize_enabled;
-  float* floats = config.output_dtype == DataType::Fp32 ? output.mutable_data<float>() : nullptr;
+  float* floats =
+      config.output_dtype == DataType::Fp32 ? static_cast<float*>(output_base) : nullptr;
   std::uint8_t* bytes =
-      config.output_dtype == DataType::Uint8 ? output.mutable_data<std::uint8_t>() : nullptr;
+      config.output_dtype == DataType::Uint8 ? static_cast<std::uint8_t*>(output_base) : nullptr;
 
   for (int y = 0; y < geometry.output_height; ++y) {
     for (int x = 0; x < geometry.output_width; ++x) {
@@ -128,6 +122,22 @@ PreprocessResult preprocess_cpu(const PreprocessConfig& config, const ImageInput
       }
     }
   }
+}
+
+PreprocessResult preprocess_cpu(const PreprocessConfig& config, const ImageInput& image,
+                                const DeviceContext& device, const GeometryTransform& geometry) {
+  std::vector<std::int64_t> shape;
+  Layout layout = Layout::Unknown;
+  if (config.output_layout == ImageLayout::Chw) {
+    shape = {1, 3, geometry.output_height, geometry.output_width};
+    layout = Layout::Nchw;
+  } else {
+    shape = {1, geometry.output_height, geometry.output_width, 3};
+    layout = Layout::Nhwc;
+  }
+  Tensor output = Tensor::zeros(device, config.output_dtype, shape);
+  output.set_layout(layout);
+  preprocess_cpu_into(config, image, geometry, output.data());
 
   PreprocessResult result;
   result.output = std::move(output);

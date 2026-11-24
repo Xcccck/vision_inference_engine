@@ -304,6 +304,85 @@ PreprocessResult ImagePreprocessor::execute(const ImageInput& image, const Devic
   throw VieError(ErrorCode::InvalidArgument, "execution device must be cpu or cuda");
 }
 
+// Phase 9.1: Batch preprocess. Allocates a single [N, ...] Tensor, writes
+// each image into a per-image slice, and returns one GeometryTransform per
+// image. On CUDA the launches happen back-to-back and a single sync covers
+// them all; the H2D cost of the images themselves stays outside this call.
+BatchPreprocessResult ImagePreprocessor::execute_batch(const std::vector<ImageInput>& images,
+                                                       const DeviceContext& device) const {
+  if (images.empty()) {
+    throw VieError(ErrorCode::InvalidArgument, "batch preprocess requires at least one image");
+  }
+  // Validate every image first so the failure surfaces before allocating the
+  // batch buffer. The message includes the offending index.
+  for (std::size_t i = 0; i < images.size(); ++i) {
+    try {
+      validate(images[i]);
+    } catch (const VieError& error) {
+      throw VieError(error.code(), "batch image[" + std::to_string(i) + "]: " + error.what());
+    }
+    if (images[i].device != device.device() || images[i].device_id != device.device_id()) {
+      throw VieError(ErrorCode::InvalidArgument,
+                     "batch image[" + std::to_string(i) + "] device " +
+                         device_label(images[i].device, images[i].device_id) +
+                         " does not match execution device " +
+                         device_label(device.device(), device.device_id()));
+    }
+  }
+
+  // One GeometryTransform per image, then compute the shared per-sample size.
+  std::vector<GeometryTransform> geometries;
+  geometries.reserve(images.size());
+  for (const ImageInput& image : images) {
+    geometries.push_back(make_geometry(config_, image.width, image.height));
+  }
+  // All geometries share the same target size; the preprocess config pins it.
+  const int out_h = geometries.front().output_height;
+  const int out_w = geometries.front().output_width;
+  const std::size_t per_image_elements =
+      static_cast<std::size_t>(out_h) * static_cast<std::size_t>(out_w) * 3u;
+  const std::size_t per_image_bytes =
+      per_image_elements * (config_.output_dtype == DataType::Uint8 ? 1u : 4u);
+
+  std::vector<std::int64_t> shape;
+  Layout layout = Layout::Unknown;
+  if (config_.output_layout == ImageLayout::Chw) {
+    shape = {static_cast<std::int64_t>(images.size()), 3, out_h, out_w};
+    layout = Layout::Nchw;
+  } else {
+    shape = {static_cast<std::int64_t>(images.size()), out_h, out_w, 3};
+    layout = Layout::Nhwc;
+  }
+  Tensor output = Tensor::zeros(device, config_.output_dtype, shape);
+  output.set_layout(layout);
+
+  BatchPreprocessResult result;
+  result.geometries = std::move(geometries);
+
+  if (device.device() == DeviceType::Cpu) {
+    std::byte* base = output.data();
+    for (std::size_t i = 0; i < images.size(); ++i) {
+      preprocess_cpu_into(config_, images[i], result.geometries[i], base + i * per_image_bytes);
+    }
+    result.output = std::move(output);
+    result.device_ms = 0;
+    return result;
+  }
+  if (device.device() == DeviceType::Cuda) {
+#if defined(VIE_HAS_CUDA)
+    CudaBatchPreprocess cuda_batch = preprocess_cuda_batch(config_, images, device);
+    BatchPreprocessResult result;
+    result.output = std::move(cuda_batch.output);
+    result.geometries = std::move(cuda_batch.geometries);
+    result.device_ms = cuda_batch.device_ms;
+    return result;
+#else
+    throw VieError(ErrorCode::Unsupported, "CUDA batch preprocess is not available in this build");
+#endif
+  }
+  throw VieError(ErrorCode::InvalidArgument, "execution device must be cpu or cuda");
+}
+
 PreprocessConfig preprocess_config_from_manifest(const ModelManifest& manifest, ColorOrder source_color,
                                                  ImageLayout source_layout) {
   require_resolved(!manifest.input.color.empty(), "input.color");
@@ -314,7 +393,18 @@ PreprocessConfig preprocess_config_from_manifest(const ModelManifest& manifest, 
                    "input.dtype");
   require_resolved(manifest.input.layout == Layout::Nchw || manifest.input.layout == Layout::Nhwc,
                    "input.layout");
-  if (!is_concrete_shape(manifest.input.shape) || manifest.input.shape.size() != 4) {
+  if (manifest.input.shape.size() != 4) {
+    throw VieError(ErrorCode::UnresolvedField, "input.shape is unresolved");
+  }
+  // Phase 9.1: batch dim may be dynamic (-1); all other axes must be concrete.
+  const std::int64_t batch_axis = manifest.input.shape[0];
+  if (batch_axis != -1 && batch_axis <= 0) {
+    throw VieError(ErrorCode::UnresolvedField, "input.shape is unresolved");
+  }
+  if (manifest.input.shape[1] <= 0 || manifest.input.shape[2] <= 0) {
+    throw VieError(ErrorCode::UnresolvedField, "input.shape is unresolved");
+  }
+  if (manifest.input.layout == Layout::Nhwc && manifest.input.shape[3] <= 0) {
     throw VieError(ErrorCode::UnresolvedField, "input.shape is unresolved");
   }
 
@@ -338,14 +428,19 @@ PreprocessConfig preprocess_config_from_manifest(const ModelManifest& manifest, 
   }
 
   if (manifest.input.layout == Layout::Nchw) {
-    if (manifest.input.shape[0] != 1 || manifest.input.shape[1] != 3) {
-      throw VieError(ErrorCode::InvalidArgument, "NCHW preprocess expects shape [1, 3, H, W]");
+    // Phase 9.1: allow batch dim to be 1 (static) or -1 (dynamic). Any other
+    // concrete value (e.g. Fixed Batch=4) is rejected here; Batch Kind is
+    // handled by the engine's shape check.
+    const std::int64_t batch = manifest.input.shape[0];
+    if ((batch != 1 && batch != -1) || manifest.input.shape[1] != 3) {
+      throw VieError(ErrorCode::InvalidArgument, "NCHW preprocess expects shape [1|-1, 3, H, W]");
     }
     config.target_height = static_cast<int>(manifest.input.shape[2]);
     config.target_width = static_cast<int>(manifest.input.shape[3]);
   } else {
-    if (manifest.input.shape[0] != 1 || manifest.input.shape[3] != 3) {
-      throw VieError(ErrorCode::InvalidArgument, "NHWC preprocess expects shape [1, H, W, 3]");
+    const std::int64_t batch = manifest.input.shape[0];
+    if ((batch != 1 && batch != -1) || manifest.input.shape[3] != 3) {
+      throw VieError(ErrorCode::InvalidArgument, "NHWC preprocess expects shape [1|-1, H, W, 3]");
     }
     config.target_height = static_cast<int>(manifest.input.shape[1]);
     config.target_width = static_cast<int>(manifest.input.shape[2]);

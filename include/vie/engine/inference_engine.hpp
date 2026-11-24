@@ -172,6 +172,16 @@ class InferenceEngine {
   // A segmentation, classification, OBB, or pose manifest throws Unsupported.
   // This never returns masks, class labels, oriented boxes, or keypoints.
   DetectionBatch infer(const ImageInput& image, DetectionInferTiming* timing = nullptr);
+  // Phase 9.1: Batch detection. Preprocesses N images into a single
+  // [N, 3, H, W] (or NHWC) Tensor, runs one Backend execute() call, then
+  // decodes the [N, ...] output with N independent GeometryTransform and NMS
+  // passes. Only task detection with a batch-capable decoder (currently
+  // yolov8_detect_raw on CPU) is accepted; CUDA yolov8_detect_raw and every
+  // other task decoder throw Unsupported when the batch size exceeds one.
+  // Empty vector throws InvalidArgument. Results are returned in input
+  // order. The single-image infer() API is unchanged.
+  DetectionBatch infer_batch(const std::vector<ImageInput>& images,
+                             DetectionInferTiming* timing = nullptr);
   // Preprocess, execute, then decode_segmentation. runtime is the only source
   // of thresholds, NMS, retina_masks, and the mask budget. timing may be null.
   // A detection manifest throws Unsupported. Mask storage outlives this engine.

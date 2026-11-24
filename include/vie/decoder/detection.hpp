@@ -120,7 +120,16 @@ struct DecoderConfig {
 
 struct DecoderInput {
   std::map<std::string, Tensor> outputs;
+  // Single-image path (Batch=1). Retained for backward compatibility.
   std::optional<GeometryTransform> geometry;
+  // Phase 9.1: Batch path. When non-empty, the size MUST equal the batch
+  // dimension of the primary output tensor, and each element maps to one
+  // sample in the batch, in input order. Decoders that support Batch>1 read
+  // this vector first and fall back to `geometry` for Batch=1 callers.
+  // Decoders that do not implement Batch>1 reject a non-empty `geometries`
+  // with an Unsupported error rather than silently decoding only the first
+  // sample.
+  std::vector<GeometryTransform> geometries;
 };
 
 struct NmsCandidate {

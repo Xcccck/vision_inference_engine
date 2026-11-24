@@ -202,6 +202,7 @@ if(VIE_BUILD_TESTS)
   find_package(GTest REQUIRED)
   add_executable(vie_tests
     tests/test_tensor.cpp
+    tests/test_batch_inference.cpp
     tests/test_classification.cpp
     tests/test_manifest.cpp
     tests/test_engine.cpp
@@ -240,7 +241,7 @@ if(VIE_BUILD_TESTS)
   if(VIE_ENABLE_CUDA)
     target_sources(vie_tests PRIVATE tests/test_cuda_tensor.cpp tests/test_preprocess_cuda.cpp
                                    tests/test_decoder_cuda.cpp tests/test_yolov8_seg_cuda.cpp
-                                   tests/test_rtdetr_cuda_decoder.cpp)
+                                   tests/test_rtdetr_cuda_decoder.cpp tests/test_batch_cuda.cpp)
     set_property(TARGET vie_tests APPEND PROPERTY BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
   endif()
   include(GoogleTest)
@@ -271,17 +272,21 @@ add_executable(real_model_benchmark tools/real_model_benchmark.cpp)
 target_link_libraries(real_model_benchmark PRIVATE vie::vie)
 target_compile_options(real_model_benchmark PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
+add_executable(batch_benchmark tools/batch_benchmark.cpp)
+target_link_libraries(batch_benchmark PRIVATE vie::vie)
+target_compile_options(batch_benchmark PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
 if(VIE_ENABLE_ONNXRUNTIME)
   if(VIE_ENABLE_ONNXRUNTIME_CUDA)
-    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime runtime_benchmark real_model_benchmark
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark
       APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_GPU_LIB_DIR}")
   else()
-    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime runtime_benchmark real_model_benchmark
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark
       APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_LIB_DIR}")
   endif()
 endif()
 if(VIE_ENABLE_CUDA)
-  set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime runtime_benchmark real_model_benchmark
+  set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark
     APPEND PROPERTY BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
 endif()
 

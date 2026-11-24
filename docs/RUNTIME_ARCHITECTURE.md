@@ -299,7 +299,7 @@ std::cout << "Total inferences: " << metrics.total_inferences << "\n";
 
 ## Future Enhancements
 
-- **Batching**: Automatically batch multiple inference requests
+- **Automatic Batch Aggregation**: Request scheduler that transparently batches incoming single-image requests (Phase 9.2+)
 - **Priority queues**: High-priority tasks preempt low-priority
 - **Dynamic thread pool**: Adjust worker count based on load
 - **Model sharing**: Share Backend/Decoder between instances (read-only)

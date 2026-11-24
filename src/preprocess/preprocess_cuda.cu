@@ -123,16 +123,6 @@ PreprocessResult preprocess_cuda(const PreprocessConfig& config, const ImageInpu
   Tensor output = Tensor::zeros(device, config.output_dtype, shape);
   output.set_layout(layout);
 
-  const bool is_u8 = image.dtype == DataType::Uint8;
-  const float mean0 = config.mean.size() == 3 ? config.mean[0] : 0.f;
-  const float mean1 = config.mean.size() == 3 ? config.mean[1] : 0.f;
-  const float mean2 = config.mean.size() == 3 ? config.mean[2] : 0.f;
-  const float std0 = config.std.size() == 3 ? config.std[0] : 1.f;
-  const float std1 = config.std.size() == 3 ? config.std[1] : 1.f;
-  const float std2 = config.std.size() == 3 ? config.std[2] : 1.f;
-  dim3 block(16, 16);
-  dim3 grid((static_cast<unsigned>(geometry.output_width) + 15) / 16,
-            (static_cast<unsigned>(geometry.output_height) + 15) / 16);
   struct EventGuard {
     cudaEvent_t event = nullptr;
     ~EventGuard() {
@@ -144,6 +134,34 @@ PreprocessResult preprocess_cuda(const PreprocessConfig& config, const ImageInpu
   cuda_check(cudaEventCreate(&started.event), "cudaEventCreate");
   cuda_check(cudaEventCreate(&stopped.event), "cudaEventCreate");
   cuda_check(cudaEventRecord(started.event), "cudaEventRecord");
+  preprocess_cuda_launch(config, image, geometry, output.device_data());
+  cuda_check(cudaEventRecord(stopped.event), "cudaEventRecord");
+  cuda_check(cudaEventSynchronize(stopped.event), "cudaEventSynchronize");
+  float elapsed = 0.f;
+  cuda_check(cudaEventElapsedTime(&elapsed, started.event, stopped.event), "cudaEventElapsedTime");
+
+  PreprocessResult result;
+  result.output = std::move(output);
+  result.geometry = geometry;
+  result.device_ms = static_cast<double>(elapsed);
+  return result;
+}
+
+// Phase 9.1: single-image kernel launch that writes into a caller-provided
+// device buffer. No synchronization and no allocation. Used by the batch
+// path so N launches share one sync at the end.
+void preprocess_cuda_launch(const PreprocessConfig& config, const ImageInput& image,
+                            const GeometryTransform& geometry, std::byte* device_output_base) {
+  const bool is_u8 = image.dtype == DataType::Uint8;
+  const float mean0 = config.mean.size() == 3 ? config.mean[0] : 0.f;
+  const float mean1 = config.mean.size() == 3 ? config.mean[1] : 0.f;
+  const float mean2 = config.mean.size() == 3 ? config.mean[2] : 0.f;
+  const float std0 = config.std.size() == 3 ? config.std[0] : 1.f;
+  const float std1 = config.std.size() == 3 ? config.std[1] : 1.f;
+  const float std2 = config.std.size() == 3 ? config.std[2] : 1.f;
+  dim3 block(16, 16);
+  dim3 grid((static_cast<unsigned>(geometry.output_width) + 15) / 16,
+            (static_cast<unsigned>(geometry.output_height) + 15) / 16);
   preprocess_kernel<<<grid, block>>>(
       is_u8 ? static_cast<const std::uint8_t*>(image.data) : nullptr,
       is_u8 ? nullptr : static_cast<const float*>(image.data), is_u8 ? 1 : 0, resolved_stride(image),
@@ -155,18 +173,85 @@ PreprocessResult preprocess_cuda(const PreprocessConfig& config, const ImageInpu
       geometry_model_origin_x(geometry), geometry_model_origin_y(geometry),
       config.output_layout == ImageLayout::Chw ? 1 : 0,
       config.output_dtype == DataType::Uint8 ? 1 : 0,
-      config.output_dtype == DataType::Uint8 ? reinterpret_cast<std::uint8_t*>(output.device_data())
-                                            : nullptr,
-      config.output_dtype == DataType::Fp32 ? reinterpret_cast<float*>(output.device_data()) : nullptr);
+      config.output_dtype == DataType::Uint8
+          ? reinterpret_cast<std::uint8_t*>(device_output_base)
+          : nullptr,
+      config.output_dtype == DataType::Fp32
+          ? reinterpret_cast<float*>(device_output_base)
+          : nullptr);
   cuda_check(cudaGetLastError(), "preprocess kernel launch");
+}
+
+// Phase 9.1: allocates one [N, ...] CUDA Tensor, launches N kernels back to
+// back, then synchronizes once. H2D cost is outside this function; every
+// image must already live on the target device.
+CudaBatchPreprocess preprocess_cuda_batch(const PreprocessConfig& config,
+                                          const std::vector<ImageInput>& images,
+                                          const DeviceContext& device) {
+  if (images.empty()) {
+    throw VieError(ErrorCode::InvalidArgument, "CUDA batch preprocess requires at least one image");
+  }
+  for (std::size_t i = 0; i < images.size(); ++i) {
+    if (images[i].device != DeviceType::Cuda) {
+      throw VieError(ErrorCode::InvalidArgument,
+                     "CUDA batch preprocess image[" + std::to_string(i) + "] is not a CUDA image");
+    }
+    if (images[i].device_id != device.device_id()) {
+      throw VieError(ErrorCode::InvalidArgument,
+                     "CUDA batch preprocess image[" + std::to_string(i) +
+                         "] device id does not match execution device");
+    }
+  }
+  cuda_check(cudaSetDevice(device.device_id()), "cudaSetDevice");
+
+  std::vector<GeometryTransform> geometries;
+  geometries.reserve(images.size());
+  for (const ImageInput& image : images) {
+    geometries.push_back(make_geometry(config, image.width, image.height));
+  }
+
+  const int out_h = geometries.front().output_height;
+  const int out_w = geometries.front().output_width;
+  const std::size_t per_image_elements =
+      static_cast<std::size_t>(out_h) * static_cast<std::size_t>(out_w) * 3u;
+  const std::size_t per_image_bytes =
+      per_image_elements * (config.output_dtype == DataType::Uint8 ? 1u : 4u);
+
+  std::vector<std::int64_t> shape;
+  Layout layout = Layout::Unknown;
+  if (config.output_layout == ImageLayout::Chw) {
+    shape = {static_cast<std::int64_t>(images.size()), 3, out_h, out_w};
+    layout = Layout::Nchw;
+  } else {
+    shape = {static_cast<std::int64_t>(images.size()), out_h, out_w, 3};
+    layout = Layout::Nhwc;
+  }
+  Tensor output = Tensor::zeros(device, config.output_dtype, shape);
+  output.set_layout(layout);
+
+  struct EventGuard {
+    cudaEvent_t event = nullptr;
+    ~EventGuard() {
+      if (event != nullptr) cudaEventDestroy(event);
+    }
+  };
+  EventGuard started;
+  EventGuard stopped;
+  cuda_check(cudaEventCreate(&started.event), "cudaEventCreate");
+  cuda_check(cudaEventCreate(&stopped.event), "cudaEventCreate");
+  cuda_check(cudaEventRecord(started.event), "cudaEventRecord");
+  std::byte* base = output.device_data();
+  for (std::size_t i = 0; i < images.size(); ++i) {
+    preprocess_cuda_launch(config, images[i], geometries[i], base + i * per_image_bytes);
+  }
   cuda_check(cudaEventRecord(stopped.event), "cudaEventRecord");
   cuda_check(cudaEventSynchronize(stopped.event), "cudaEventSynchronize");
   float elapsed = 0.f;
   cuda_check(cudaEventElapsedTime(&elapsed, started.event, stopped.event), "cudaEventElapsedTime");
 
-  PreprocessResult result;
+  CudaBatchPreprocess result;
   result.output = std::move(output);
-  result.geometry = geometry;
+  result.geometries = std::move(geometries);
   result.device_ms = static_cast<double>(elapsed);
   return result;
 }

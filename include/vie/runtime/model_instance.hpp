@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace vie {
 
@@ -27,6 +28,13 @@ class ModelInstance {
 
   // Thread-safe inference methods (serialize concurrent calls)
   DetectionBatch infer(const ImageInput& image, DetectionInferTiming* timing = nullptr);
+  // Phase 9.1: Batch inference. Serializes on the same mutex as infer().
+  // A Batch>1 call is not concurrent-safe within one instance; parallelism
+  // across batches requires multiple ModelInstances. Only task detection
+  // with a batch-capable decoder returns results; other tasks throw
+  // Unsupported for batch sizes greater than one.
+  DetectionBatch infer_batch(const std::vector<ImageInput>& images,
+                             DetectionInferTiming* timing = nullptr);
   SegmentationBatch infer_segmentation(const ImageInput& image, const SegmentationRuntimeConfig& runtime,
                                        SegmentationInferTiming* timing = nullptr);
   ClassificationBatch infer_classification(const ImageInput& image, const ClassificationRuntimeConfig& runtime,

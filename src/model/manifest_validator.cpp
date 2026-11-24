@@ -23,6 +23,21 @@ bool shape_ready(const std::vector<std::int64_t>& shape, const std::string& path
     unresolved.push_back({path, "shape is unresolved"});
     return false;
   }
+  // Phase 9.1: allow a single dynamic dimension at axis 0 (the batch axis) so
+  // a dynamic-batch ONNX can carry a Manifest with input.shape=[-1, C, H, W]
+  // and output.shape=[-1, ...]. Any other dynamic or non-positive axis stays
+  // unresolved, because the engine does not yet support dynamic spatial or
+  // channel axes.
+  const bool batch_dynamic = !shape.empty() && shape[0] == -1 && shape.size() >= 3;
+  if (batch_dynamic) {
+    for (std::size_t i = 1; i < shape.size(); ++i) {
+      if (shape[i] <= 0) {
+        unresolved.push_back({path, "only the batch axis may be dynamic"});
+        return false;
+      }
+    }
+    return true;
+  }
   if (!is_concrete_shape(shape)) {
     unresolved.push_back({path, "dynamic dimension requires a concrete profile"});
     return false;
