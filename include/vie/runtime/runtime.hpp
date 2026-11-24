@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vie/model/model_config.hpp"
+#include "vie/runtime/batch_execution_queue.hpp"
 #include "vie/runtime/dynamic_batch_aggregator.hpp"
 #include "vie/runtime/model_instance.hpp"
 #include "vie/runtime/request_queue.hpp"
@@ -95,22 +96,31 @@ class Runtime {
 
  private:
   void aggregator_loop();
+  void execution_worker_loop();
   void launch_workers();
   void execute_batch(BatchWorkItem& batch);
+  void dispatch_batch(BatchWorkItem batch);
 
   RuntimeConfig config_;
   ThreadPool thread_pool_;
   std::shared_ptr<MetricsCollector> metrics_;
   ModelManager models_;
-  
-  // Phase 9.2.1: Async request queue and workers
+
+  // Phase 9.2.1: Async request queue
   std::unique_ptr<RequestQueue> request_queue_;
-  std::vector<std::thread> inference_workers_;
+
+  // Phase 9.2.2: Dynamic batch aggregator (single thread)
+  std::unique_ptr<DynamicBatchAggregator> aggregator_;
+
+  // Phase 9.2.2.1: Batch execution queue (bounded, connects aggregator to workers)
+  std::unique_ptr<BatchExecutionQueue> exec_queue_;
+
+  // Threads
+  std::thread aggregator_thread_;
+  std::vector<std::thread> execution_workers_;
+
   std::atomic<bool> running_{false};
   std::atomic<RequestId> next_request_id_{1};
-  
-  // Phase 9.2.2: Dynamic batch aggregator
-  std::unique_ptr<DynamicBatchAggregator> aggregator_;
 };
 
 }  // namespace vie

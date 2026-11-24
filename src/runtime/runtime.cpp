@@ -72,10 +72,11 @@ Runtime::Runtime(const RuntimeConfig& config)
       metrics_(std::make_shared<MetricsCollector>()),
       models_(metrics_, config.max_loaded_models),
       request_queue_(std::make_unique<RequestQueue>(config.request_queue_capacity)),
-      aggregator_(std::make_unique<DynamicBatchAggregator>(config.batch_aggregation, metrics_)) {
+      aggregator_(std::make_unique<DynamicBatchAggregator>(config.batch_aggregation, metrics_)),
+      exec_queue_(std::make_unique<BatchExecutionQueue>(config.batch_execution_queue_capacity)) {
   // Mark as running even if deferred - submit() checks running_
   running_.store(true);
-  
+
   // Auto-start workers unless deferred
   if (!config_.defer_start) {
     launch_workers();
@@ -96,14 +97,18 @@ void Runtime::start() {
 
 void Runtime::launch_workers() {
   // Don't launch if workers are already running
-  if (!inference_workers_.empty()) {
+  if (aggregator_thread_.joinable() || !execution_workers_.empty()) {
     return;
   }
-  
-  // Phase 9.2.2: The aggregator is single-threaded. It pulls from the
-  // RequestQueue, forms batches, and executes them inline via infer_batch().
-  // Multiple aggregator threads would race on the aggregator's internal state.
-  inference_workers_.emplace_back([this] { aggregator_loop(); });
+
+  // Phase 9.2.2.1: Launch the single aggregator thread
+  aggregator_thread_ = std::thread([this] { aggregator_loop(); });
+
+  // Launch execution worker threads
+  const std::size_t worker_count = std::max<std::size_t>(1, config_.inference_worker_count);
+  for (std::size_t i = 0; i < worker_count; ++i) {
+    execution_workers_.emplace_back([this] { execution_worker_loop(); });
+  }
 }
 
 void Runtime::shutdown() {
@@ -111,17 +116,27 @@ void Runtime::shutdown() {
     return;
   }
   running_.store(false);
-  
-  // Shutdown the request queue (rejects new pushes, wakes waiting workers)
+
+  // Phase 1: Shutdown the request queue (rejects new pushes, wakes aggregator)
   request_queue_->shutdown();
-  
-  // Wait for all inference workers to finish
-  for (auto& worker : inference_workers_) {
+
+  // Phase 2: Wait for the aggregator to exit.
+  // The aggregator drains the request queue, flushes pending groups, and
+  // pushes all formed batches to exec_queue_ before exiting.
+  if (aggregator_thread_.joinable()) {
+    aggregator_thread_.join();
+  }
+
+  // Phase 3: Shutdown the execution queue (wakes workers after all batches pushed)
+  exec_queue_->shutdown();
+
+  // Phase 4: Wait for execution workers to finish remaining batches
+  for (auto& worker : execution_workers_) {
     if (worker.joinable()) {
       worker.join();
     }
   }
-  inference_workers_.clear();
+  execution_workers_.clear();
 }
 
 std::future<DetectionResult> Runtime::submit(const std::string& model_id, ImageInput image) {
@@ -129,14 +144,14 @@ std::future<DetectionResult> Runtime::submit(const std::string& model_id, ImageI
   if (!running_.load()) {
     throw VieError(ErrorCode::RuntimeNotStarted, "Runtime is not running");
   }
-  
+
   // Resolve model to shared_ptr at submit time. This keeps the model alive
   // even if it is unloaded while the request is queued or executing.
   auto model = models_.get(model_id);
   if (!model) {
     throw VieError(ErrorCode::InvalidModelId, "Model '" + model_id + "' is not loaded");
   }
-  
+
   // Create the request with pre-resolved model reference
   InferenceRequest request;
   request.id = next_request_id_.fetch_add(1);
@@ -144,35 +159,34 @@ std::future<DetectionResult> Runtime::submit(const std::string& model_id, ImageI
   request.image = image;
   request.model = model;
   request.submitted_at = std::chrono::steady_clock::now();
-  
+
   // Get the future before moving the request
   std::future<DetectionResult> future = request.promise.get_future();
-  
+
   // Record submission
   metrics_->record_request_submitted();
-  
+
   // Try to push to queue
   if (!request_queue_->push(std::move(request))) {
     metrics_->record_request_rejected();
     throw VieError(ErrorCode::RequestQueueFull, "Request queue is full or shutting down");
   }
-  
+
   // Record acceptance and queue size
   metrics_->record_request_accepted();
   metrics_->record_queue_size(request_queue_->size());
-  
+
   return future;
 }
 
+// Phase 9.2.2.1: Aggregator loop - ONLY forms batches, does NOT execute them.
+// Formed batches are pushed to the execution queue for workers to process.
 void Runtime::aggregator_loop() {
-  // Phase 9.2.2: Aggregator loop with dynamic batch formation.
-  // Continuously pulls from RequestQueue, groups by ModelInstance,
-  // and executes batches via infer_batch().
   while (true) {
     // Step 1: Try to flush any expired pending batch
     auto expired_batch = aggregator_->flush_expired();
     if (expired_batch.has_value()) {
-      execute_batch(*expired_batch);
+      dispatch_batch(std::move(*expired_batch));
       continue;
     }
 
@@ -184,10 +198,8 @@ void Runtime::aggregator_loop() {
     bool got_request = false;
 
     if (has_pending && deadline != std::chrono::steady_clock::time_point::max()) {
-      // Wait until the earliest batch deadline or a new request arrives
       got_request = request_queue_->wait_pop_until(deadline, request);
     } else {
-      // No pending batches: block until request or shutdown
       got_request = request_queue_->wait_pop(request);
     }
 
@@ -195,39 +207,60 @@ void Runtime::aggregator_loop() {
     if (got_request) {
       auto batch = aggregator_->add(std::move(request));
       if (batch.has_value()) {
-        // Batch is full, execute immediately
-        execute_batch(*batch);
+        dispatch_batch(std::move(*batch));
       }
       continue;
     }
 
     // Step 4: wait_pop returned false
     if (!running_.load() && request_queue_->empty() && aggregator_->pending_count() == 0) {
-      // Queue is shut down, empty, and no pending batches: exit
       break;
     }
 
-    // If queue is shut down but we have pending requests, flush them
+    // If queue is shut down, drain remaining requests and flush
     if (request_queue_->is_shutdown()) {
-      // Drain remaining requests from queue
       while (request_queue_->wait_pop(request)) {
         auto batch = aggregator_->add(std::move(request));
         if (batch.has_value()) {
-          execute_batch(*batch);
+          dispatch_batch(std::move(*batch));
         }
       }
-      // Flush all remaining pending groups
       auto remaining = aggregator_->flush_all();
       for (auto& batch : remaining) {
-        execute_batch(batch);
+        dispatch_batch(std::move(batch));
       }
       break;
     }
   }
 }
 
+// Push a formed batch to the execution queue. Blocks if the queue is full
+// (backpressure). If the queue has been shut down, executes inline as fallback.
+void Runtime::dispatch_batch(BatchWorkItem batch) {
+  if (!exec_queue_->push(std::move(batch))) {
+    // Execution queue shut down - execute inline to avoid losing requests.
+    // This can only happen during shutdown after the aggregator has been
+    // asked to stop but before exec_queue_ is shut down.
+    execute_batch(batch);
+  }
+}
+
+// Phase 9.2.2.1: Execution worker loop - pulls batches from the execution
+// queue and runs inference. Multiple workers can execute batches for different
+// ModelInstances in parallel.
+void Runtime::execution_worker_loop() {
+  while (true) {
+    BatchWorkItem batch;
+    if (!exec_queue_->wait_pop(batch)) {
+      // Queue is empty and shut down - exit worker
+      break;
+    }
+    execute_batch(batch);
+  }
+}
+
 void Runtime::execute_batch(BatchWorkItem& batch) {
-  // Execute a formed batch via ModelInstance::infer_batch()
+  // Execute a formed batch via ModelInstance::infer() or infer_batch()
   const auto exec_start = std::chrono::steady_clock::now();
   const std::size_t batch_size = batch.requests.size();
   bool success = false;

@@ -17,10 +17,15 @@ struct RuntimeConfig {
   std::size_t max_loaded_models = 16;
   // Phase 9.2.1: Async request queue configuration
   std::size_t request_queue_capacity = 1024;
-  std::size_t inference_worker_count = 2;
   bool defer_start = false;  // If true, constructor won't auto-start workers
   // Phase 9.2.2: Dynamic batch aggregation
   BatchAggregationConfig batch_aggregation;
+  // Phase 9.2.2.1: Execution workers and queue
+  // inference_worker_count now controls the number of execution workers
+  // that pull BatchWorkItems from the execution queue and run inference.
+  // The aggregator is always a single dedicated thread.
+  std::size_t inference_worker_count = 2;
+  std::size_t batch_execution_queue_capacity = 64;
 };
 
 }  // namespace vie

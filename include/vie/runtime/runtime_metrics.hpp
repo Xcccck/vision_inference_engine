@@ -34,9 +34,9 @@ struct RuntimeMetrics {
   std::size_t max_queue_size = 0;
 
   // Phase 9.2.2: Batch aggregation metrics
-  std::size_t total_batches = 0;               // Number of infer_batch() calls
-  std::size_t total_single_infer_calls = 0;    // Number of single infer() calls (bypass)
-  std::size_t total_aggregated_requests = 0;   // Sum of all batch sizes
+  std::size_t total_batches = 0;               // Total execution units (includes batch_size=1 single infers)
+  std::size_t total_single_infer_calls = 0;    // Subset of total_batches where batch_size==1
+  std::size_t total_aggregated_requests = 0;   // Sum of all batch sizes across execution units
   std::size_t batch_full_flush_count = 0;      // Batches flushed due to max_batch_size
   std::size_t batch_timeout_flush_count = 0;   // Batches flushed due to timeout
   std::size_t batch_shutdown_flush_count = 0;  // Batches flushed during shutdown
