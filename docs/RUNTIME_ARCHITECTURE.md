@@ -129,13 +129,13 @@ auto metrics = runtime.snapshot_metrics();
 
 ### Different Models
 
-Multiple `ModelInstance` objects can run inference concurrently without any synchronization overhead. Each instance has:
+Multiple `ModelInstance` objects can run inference concurrently without sharing VIE-owned mutable state. Each instance owns:
 - Its own `InferenceEngine`
 - Its own Backend (with independent ONNX Runtime session)
 - Its own Decoder
 - Its own mutex (for serializing same-model calls)
 
-**Parallelism**: Full parallelism across different models.
+**Parallelism**: Different instances can be driven from different worker threads in parallel. Phase 8.3.1 real-model benchmark (Scenario C) observed throughput gains of ~50% on CPU EP and ~21% on CUDA EP when going from 1 to 2 instances. **Note for CUDA**: the backend's `execute()` calls `cudaDeviceSynchronize()` twice per run, which is a device-wide barrier. Whether GPU kernels from two independent Sessions actually overlap in wall-clock time was NOT verified by a profiler; the measured throughput gain is attributable to Session-level concurrency plus CPU-side overlap of preprocess/decode. Do not describe this as "GPU kernel overlap is achieved".
 
 ### Same Model
 
@@ -189,15 +189,16 @@ The `BackendRegistry` has been updated to include a mutex, making all methods th
 
 ### Model Unloading
 
-1. User calls `manager.unload(id)`
-2. `ModelManager` removes instance from map
-3. `shared_ptr<ModelInstance>` destroyed
-4. When last reference drops:
-   - `ModelInstance` destructor runs
-   - `InferenceEngine` destructor runs
-   - Backend destructor runs (releases ONNX Runtime session)
-   - Decoder destructor runs
-5. `MetricsCollector` records model unload
+1. User calls `manager.unload(id)`.
+2. `ModelManager` removes the entry from its map under `mutex_`. Any `shared_ptr` that a caller obtained earlier is unaffected.
+3. Inference in flight on a previously-obtained `shared_ptr` continues to succeed. The model's resources are NOT released at the moment `unload()` returns.
+4. When the last outstanding `shared_ptr` drops:
+   - `ModelInstance` destructor runs.
+   - `InferenceEngine` destructor runs.
+   - Backend destructor runs (releases ONNX Runtime session; for CUDA this calls `quiesce()` which does `cudaDeviceSynchronize()` before dropping the session).
+   - Decoder destructor runs.
+
+`unload()` is therefore "remove from the manager and forbid new lookups", not "cancel in-flight inference" and not "synchronously free CUDA memory". Callers that hold a reference keep the model alive until they release it.
 
 ### Runtime Shutdown
 
