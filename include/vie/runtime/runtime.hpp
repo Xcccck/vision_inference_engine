@@ -2,14 +2,18 @@
 
 #include "vie/model/model_config.hpp"
 #include "vie/runtime/model_instance.hpp"
+#include "vie/runtime/request_queue.hpp"
 #include "vie/runtime/runtime_config.hpp"
 #include "vie/runtime/runtime_metrics.hpp"
 #include "vie/runtime/thread_pool.hpp"
 
+#include <atomic>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace vie {
@@ -48,11 +52,11 @@ class ModelManager {
   std::size_t max_models_;
 };
 
-// Main runtime class that coordinates thread pool and model management
+// Main Runtime class that coordinates thread pool and model management
 class Runtime {
  public:
   explicit Runtime(const RuntimeConfig& config = RuntimeConfig{});
-  ~Runtime() = default;
+  ~Runtime();
 
   Runtime(const Runtime&) = delete;
   Runtime& operator=(const Runtime&) = delete;
@@ -73,11 +77,35 @@ class Runtime {
   const RuntimeConfig& config() const noexcept { return config_; }
   bool profiling_enabled() const noexcept { return config_.enable_profiling; }
 
+  // Phase 9.2.1: Async request submission
+  // Submit an inference request and return a future for the result.
+  // The request is queued and executed by a background worker.
+  // Throws VieError on submission failure (queue full, shutdown, invalid model).
+  std::future<DetectionResult> submit(const std::string& model_id, ImageInput image);
+
+  // Start the runtime (launch inference workers). Called automatically in constructor.
+  void start();
+
+  // Initiate graceful shutdown. Rejects new requests and waits for queued requests to complete.
+  void shutdown();
+
+  // Check if the runtime is running.
+  bool is_running() const noexcept { return running_.load(); }
+
  private:
+  void worker_loop();
+  void launch_workers();
+
   RuntimeConfig config_;
   ThreadPool thread_pool_;
   std::shared_ptr<MetricsCollector> metrics_;
   ModelManager models_;
+  
+  // Phase 9.2.1: Async request queue and workers
+  std::unique_ptr<RequestQueue> request_queue_;
+  std::vector<std::thread> inference_workers_;
+  std::atomic<bool> running_{false};
+  std::atomic<RequestId> next_request_id_{1};
 };
 
 }  // namespace vie

@@ -40,6 +40,9 @@ Thread-safe collector for runtime performance metrics.
 - Preprocess call count and time
 - Model load/unload count
 - Per-model inference statistics
+- **Phase 9.2.1**: Request lifecycle metrics (submitted/accepted/rejected/completed/failed)
+- **Phase 9.2.1**: Queue wait time, execution time, end-to-end time
+- **Phase 9.2.1**: Current and max queue size
 
 **Usage**:
 ```cpp
@@ -101,15 +104,18 @@ manager.unload("model1");
 
 **Location**: `include/vie/runtime/runtime.hpp`, `src/runtime/runtime.cpp`
 
-Top-level coordinator that owns ThreadPool, MetricsCollector, and ModelManager.
+Top-level coordinator that owns ThreadPool, MetricsCollector, ModelManager, and the async RequestQueue.
 
 **Features**:
 - Single entry point for runtime configuration
 - Owns and coordinates all runtime components
 - Provides access to thread pool and model manager
 - Snapshots metrics
+- **Phase 9.2.1**: Async request submission via `submit(model_id, image)` returning `std::future<DetectionResult>`
+- **Phase 9.2.1**: Bounded RequestQueue with backpressure and graceful shutdown
+- **Phase 9.2.1**: Background inference worker threads
 
-**Usage**:
+**Usage (synchronous via ThreadPool)**:
 ```cpp
 vie::RuntimeConfig config;
 config.thread_pool_size = 4;
@@ -121,6 +127,23 @@ auto future = runtime.thread_pool().submit([model] {
   return model->infer(image);
 });
 auto metrics = runtime.snapshot_metrics();
+```
+
+**Usage (asynchronous via RequestQueue, Phase 9.2.1)**:
+```cpp
+vie::RuntimeConfig config;
+config.request_queue_capacity = 1024;
+config.inference_worker_count = 2;
+
+vie::Runtime runtime(config);
+runtime.models().load("det", det_config);
+
+// Submit async request, get future
+auto future = runtime.submit("det", image);
+DetectionResult result = future.get();
+
+// Graceful shutdown
+runtime.shutdown();
 ```
 
 **Thread Safety**: Access to sub-components is thread-safe (see their documentation).
@@ -202,15 +225,34 @@ The `BackendRegistry` has been updated to include a mutex, making all methods th
 
 ### Runtime Shutdown
 
-1. `Runtime` destructor runs
-2. `ModelManager` destructor clears (unloads all models)
-3. `ThreadPool` destructor runs:
+1. `Runtime::shutdown()` is called (or `Runtime` destructor runs)
+2. `running_` flag set to false
+3. `RequestQueue::shutdown()` rejects new pushes, wakes all waiting workers
+4. Workers continue processing remaining queued requests (graceful)
+5. When queue is empty, `wait_pop()` returns false, workers exit
+6. All worker threads joined
+7. `ModelManager` destructor clears (unloads all models)
+8. `ThreadPool` destructor runs:
    - Sets `shutdown_` flag
    - Notifies all workers
    - Workers complete pending tasks and exit
    - All worker threads joined
 
 ## Configuration
+
+### RequestQueue (Phase 9.2.1)
+
+**Location**: `include/vie/runtime/request_queue.hpp`, `src/runtime/request_queue.cpp`
+
+Thread-safe bounded queue for async inference requests. Supports graceful shutdown.
+
+**Features**:
+- Bounded capacity with non-blocking push (rejects when full)
+- Blocking wait_pop for worker threads
+- Graceful shutdown: rejects new pushes, wakes waiting workers, drains queued requests
+- `InferenceRequest` carries pre-resolved `shared_ptr<ModelInstance>` for model lifecycle safety
+
+**Thread Safety**: Fully thread-safe via `std::mutex` + `std::condition_variable`.
 
 ### RuntimeConfig
 
@@ -221,6 +263,10 @@ struct RuntimeConfig {
   int default_device_id = 0;
   bool enable_profiling = false;
   std::size_t max_loaded_models = 16;
+  // Phase 9.2.1
+  std::size_t request_queue_capacity = 1024;
+  std::size_t inference_worker_count = 2;
+  bool defer_start = false;
 };
 ```
 
@@ -265,6 +311,11 @@ struct RuntimeConfig {
 - `ModelManager::unload()` throws `VieError` if model ID not found
 - `ModelInstance::infer()` propagates exceptions from `InferenceEngine`
 - Failed inferences are recorded in metrics (success=false)
+- **Phase 9.2.1**: `Runtime::submit()` throws `VieError` synchronously if:
+  - Runtime is not running (`RuntimeNotStarted`)
+  - Model ID is not loaded (`InvalidModelId`)
+  - Request queue is full (`RequestQueueFull`)
+- **Phase 9.2.1**: Execution errors propagate asynchronously through `std::future`
 
 ## Example
 
@@ -299,7 +350,7 @@ std::cout << "Total inferences: " << metrics.total_inferences << "\n";
 
 ## Future Enhancements
 
-- **Automatic Batch Aggregation**: Request scheduler that transparently batches incoming single-image requests (Phase 9.2+)
+- **Automatic Batch Aggregation**: Request scheduler that transparently batches incoming single-image requests (Phase 9.2.2 - next)
 - **Priority queues**: High-priority tasks preempt low-priority
 - **Dynamic thread pool**: Adjust worker count based on load
 - **Model sharing**: Share Backend/Decoder between instances (read-only)

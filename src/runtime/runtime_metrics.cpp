@@ -34,4 +34,39 @@ RuntimeMetrics MetricsCollector::snapshot() const {
   return metrics_;
 }
 
+// Phase 9.2.1: Async request metrics
+void MetricsCollector::record_request_submitted() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  metrics_.submitted_requests++;
+}
+
+void MetricsCollector::record_request_accepted() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  metrics_.accepted_requests++;
+}
+
+void MetricsCollector::record_request_rejected() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  metrics_.rejected_requests++;
+}
+
+void MetricsCollector::record_request_completed(double queue_wait_ms, double execution_ms, double e2e_ms, bool success) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  metrics_.completed_requests++;
+  if (!success) {
+    metrics_.failed_requests++;
+  }
+  metrics_.total_queue_wait_time_ms += queue_wait_ms;
+  metrics_.total_execution_time_ms += execution_ms;
+  metrics_.total_e2e_time_ms += e2e_ms;
+}
+
+void MetricsCollector::record_queue_size(std::size_t size) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  metrics_.current_queue_size = size;
+  if (size > metrics_.max_queue_size) {
+    metrics_.max_queue_size = size;
+  }
+}
+
 }  // namespace vie

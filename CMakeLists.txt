@@ -140,6 +140,7 @@ add_library(vie
   src/runtime/thread_pool.cpp
   src/runtime/runtime_metrics.cpp
   src/runtime/model_instance.cpp
+  src/runtime/request_queue.cpp
   src/runtime/runtime.cpp
 )
 
@@ -225,6 +226,7 @@ if(VIE_BUILD_TESTS)
     tests/test_model_inspection.cpp
     tests/test_runtime.cpp
     tests/test_runtime_audit.cpp
+    tests/test_async_runtime.cpp
   )
   target_link_libraries(vie_tests PRIVATE vie::vie GTest::gtest GTest::gtest_main)
   target_compile_options(vie_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)

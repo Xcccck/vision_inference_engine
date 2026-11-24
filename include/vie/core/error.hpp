@@ -12,6 +12,11 @@ enum class ErrorCode {
   SchemaError,
   Unsupported,
   Internal,
+  // Phase 9.2.1: Async request errors
+  RuntimeNotStarted,
+  RuntimeShuttingDown,
+  RequestQueueFull,
+  InvalidModelId,
 };
 
 // Project-wide error policy: callers handle VieError. Allocation failure
@@ -39,6 +44,14 @@ inline const char* to_string(ErrorCode code) {
       return "unsupported";
     case ErrorCode::Internal:
       return "internal";
+    case ErrorCode::RuntimeNotStarted:
+      return "runtime_not_started";
+    case ErrorCode::RuntimeShuttingDown:
+      return "runtime_shutting_down";
+    case ErrorCode::RequestQueueFull:
+      return "request_queue_full";
+    case ErrorCode::InvalidModelId:
+      return "invalid_model_id";
   }
   return "internal";
 }
