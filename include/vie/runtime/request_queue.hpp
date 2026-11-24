@@ -2,6 +2,7 @@
 
 #include "vie/runtime/inference_request.hpp"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <mutex>
@@ -28,6 +29,12 @@ class RequestQueue {
   // Pop a request from the queue. Returns false if the queue is empty and
   // has been shut down. Blocks if the queue is empty but not shut down.
   bool wait_pop(InferenceRequest& request);
+
+  // Phase 9.2.2: Timed wait for a request. Returns true if a request was
+  // popped. Returns false if the deadline expires or the queue is shut down
+  // and empty. Uses steady_clock for deadline computation.
+  bool wait_pop_until(std::chrono::steady_clock::time_point deadline,
+                      InferenceRequest& request);
 
   // Initiate graceful shutdown. Rejects new pushes and wakes all waiting
   // workers. Already-queued requests remain available for processing.

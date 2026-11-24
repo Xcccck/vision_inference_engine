@@ -43,6 +43,7 @@ Thread-safe collector for runtime performance metrics.
 - **Phase 9.2.1**: Request lifecycle metrics (submitted/accepted/rejected/completed/failed)
 - **Phase 9.2.1**: Queue wait time, execution time, end-to-end time
 - **Phase 9.2.1**: Current and max queue size
+- **Phase 9.2.2**: Batch aggregation metrics (total_batches, batch_size_histogram, flush counts)
 
 **Usage**:
 ```cpp
@@ -114,6 +115,9 @@ Top-level coordinator that owns ThreadPool, MetricsCollector, ModelManager, and 
 - **Phase 9.2.1**: Async request submission via `submit(model_id, image)` returning `std::future<DetectionResult>`
 - **Phase 9.2.1**: Bounded RequestQueue with backpressure and graceful shutdown
 - **Phase 9.2.1**: Background inference worker threads
+- **Phase 9.2.2**: Dynamic batch aggregation — transparently groups compatible requests into batches
+- **Phase 9.2.2**: Single aggregator thread with deadline-driven flush strategy
+- **Phase 9.2.2**: CUDA models automatically forced to batch_size=1
 
 **Usage (synchronous via ThreadPool)**:
 ```cpp
@@ -133,7 +137,7 @@ auto metrics = runtime.snapshot_metrics();
 ```cpp
 vie::RuntimeConfig config;
 config.request_queue_capacity = 1024;
-config.inference_worker_count = 2;
+config.inference_worker_count = 1;  // Phase 9.2.2: single aggregator thread
 
 vie::Runtime runtime(config);
 runtime.models().load("det", det_config);
@@ -144,6 +148,22 @@ DetectionResult result = future.get();
 
 // Graceful shutdown
 runtime.shutdown();
+```
+
+**Usage (with batch aggregation, Phase 9.2.2)**:
+```cpp
+vie::RuntimeConfig config;
+config.batch_aggregation.enabled = true;
+config.batch_aggregation.max_batch_size = 4;
+config.batch_aggregation.max_wait_time = std::chrono::milliseconds(5);
+
+vie::Runtime runtime(config);
+runtime.models().load("det", det_config);
+
+// Requests are automatically batched
+auto f1 = runtime.submit("det", image1);
+auto f2 = runtime.submit("det", image2);
+// Both may be executed as a single infer_batch() call
 ```
 
 **Thread Safety**: Access to sub-components is thread-safe (see their documentation).
@@ -249,10 +269,28 @@ Thread-safe bounded queue for async inference requests. Supports graceful shutdo
 **Features**:
 - Bounded capacity with non-blocking push (rejects when full)
 - Blocking wait_pop for worker threads
+- **Phase 9.2.2**: Timed `wait_pop_until(deadline)` for aggregator deadline-driven polling
 - Graceful shutdown: rejects new pushes, wakes waiting workers, drains queued requests
 - `InferenceRequest` carries pre-resolved `shared_ptr<ModelInstance>` for model lifecycle safety
 
 **Thread Safety**: Fully thread-safe via `std::mutex` + `std::condition_variable`.
+
+### DynamicBatchAggregator (Phase 9.2.2)
+
+**Location**: `include/vie/runtime/dynamic_batch_aggregator.hpp`, `src/runtime/dynamic_batch_aggregator.cpp`
+
+Automatically groups compatible single-image requests into batches for `infer_batch()` execution.
+
+**Features**:
+- Groups requests by `ModelInstance` pointer identity (same model = same group)
+- Flush on batch full (`max_batch_size` reached)
+- Flush on timeout (`max_wait_time` elapsed since first request in group)
+- Flush on shutdown (all pending groups drained)
+- CUDA models forced to `batch_size=1` (CUDA decoder rejects batch>1)
+- Batch=1 uses `infer()` instead of `infer_batch()` for fixed-model compatibility
+- Backpressure via `max_pending_requests` limit
+
+**Thread Safety**: NOT thread-safe — designed for single aggregator thread access only.
 
 ### RuntimeConfig
 
@@ -267,6 +305,17 @@ struct RuntimeConfig {
   std::size_t request_queue_capacity = 1024;
   std::size_t inference_worker_count = 2;
   bool defer_start = false;
+  // Phase 9.2.2
+  BatchAggregationConfig batch_aggregation;
+};
+```
+
+```cpp
+struct BatchAggregationConfig {
+  bool enabled = true;                             // Enable/disable aggregation
+  std::size_t max_batch_size = 4;                  // Max images per batch
+  std::chrono::milliseconds max_wait_time{5};      // Max wait before flushing
+  std::size_t max_pending_requests = 256;          // Backpressure limit
 };
 ```
 
@@ -350,9 +399,10 @@ std::cout << "Total inferences: " << metrics.total_inferences << "\n";
 
 ## Future Enhancements
 
-- **Automatic Batch Aggregation**: Request scheduler that transparently batches incoming single-image requests (Phase 9.2.2 - next)
+- ~~**Automatic Batch Aggregation**~~: Implemented in Phase 9.2.2
 - **Priority queues**: High-priority tasks preempt low-priority
 - **Dynamic thread pool**: Adjust worker count based on load
 - **Model sharing**: Share Backend/Decoder between instances (read-only)
 - **Detailed profiling**: Per-layer timing, memory tracking
 - **Async I/O**: Overlap data loading with inference
+- **Auto-tuning batch size**: Dynamically adjust based on model capacity and load

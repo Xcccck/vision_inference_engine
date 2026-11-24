@@ -183,7 +183,10 @@ class AsyncRuntimeTest : public ::testing::Test {
     RuntimeConfig config;
     config.thread_pool_size = 2;
     config.request_queue_capacity = 10;
-    config.inference_worker_count = 2;
+    config.inference_worker_count = 1;  // Aggregator is single-threaded
+    // Use batch_size=1 for fixed-batch model (yolov8n.onnx)
+    config.batch_aggregation.max_batch_size = 1;
+    config.batch_aggregation.max_wait_time = std::chrono::milliseconds(0);
     return config;
   }
 

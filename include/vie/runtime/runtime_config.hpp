@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vie/core/device_context.hpp"
+#include "vie/runtime/batch_aggregation_config.hpp"
 
 #include <cstddef>
 #include <string>
@@ -18,6 +19,8 @@ struct RuntimeConfig {
   std::size_t request_queue_capacity = 1024;
   std::size_t inference_worker_count = 2;
   bool defer_start = false;  // If true, constructor won't auto-start workers
+  // Phase 9.2.2: Dynamic batch aggregation
+  BatchAggregationConfig batch_aggregation;
 };
 
 }  // namespace vie

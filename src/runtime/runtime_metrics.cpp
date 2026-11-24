@@ -69,4 +69,40 @@ void MetricsCollector::record_queue_size(std::size_t size) {
   }
 }
 
+// Phase 9.2.2: Batch aggregation metrics
+void MetricsCollector::record_batch_executed(std::size_t batch_size) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  metrics_.total_batches++;
+  metrics_.total_aggregated_requests += batch_size;
+  if (batch_size > metrics_.max_batch_size_achieved) {
+    metrics_.max_batch_size_achieved = batch_size;
+  }
+  metrics_.batch_size_histogram[static_cast<int>(batch_size)]++;
+}
+
+void MetricsCollector::record_single_infer() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  metrics_.total_single_infer_calls++;
+}
+
+void MetricsCollector::record_batch_full_flush() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  metrics_.batch_full_flush_count++;
+}
+
+void MetricsCollector::record_batch_timeout_flush() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  metrics_.batch_timeout_flush_count++;
+}
+
+void MetricsCollector::record_batch_shutdown_flush() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  metrics_.batch_shutdown_flush_count++;
+}
+
+void MetricsCollector::record_batch_execution_failure() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  metrics_.batch_execution_failures++;
+}
+
 }  // namespace vie

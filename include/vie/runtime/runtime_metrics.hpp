@@ -33,6 +33,17 @@ struct RuntimeMetrics {
   std::size_t current_queue_size = 0;
   std::size_t max_queue_size = 0;
 
+  // Phase 9.2.2: Batch aggregation metrics
+  std::size_t total_batches = 0;               // Number of infer_batch() calls
+  std::size_t total_single_infer_calls = 0;    // Number of single infer() calls (bypass)
+  std::size_t total_aggregated_requests = 0;   // Sum of all batch sizes
+  std::size_t batch_full_flush_count = 0;      // Batches flushed due to max_batch_size
+  std::size_t batch_timeout_flush_count = 0;   // Batches flushed due to timeout
+  std::size_t batch_shutdown_flush_count = 0;  // Batches flushed during shutdown
+  std::size_t batch_execution_failures = 0;    // Failed infer_batch() calls
+  std::size_t max_batch_size_achieved = 0;     // Largest batch actually executed
+  std::map<int, std::size_t> batch_size_histogram;  // batch_size -> count
+
   void reset() {
     total_inferences = 0;
     failed_inferences = 0;
@@ -54,6 +65,16 @@ struct RuntimeMetrics {
     total_e2e_time_ms = 0.0;
     current_queue_size = 0;
     max_queue_size = 0;
+    // Phase 9.2.2
+    total_batches = 0;
+    total_single_infer_calls = 0;
+    total_aggregated_requests = 0;
+    batch_full_flush_count = 0;
+    batch_timeout_flush_count = 0;
+    batch_shutdown_flush_count = 0;
+    batch_execution_failures = 0;
+    max_batch_size_achieved = 0;
+    batch_size_histogram.clear();
   }
 };
 
@@ -72,6 +93,14 @@ class MetricsCollector {
   void record_request_rejected();
   void record_request_completed(double queue_wait_ms, double execution_ms, double e2e_ms, bool success);
   void record_queue_size(std::size_t size);
+
+  // Phase 9.2.2: Batch aggregation metrics
+  void record_batch_executed(std::size_t batch_size);
+  void record_single_infer();
+  void record_batch_full_flush();
+  void record_batch_timeout_flush();
+  void record_batch_shutdown_flush();
+  void record_batch_execution_failure();
 
  private:
   mutable std::mutex mutex_;

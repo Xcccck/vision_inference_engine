@@ -1,5 +1,7 @@
 #include "vie/runtime/request_queue.hpp"
 
+#include <chrono>
+
 namespace vie {
 
 RequestQueue::RequestQueue(std::size_t capacity) : capacity_(capacity) {
@@ -32,6 +34,29 @@ bool RequestQueue::wait_pop(InferenceRequest& request) {
     return false;
   }
   
+  request = std::move(queue_.front());
+  queue_.pop();
+  not_full_.notify_one();
+  return true;
+}
+
+// Phase 9.2.2: Timed wait variant for aggregator deadline-driven polling.
+bool RequestQueue::wait_pop_until(std::chrono::steady_clock::time_point deadline,
+                                  InferenceRequest& request) {
+  std::unique_lock<std::mutex> lock(mutex_);
+
+  // Wait until: item available, shutdown, or deadline reached
+  if (!not_empty_.wait_until(lock, deadline,
+                              [this] { return !queue_.empty() || shutdown_; })) {
+    // Timed out: deadline reached with no item and no shutdown
+    return false;
+  }
+
+  // If queue is empty (shutdown with nothing queued), return false
+  if (queue_.empty()) {
+    return false;
+  }
+
   request = std::move(queue_.front());
   queue_.pop();
   not_full_.notify_one();

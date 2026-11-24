@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vie/model/model_config.hpp"
+#include "vie/runtime/dynamic_batch_aggregator.hpp"
 #include "vie/runtime/model_instance.hpp"
 #include "vie/runtime/request_queue.hpp"
 #include "vie/runtime/runtime_config.hpp"
@@ -93,8 +94,9 @@ class Runtime {
   bool is_running() const noexcept { return running_.load(); }
 
  private:
-  void worker_loop();
+  void aggregator_loop();
   void launch_workers();
+  void execute_batch(BatchWorkItem& batch);
 
   RuntimeConfig config_;
   ThreadPool thread_pool_;
@@ -106,6 +108,9 @@ class Runtime {
   std::vector<std::thread> inference_workers_;
   std::atomic<bool> running_{false};
   std::atomic<RequestId> next_request_id_{1};
+  
+  // Phase 9.2.2: Dynamic batch aggregator
+  std::unique_ptr<DynamicBatchAggregator> aggregator_;
 };
 
 }  // namespace vie

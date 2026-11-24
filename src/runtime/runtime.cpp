@@ -2,9 +2,11 @@
 
 #include "vie/core/error.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <utility>
+#include <vector>
 
 namespace vie {
 
@@ -69,7 +71,8 @@ Runtime::Runtime(const RuntimeConfig& config)
       thread_pool_(config.thread_pool_size),
       metrics_(std::make_shared<MetricsCollector>()),
       models_(metrics_, config.max_loaded_models),
-      request_queue_(std::make_unique<RequestQueue>(config.request_queue_capacity)) {
+      request_queue_(std::make_unique<RequestQueue>(config.request_queue_capacity)),
+      aggregator_(std::make_unique<DynamicBatchAggregator>(config.batch_aggregation, metrics_)) {
   // Mark as running even if deferred - submit() checks running_
   running_.store(true);
   
@@ -97,15 +100,10 @@ void Runtime::launch_workers() {
     return;
   }
   
-  // Launch inference worker threads
-  const std::size_t worker_count = config_.inference_worker_count;
-  if (worker_count == 0) {
-    throw VieError(ErrorCode::InvalidArgument, "inference_worker_count must be at least 1");
-  }
-  
-  for (std::size_t i = 0; i < worker_count; ++i) {
-    inference_workers_.emplace_back([this] { worker_loop(); });
-  }
+  // Phase 9.2.2: The aggregator is single-threaded. It pulls from the
+  // RequestQueue, forms batches, and executes them inline via infer_batch().
+  // Multiple aggregator threads would race on the aggregator's internal state.
+  inference_workers_.emplace_back([this] { aggregator_loop(); });
 }
 
 void Runtime::shutdown() {
@@ -166,63 +164,141 @@ std::future<DetectionResult> Runtime::submit(const std::string& model_id, ImageI
   return future;
 }
 
-void Runtime::worker_loop() {
-  // Continue processing requests until the queue is empty and shutdown
+void Runtime::aggregator_loop() {
+  // Phase 9.2.2: Aggregator loop with dynamic batch formation.
+  // Continuously pulls from RequestQueue, groups by ModelInstance,
+  // and executes batches via infer_batch().
   while (true) {
+    // Step 1: Try to flush any expired pending batch
+    auto expired_batch = aggregator_->flush_expired();
+    if (expired_batch.has_value()) {
+      execute_batch(*expired_batch);
+      continue;
+    }
+
+    // Step 2: Determine how long to wait for next request
+    auto deadline = aggregator_->earliest_deadline();
+    bool has_pending = (aggregator_->pending_count() > 0);
+
     InferenceRequest request;
-    
-    // Wait for a request from the queue
-    if (!request_queue_->wait_pop(request)) {
-      // Queue is empty and shutdown, exit worker
+    bool got_request = false;
+
+    if (has_pending && deadline != std::chrono::steady_clock::time_point::max()) {
+      // Wait until the earliest batch deadline or a new request arrives
+      got_request = request_queue_->wait_pop_until(deadline, request);
+    } else {
+      // No pending batches: block until request or shutdown
+      got_request = request_queue_->wait_pop(request);
+    }
+
+    // Step 3: If we got a request, add it to the aggregator
+    if (got_request) {
+      auto batch = aggregator_->add(std::move(request));
+      if (batch.has_value()) {
+        // Batch is full, execute immediately
+        execute_batch(*batch);
+      }
+      continue;
+    }
+
+    // Step 4: wait_pop returned false
+    if (!running_.load() && request_queue_->empty() && aggregator_->pending_count() == 0) {
+      // Queue is shut down, empty, and no pending batches: exit
       break;
     }
-    
-    // Record queue wait time
-    const auto dequeue_time = std::chrono::steady_clock::now();
-    const double queue_wait_ms = std::chrono::duration<double, std::milli>(
-        dequeue_time - request.submitted_at).count();
-    
-    // Execute the inference
-    const auto execution_start = std::chrono::steady_clock::now();
-    bool success = false;
-    
-    try {
-      // Use the pre-resolved model shared_ptr (keeps model alive even if
-      // unloaded from ModelManager after submit time)
-      if (!request.model) {
-        throw VieError(ErrorCode::InvalidModelId, 
-                       "Model '" + request.model_id + "' was unloaded before execution");
+
+    // If queue is shut down but we have pending requests, flush them
+    if (request_queue_->is_shutdown()) {
+      // Drain remaining requests from queue
+      while (request_queue_->wait_pop(request)) {
+        auto batch = aggregator_->add(std::move(request));
+        if (batch.has_value()) {
+          execute_batch(*batch);
+        }
       }
-      
-      // Execute inference (single image, extract first result from batch)
-      DetectionBatch batch = request.model->infer(request.image);
-      if (batch.results.empty()) {
-        throw VieError(ErrorCode::Internal, "Inference returned empty results");
+      // Flush all remaining pending groups
+      auto remaining = aggregator_->flush_all();
+      for (auto& batch : remaining) {
+        execute_batch(batch);
       }
-      
-      // Complete the promise with the first result
-      request.promise.set_value(std::move(batch.results[0]));
-      success = true;
-      
-    } catch (...) {
-      // Propagate exception through the promise
+      break;
+    }
+  }
+}
+
+void Runtime::execute_batch(BatchWorkItem& batch) {
+  // Execute a formed batch via ModelInstance::infer_batch()
+  const auto exec_start = std::chrono::steady_clock::now();
+  const std::size_t batch_size = batch.requests.size();
+  bool success = false;
+
+  try {
+    if (!batch.model) {
+      throw VieError(ErrorCode::InvalidModelId, "Batch model reference is null");
+    }
+
+    // Build the image vector for infer_batch
+    std::vector<ImageInput> images;
+    images.reserve(batch_size);
+    for (const auto& req : batch.requests) {
+      images.push_back(req.image);
+    }
+
+    // Execute inference: use infer() for batch_size=1 (compatible with
+    // fixed-batch models), infer_batch() for batch_size>1 (requires
+    // dynamic batch model).
+    DetectionBatch result;
+    if (batch_size == 1) {
+      result = batch.model->infer(images[0]);
+      metrics_->record_single_infer();
+    } else {
+      result = batch.model->infer_batch(images);
+    }
+
+    // Validate result count matches batch size
+    if (result.results.size() != batch_size) {
+      throw VieError(ErrorCode::Internal,
+                     "infer_batch returned " + std::to_string(result.results.size()) +
+                         " results for batch of " + std::to_string(batch_size));
+    }
+
+    // Distribute results to individual promises
+    for (std::size_t i = 0; i < batch_size; ++i) {
       try {
-        request.promise.set_exception(std::current_exception());
+        batch.requests[i].promise.set_value(std::move(result.results[i]));
       } catch (...) {
         // Promise already satisfied or broken, ignore
       }
     }
-    
-    // Record execution time and completion
-    const auto execution_end = std::chrono::steady_clock::now();
-    const double execution_ms = std::chrono::duration<double, std::milli>(
-        execution_end - execution_start).count();
-    const double e2e_ms = std::chrono::duration<double, std::milli>(
-        execution_end - request.submitted_at).count();
-    
-    metrics_->record_request_completed(queue_wait_ms, execution_ms, e2e_ms, success);
-    metrics_->record_queue_size(request_queue_->size());
+    success = true;
+
+  } catch (...) {
+    // Batch execution failed: complete all promises with the exception
+    for (std::size_t i = 0; i < batch_size; ++i) {
+      try {
+        batch.requests[i].promise.set_exception(std::current_exception());
+      } catch (...) {
+        // Promise already satisfied or broken, ignore
+      }
+    }
+    metrics_->record_batch_execution_failure();
   }
+
+  // Record metrics
+  const auto exec_end = std::chrono::steady_clock::now();
+  const double exec_ms = std::chrono::duration<double, std::milli>(exec_end - exec_start).count();
+
+  metrics_->record_batch_executed(batch_size);
+
+  // Record per-request completion metrics
+  for (const auto& req : batch.requests) {
+    const double queue_wait_ms = std::chrono::duration<double, std::milli>(
+        exec_start - req.submitted_at).count();
+    metrics_->record_request_completed(queue_wait_ms, exec_ms,
+                                        std::chrono::duration<double, std::milli>(exec_end - req.submitted_at).count(),
+                                        success);
+  }
+  metrics_->record_queue_size(request_queue_->size());
 }
 
 }  // namespace vie
