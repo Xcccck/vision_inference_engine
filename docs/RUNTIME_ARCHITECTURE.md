@@ -767,6 +767,101 @@ dump/perf probe mirroring the production ORT calls), `downgrade_opset.py`
 (opset-18 copy for the fix test). They write only to an explicit output dir and
 never modify the baseline model or test data.
 
+### Model Deployment Compatibility Workflow (Phase 9.3.4)
+
+Phase 9.3.3 explained *why* the two YOLOv8n `Resize` nodes landed on the CPU EP
+(ORT 1.20.1 has no CUDA `Resize` v19 kernel, so an opset-20 `Resize` falls back
+to CPU) and proved that converting the model to opset 18 yields a strict-CUDA,
+numerically identical run. Phase 9.3.4 turns that finding into a repeatable,
+model-agnostic workflow made of independent tools. **No Runtime, Backend,
+Engine, Staging, Aggregator or Decoder code was changed** to add it.
+
+**Model export vs model conversion.** *Export* (training frameworks -> ONNX)
+decides the opset a model is written with and is owned by the model producer.
+*Conversion* (one ONNX opset -> another) is a deployment-time repair for a
+specific ORT/kernel gap. They are separate responsibilities: VIE loads whatever
+ONNX it is given and does not re-author models.
+
+**Why VIE never auto-converts.** `InferenceEngine::load()` / the backends do not
+rewrite opsets, silently lower versions, overwrite the user's file, or enable
+CPU fallback to mask an incompatibility (see "Strict CUDA execution" above). An
+incompatible operator is reported, not hidden. Conversion is always a separate,
+explicit, user-invoked step so the original artifact and the exact applied
+transform stay auditable.
+
+**Explicit opset conversion** -- `convert_onnx_opset.py` (standalone CLI, python
+`onnx.version_converter` only; never imported by the C++ Runtime). It refuses
+`output == input`, refuses an existing output without `--overwrite`, never
+touches the input, records original/converted SHA256, the source/target opset
+and the converter version, then runs `check_model` and `infer_shapes`. It exits
+non-zero and reports distinct states for *conversion failed*, *converted but
+checker failed* and *converted but shape-inference failed* -- it never swallows
+an error and claims success.
+
+```
+python3 tools/diagnostics/model_deployment/convert_onnx_opset.py \
+  --input testdata/onnx/yolov8n.onnx \
+  --output /tmp/yolov8n_opset18.onnx --target-opset 18
+```
+
+**Numerical equivalence** is decided by data, not by node counts. The
+orchestrator feeds the *same* real preprocessed `bus.ppm` tensor through the
+original and converted model on the CPU EP and reports MaxAbs / MeanAbs / RMSE /
+MaxRel / MeanRel plus NaN/Inf counts and a shape/dtype compatibility gate
+(default tolerance `MaxAbs<=1e-5`, `MeanAbs<=1e-6`; never widened to pass). The
+final `DetectionResult` is compared via VIE's *own* decoder + NMS (reused
+through `vie_deploy_verify`, not reimplemented) with IoU-based matching rather
+than array-index equality.
+
+**Strict CUDA provider placement** reuses the sanctioned GPU path: `vie_deploy_verify`
+loads the converted model into a real `InferenceEngine` (CPU pixels are staged to
+the device for the CUDA run), enables ORT profiling through
+`ModelConfig::ort_enable_profiling`, runs a real inference and calls
+`end_profiling()`. The produced trace is classified by `vie_ort_profile_inspect
+--json`, which shares the exact `ort_profile_parser` the CUDA E2E tests use --
+placement is never inferred from the CPU-only python `onnxruntime`. The GPU-only
+rule is: session created, inference succeeded, profile complete, and CUDA nodes
+== total nodes with CPU nodes == 0 and Unknown == 0; `Memcpy` events are reported
+separately and are not counted as CPU nodes.
+
+```
+python3 tools/diagnostics/model_deployment/validate_model_deployment.py \
+  --model testdata/onnx/yolov8n.onnx --run-conversion --target-opset 18 \
+  --target-device cuda --report /tmp/yolov8n_deployment_report.json
+```
+
+**Reading the verdict.** `PASS` means every required check ran and cleared; a
+strict-CUDA deployment only reaches it with model validity + numeric equivalence
++ detection equivalence + all-node-CUDA placement + profile completeness. Any
+required check left unrun is `INCOMPLETE` (0 is never used to fake a run), an
+explicit failure is `FAIL`, and a missing capability is `UNSUPPORTED`. Creating
+a session, passing `check_model`, or a successful `version_converter` run are
+never, on their own, treated as deployment compatibility.
+
+**Verified case (YOLOv8n, ORT 1.20.1 GPU, RTX 4080, CUDA 12.6).** opset 20 ->
+strict CUDA **fails session creation** with the CPU-EP-disabled message (the
+`Resize` v19 gap; classified `cuda_ep_unsupported_op_would_fallback_to_cpu`, not
+a VIE fault). The opset-18 conversion of the *same* model: checker + shape
+inference pass, CPU numeric comparison **MaxAbs = MeanAbs = RMSE = 0.0**, VIE
+detections identical (5/5 matched, 0 error), strict-CUDA placement
+**175/175 nodes on CUDA, 0 CPU, 0 Unknown, 0 Memcpy**, and full-pipeline latency
+CPU ~45 ms vs strict-CUDA ~6 ms.
+
+**Why re-validate after an ORT change.** The kernel-coverage boundary (which
+`Resize` schema versions the CUDA EP registers) is a property of the ORT build,
+not of the model. A different ORT version can move or remove the opset-19 gap,
+so opset 18 is recorded *only* as the verified remedy for this YOLOv8n + ORT
+1.20.1 combination -- never as a rule for all YOLO, all ONNX models, all ORT
+versions, or a guarantee that conversion preserves semantics (that is what the
+numeric and detection checks are for). Re-run the workflow after any ORT upgrade.
+
+**Tools:** `convert_onnx_opset.py`, `validate_model_deployment.py` (orchestrator +
+JSON report), `vie_deploy_verify.cpp` (CMake target reusing the VIE engine),
+`yolov8n.manifest.json` (fixture manifest), and `test_model_deployment.py`
+(pytest; conversion/decision/maths tests are CPU-only, real-model CUDA tests
+skip when no GPU/tools are present -- a skip is never a pass). Build the native
+tools with `cmake --build <build> --target vie_deploy_verify vie_ort_profile_inspect`.
+
 ### RuntimeConfig
 
 ```cpp

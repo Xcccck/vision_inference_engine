@@ -11,6 +11,7 @@
 #include <iostream>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -24,7 +25,85 @@ void print_usage(const char* program) {
             << "  --onnx-nodes <N>   Report N as the original ONNX node count\n"
             << "                     (an ORT profile has no original graph size, so\n"
             << "                     this is shown as 'Not Available' when omitted)\n"
+            << "  --json             Emit the placement statistics as a JSON object on\n"
+            << "                     stdout for tooling (validate_model_deployment.py);\n"
+            << "                     the human report above is suppressed\n"
             << "  --help, -h         Show this help\n";
+}
+
+// Machine-readable placement view for the deployment workflow (Phase 9.3.4).
+// It reports exactly what the shared parser confirmed and never reinterprets
+// memcpy/transfer events as CPU nodes, so a caller can apply the GPU-only rule
+// without reimplementing any parsing here.
+std::size_t unique_for(const vie::OrtProfileStats& stats, vie::OrtProviderClass wanted);
+
+std::string json_escape(const std::string& text) {
+  std::string out;
+  out.reserve(text.size() + 8);
+  for (char c : text) {
+    if (c == '"') {
+      out += "\\\"";
+    } else if (c == '\\') {
+      out += "\\\\";
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+void print_json(const std::string& profile_path, const vie::OrtProfileStats& stats) {
+  const bool gpu_only = !stats.incomplete && stats.total_node_events > 0 &&
+                        stats.cuda_node_events == stats.total_node_events &&
+                        stats.cpu_node_events == 0 && stats.unknown_provider_events == 0;
+  std::string conclusion;
+  if (stats.unknown_provider_events > 0) {
+    conclusion = "inconclusive_unattributed";
+  } else if (stats.cpu_node_events > 0) {
+    conclusion = "cpu_ep_fallback";
+  } else if (stats.total_node_events == 0) {
+    conclusion = "unattributable";
+  } else if (stats.cuda_node_events == stats.total_node_events) {
+    conclusion = "all_cuda";
+  } else {
+    conclusion = "mixed";
+  }
+  std::cout << "{\n";
+  std::cout << "  \"schema_version\": \"1.0\",\n";
+  std::cout << "  \"profile_path\": \"" << json_escape(profile_path) << "\",\n";
+  std::cout << "  \"parse_status\": \"" << (stats.incomplete ? "incomplete" : "ok") << "\",\n";
+  std::cout << "  \"complete\": " << (stats.incomplete ? "false" : "true") << ",\n";
+  std::cout << "  \"conclusion\": \"" << conclusion << "\",\n";
+  std::cout << "  \"gpu_only\": " << (gpu_only ? "true" : "false") << ",\n";
+  std::cout << "  \"total_node_events\": " << stats.total_node_events << ",\n";
+  std::cout << "  \"cuda_nodes\": " << stats.cuda_node_events << ",\n";
+  std::cout << "  \"cpu_nodes\": " << stats.cpu_node_events << ",\n";
+  std::cout << "  \"other_nodes\": " << stats.other_provider_events << ",\n";
+  std::cout << "  \"unknown_nodes\": " << stats.unknown_provider_events << ",\n";
+  std::cout << "  \"memcpy_events\": " << stats.transfer_events << ",\n";
+  std::cout << "  \"unique_cuda_nodes\": " << unique_for(stats, vie::OrtProviderClass::Cuda) << ",\n";
+  std::cout << "  \"unique_cpu_nodes\": " << unique_for(stats, vie::OrtProviderClass::Cpu) << ",\n";
+  std::cout << "  \"unique_node_names\": " << stats.unique_node_names << ",\n";
+  std::cout << "  \"total_trace_events\": " << stats.total_trace_events << ",\n";
+  std::cout << "  \"category_node_events\": " << stats.category_node_events << ",\n";
+  std::cout << "  \"category_session_events\": " << stats.category_session_events << ",\n";
+  std::cout << "  \"category_threadpool_events\": " << stats.category_threadpool_events << ",\n";
+  std::cout << "  \"category_memcpy_events\": " << stats.category_memcpy_events << ",\n";
+  std::cout << "  \"category_other_events\": " << stats.category_other_events << ",\n";
+  std::cout << "  \"category_unknown_events\": " << stats.category_unknown_events << ",\n";
+  if (stats.original_onnx_nodes_known) {
+    std::cout << "  \"original_onnx_nodes\": " << stats.original_onnx_nodes << ",\n";
+    std::cout << "  \"original_onnx_nodes_known\": true,\n";
+  } else {
+    std::cout << "  \"original_onnx_nodes\": null,\n";
+    std::cout << "  \"original_onnx_nodes_known\": false,\n";
+  }
+  std::cout << "  \"memcpy_names\": [";
+  for (std::size_t i = 0; i < stats.memcpy_names.size(); ++i) {
+    if (i) std::cout << ", ";
+    std::cout << "\"" << json_escape(stats.memcpy_names[i]) << "\"";
+  }
+  std::cout << "]\n}\n";
 }
 
 // Distinct node names for one provider class, used for the Unique Nodes rows.
@@ -67,6 +146,7 @@ void print_conclusion(const vie::OrtProfileStats& stats) {
 int main(int argc, char** argv) {
   std::string profile_path;
   bool onnx_known = false;
+  bool json_output = false;
   std::size_t onnx_nodes = 0;
 
   for (int i = 1; i < argc; ++i) {
@@ -74,6 +154,10 @@ int main(int argc, char** argv) {
     if (arg == "--help" || arg == "-h") {
       print_usage(argv[0]);
       return 0;
+    }
+    if (arg == "--json") {
+      json_output = true;
+      continue;
     }
     if (arg == "--onnx-nodes") {
       if (i + 1 >= argc) {
@@ -118,6 +202,11 @@ int main(int argc, char** argv) {
   }
   stats.original_onnx_nodes = onnx_nodes;
   stats.original_onnx_nodes_known = onnx_known;
+
+  if (json_output) {
+    print_json(profile_path, stats);
+    return stats.incomplete ? 1 : 0;
+  }
 
   std::cout << "ORT Profile Summary\n";
   std::cout << "===================\n\n";

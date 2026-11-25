@@ -277,6 +277,12 @@ add_executable(vie_ort_profile_inspect tools/vie_ort_profile_inspect.cpp)
 target_link_libraries(vie_ort_profile_inspect PRIVATE vie::vie)
 target_compile_options(vie_ort_profile_inspect PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
+# Model-deployment verifier: runs a real image through the VIE engine and emits
+# session/detection/latency/ORT-profile records for validate_model_deployment.py.
+add_executable(vie_deploy_verify tools/diagnostics/model_deployment/vie_deploy_verify.cpp)
+target_link_libraries(vie_deploy_verify PRIVATE vie::vie)
+target_compile_options(vie_deploy_verify PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
 add_executable(multi_model_runtime examples/multi_model_runtime.cpp)
 target_link_libraries(multi_model_runtime PRIVATE vie::vie)
 target_compile_options(multi_model_runtime PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -305,15 +311,15 @@ target_compile_definitions(multi_model_concurrency_benchmark PRIVATE VIE_SOURCE_
 
 if(VIE_ENABLE_ONNXRUNTIME)
   if(VIE_ENABLE_ONNXRUNTIME_CUDA)
-    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect vie_ort_profile_inspect multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark batch_aggregator_benchmark multi_model_concurrency_benchmark
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect vie_ort_profile_inspect vie_deploy_verify multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark batch_aggregator_benchmark multi_model_concurrency_benchmark
       APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_GPU_LIB_DIR}")
   else()
-    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect vie_ort_profile_inspect multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark batch_aggregator_benchmark multi_model_concurrency_benchmark
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect vie_ort_profile_inspect vie_deploy_verify multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark batch_aggregator_benchmark multi_model_concurrency_benchmark
       APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_LIB_DIR}")
   endif()
 endif()
 if(VIE_ENABLE_CUDA)
-  set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect vie_ort_profile_inspect multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark batch_aggregator_benchmark multi_model_concurrency_benchmark
+  set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect vie_ort_profile_inspect vie_deploy_verify multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark batch_aggregator_benchmark multi_model_concurrency_benchmark
     APPEND PROPERTY BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
 endif()
 
