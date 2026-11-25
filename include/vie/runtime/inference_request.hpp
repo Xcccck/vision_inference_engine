@@ -29,9 +29,10 @@ using RequestId = std::uint64_t;
 // owned_pixels.data(), ensuring the caller can safely release their buffer
 // immediately after submit() returns without causing Use-After-Free.
 //
-// For CUDA device images (device != Cpu), no copy is performed (device memory
-// cannot be cheaply copied via host pointer). The caller MUST ensure the CUDA
-// buffer remains alive until the Future completes.
+// Phase 9.2.2.3: CUDA device images (device != Cpu) are rejected at
+// Runtime::submit() before reaching InferenceRequest. The async pipeline
+// cannot guarantee CUDA buffer lifetime; use InferenceEngine::infer() for
+// synchronous CUDA inference instead.
 struct InferenceRequest {
   RequestId id = 0;
   std::string model_id;
@@ -51,9 +52,11 @@ struct InferenceRequest {
   // Deep-copies CPU pixel data so the request is self-contained.
   // After this call, image.data points to owned_pixels and the caller
   // may safely release the original buffer.
+  // CUDA inputs are rejected at Runtime::submit() before reaching this
+  // method, so this function is always called with device == Cpu.
   void adopt_cpu_pixels() {
     if (image.device != DeviceType::Cpu || image.data == nullptr) {
-      return;  // CUDA or null: cannot copy via host pointer.
+      return;  // Defensive: CUDA images should not reach here via submit().
     }
     const std::size_t row_bytes =
         (image.row_stride_bytes != 0)

@@ -118,6 +118,7 @@ Top-level coordinator that owns ThreadPool, MetricsCollector, ModelManager, and 
 - **Phase 9.2.2**: Dynamic batch aggregation — transparently groups compatible requests into batches
 - **Phase 9.2.2**: Single aggregator thread with deadline-driven flush strategy
 - **Phase 9.2.2**: CUDA models automatically forced to batch_size=1
+- **Phase 9.2.2.3**: `submit()` (async RequestQueue path) accepts CPU/Borrowed `ImageInput` only; CUDA device inputs are rejected synchronously before entering the queue (see "Input Device Support" below)
 
 **Usage (synchronous via ThreadPool)**:
 ```cpp
@@ -167,6 +168,26 @@ auto f2 = runtime.submit("det", image2);
 ```
 
 **Thread Safety**: Access to sub-components is thread-safe (see their documentation).
+
+### Input Device Support (Phase 9.2.2.3)
+
+`Runtime` exposes two different submission paths with different device guarantees:
+
+| API | CPU `ImageInput` | CUDA `ImageInput` |
+|---|---|---|
+| `Runtime::submit(model_id, image)` (async, RequestQueue) | Supported | **Rejected** with `ErrorCode::Unsupported` |
+| `ModelInstance::infer()` / `InferenceEngine::infer()` (synchronous) | Supported | Supported (unchanged) |
+
+**Why the async path rejects CUDA input**: `ImageInput::data` for a CUDA image is a raw device pointer (`cudaMalloc`'d by the caller) with no ownership transfer. `InferenceRequest::adopt_cpu_pixels()` deep-copies only CPU pixel bytes into `owned_pixels`; there is no equivalent safe, cheap device-side copy that `Runtime` owns. Since the async worker may run the request at an arbitrary later time, the caller is free to `cudaFree()`/reuse the buffer before the worker reads it, which would cause a GPU-side use-after-free or silently corrupted input. Rather than introduce a partial, unproven CUDA buffer-ownership mechanism (which would also require new `InferenceRequest` members to depend on CUDA headers, breaking non-CUDA builds), the async API's device contract is explicitly narrowed to CPU only.
+
+**Rejection semantics**:
+- Check happens at the very start of `Runtime::submit()`, before `models_.get(model_id)` lookup and before `RequestQueue::push()` — a rejected request never increments `accepted_requests` and never produces a `std::future`.
+- Throws `VieError(ErrorCode::Unsupported, ...)` synchronously; the message names the actual rejected `DeviceType` (`to_string(image.device)`) so callers can distinguish an unsupported *device type* from other `submit()` errors (`RuntimeNotStarted`, `InvalidModelId`, `RequestQueueFull`).
+- Only affects the async `submit(model_id, image)` overload; `Runtime::thread_pool().submit(...)` (raw lambda task submission, unchanged) and direct `ModelInstance::infer()`/`ModelInstance::infer_batch()` CUDA calls are unaffected.
+
+**Migrating existing CUDA async callers**: submit work through `Runtime::thread_pool().submit([model, image]{ return model->infer(image); })` instead — this keeps the call fully synchronous from `Runtime`'s RequestQueue/aggregator/batch-worker pipeline's point of view, so the caller's own buffer-lifetime discipline (holding the CUDA buffer alive until `future.get()`) remains the single, explicit contract, exactly as before this phase.
+
+**Known limitation**: two timing-based multi-model concurrency tests (`MultiModelConcurrencyTest.DifferentModelsExecuteInParallel`, `RuntimeConcurrencySemanticsTest.DifferentModelsHaveOverlappingExecution`) remain conditionally skipped in the ORT-CUDA (Build D) configuration only — the ONNX Runtime CUDA Execution Provider serializes inference through a single CUDA stream, making wall-clock overlap assertions unreliable in that build. Mock-backend concurrency tests (which do not depend on real GPU timing) continue to run and prove scheduling parallelism in every build.
 
 ## Concurrency Model
 
@@ -364,6 +385,7 @@ struct BatchAggregationConfig {
   - Runtime is not running (`RuntimeNotStarted`)
   - Model ID is not loaded (`InvalidModelId`)
   - Request queue is full (`RequestQueueFull`)
+- **Phase 9.2.2.3**: `Runtime::submit()` throws `VieError(ErrorCode::Unsupported, ...)` synchronously, before any model lookup or queue push, if `image.device != DeviceType::Cpu` (see "Input Device Support" above). This rejection does not create a `std::future` and does not affect `ModelInstance::infer()`/`InferenceEngine::infer()` CUDA support.
 - **Phase 9.2.1**: Execution errors propagate asynchronously through `std::future`
 
 ## Example

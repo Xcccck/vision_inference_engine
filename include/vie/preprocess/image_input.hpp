@@ -13,6 +13,12 @@ enum class ImageLayout { Hwc, Chw };
 // Borrowed: data stays owned by the caller and must remain valid for the
 // whole execute() call. The preprocessor never frees it and never wraps it in
 // a Tensor that would free it.
+// Note: "the whole execute() call" is a synchronous contract. For the
+// asynchronous Runtime::submit() path, only CPU images are accepted (the
+// request is deep-copied into owned_pixels); CUDA images are rejected there
+// because a raw Borrowed device pointer cannot be kept valid across an
+// unbounded queue/aggregator delay. See docs/RUNTIME_ARCHITECTURE.md,
+// "Input Device Support".
 enum class ImageOwnership { Borrowed };
 
 // One image. data is a host pointer when device is CPU and a CUDA device

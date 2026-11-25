@@ -614,6 +614,7 @@ TEST(ClassificationEngine, MockTopKAndTaskDispatch) {
 
 TEST(ClassificationEngine, MissingBackendIsExplicit) {
 #if !defined(VIE_HAS_ONNXRUNTIME)
+  // Build A/C: ONNX Runtime is missing.
   vie::ModelConfig config;
   config.manifest = classification_manifest(4, "classification_logits_raw");
   config.manifest->model_format = vie::ModelFormat::Onnx;
@@ -624,6 +625,7 @@ TEST(ClassificationEngine, MissingBackendIsExplicit) {
   VIE_EXPECT_ERROR(vie::ErrorCode::Unsupported, engine.load(config));
   EXPECT_FALSE(engine.loaded());
 #elif !defined(VIE_HAS_ONNXRUNTIME_CUDA)
+  // Build B: ORT CPU is available, but ORT CUDA is not.
   vie::ModelConfig config;
   config.manifest = classification_manifest(4, "classification_logits_raw");
   config.manifest->model_format = vie::ModelFormat::Onnx;
@@ -634,7 +636,17 @@ TEST(ClassificationEngine, MissingBackendIsExplicit) {
   VIE_EXPECT_ERROR(vie::ErrorCode::Unsupported, engine.load(config));
   EXPECT_FALSE(engine.loaded());
 #else
-  GTEST_SKIP() << "this build has both ONNX Runtime backends";
+  // Build D: Both ORT CPU and ORT CUDA are available.
+  // TensorRT is never compiled in any current build; verify it is also explicit.
+  vie::ModelConfig config;
+  config.manifest = classification_manifest(4, "classification_logits_raw");
+  config.manifest->model_format = vie::ModelFormat::Onnx;
+  config.manifest->model_path = "missing.onnx";
+  config.backend = vie::BackendKind::TensorRT;
+  config.device = vie::DeviceType::Cuda;
+  vie::InferenceEngine engine;
+  VIE_EXPECT_ERROR(vie::ErrorCode::Unsupported, engine.load(config));
+  EXPECT_FALSE(engine.loaded());
 #endif
 }
 

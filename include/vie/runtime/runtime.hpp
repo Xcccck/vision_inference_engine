@@ -83,6 +83,14 @@ class Runtime {
   // Submit an inference request and return a future for the result.
   // The request is queued and executed by a background worker.
   // Throws VieError on submission failure (queue full, shutdown, invalid model).
+  //
+  // Phase 9.2.2.3: Only CPU ImageInput is supported by this async path.
+  // image.device != DeviceType::Cpu is rejected synchronously with
+  // ErrorCode::Unsupported before the request reaches the model lookup or
+  // the RequestQueue: the pipeline cannot guarantee a caller-owned CUDA
+  // device buffer stays valid until the background worker reads it. Use
+  // ModelInstance::infer()/infer_batch() or InferenceEngine::infer() for
+  // synchronous CUDA inference.
   std::future<DetectionResult> submit(const std::string& model_id, ImageInput image);
 
   // Start the runtime (launch inference workers). Called automatically in constructor.

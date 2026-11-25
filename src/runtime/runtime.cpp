@@ -147,6 +147,19 @@ std::future<DetectionResult> Runtime::submit(const std::string& model_id, ImageI
     throw VieError(ErrorCode::RuntimeNotStarted, "Runtime is not running");
   }
 
+  // Phase 9.2.2.3: CUDA async submit is not supported.
+  // ImageInput::data for a CUDA image is a raw device pointer with no
+  // ownership management. The caller may cudaFree() the buffer before the
+  // async worker reads it, causing GPU-side use-after-free. Use the
+  // synchronous InferenceEngine::infer() API for CUDA inputs instead.
+  if (image.device != DeviceType::Cpu) {
+    throw VieError(
+        ErrorCode::Unsupported,
+        std::string("Runtime::submit() does not support ") + to_string(image.device) +
+            " device inputs: the asynchronous request pipeline cannot guarantee CUDA buffer "
+            "lifetime. Use InferenceEngine::infer() for synchronous CUDA inference.");
+  }
+
   // Resolve model to shared_ptr at submit time. This keeps the model alive
   // even if it is unloaded while the request is queued or executing.
   auto model = models_.get(model_id);

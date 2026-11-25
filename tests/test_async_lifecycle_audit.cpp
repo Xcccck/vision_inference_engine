@@ -368,7 +368,96 @@ TEST(ConcurrencySemanticsTest, IdempotentShutdownSafeOnBatchQueue) {
 }
 
 // =============================================================================
-// 5. Runtime shutdown drains all queues correctly (ORTEST)
+// 5. CUDA async submit rejection (Phase 9.2.2.3, no ORT required)
+// =============================================================================
+
+TEST(ConcurrencySemanticsTest, CudaInputRejectedAtSubmitBeforeModelLookup) {
+  // Runtime::submit() must reject CUDA ImageInput synchronously, before the
+  // model is even looked up. This means the rejection works even with no
+  // models loaded and the model_id can be arbitrary.
+  RuntimeConfig config;
+  config.defer_start = true;  // Workers not started; test is fully synchronous
+  Runtime runtime(config);    // running_ = true
+
+  ImageInput cuda_img;
+  cuda_img.device = DeviceType::Cuda;
+  cuda_img.data = nullptr;  // No real device memory needed; rejected on field
+  cuda_img.width = 64;
+  cuda_img.height = 64;
+  cuda_img.channels = 3;
+  cuda_img.dtype = DataType::Uint8;
+  cuda_img.device_id = 0;
+
+  // Rejection must throw VieError with ErrorCode::Unsupported
+  EXPECT_THROW(runtime.submit("nonexistent", cuda_img), VieError);
+
+  // Verify exact error code (not InvalidModelId, not RequestQueueFull)
+  try {
+    runtime.submit("some_model", cuda_img);
+    FAIL() << "Expected VieError for CUDA submit";
+  } catch (const VieError& e) {
+    EXPECT_EQ(e.code(), ErrorCode::Unsupported)
+        << "CUDA submit must be rejected with Unsupported, got: " << e.what();
+  }
+}
+
+TEST(ConcurrencySemanticsTest, CudaInputRejectedDoesNotEnterQueue) {
+  // The rejection happens before the RequestQueue::push(), so no metrics
+  // are recorded for the request and no Future is created.
+  RuntimeConfig config;
+  config.defer_start = true;
+  Runtime runtime(config);
+
+  ImageInput cuda_img;
+  cuda_img.device = DeviceType::Cuda;
+  cuda_img.data = nullptr;
+  cuda_img.width = 64;
+  cuda_img.height = 64;
+  cuda_img.channels = 3;
+  cuda_img.dtype = DataType::Uint8;
+
+  try {
+    runtime.submit("model", cuda_img);
+  } catch (const VieError&) {
+    // Expected
+  }
+
+  // No requests were accepted (rejected before queue push)
+  auto metrics = runtime.snapshot_metrics();
+  EXPECT_EQ(metrics.accepted_requests, 0u)
+      << "CUDA submit rejection must not increment accepted_requests";
+}
+
+TEST(ConcurrencySemanticsTest, CpuInputNotAffectedByCudaRejection) {
+  // CPU/Borrowed inputs must still work. We use a CPU ImageInput and check
+  // that the error (if any) is about the model, not about the device type.
+  RuntimeConfig config;
+  config.defer_start = true;
+  Runtime runtime(config);
+
+  std::vector<uint8_t> buf(64 * 64 * 3, 128);
+  ImageInput cpu_img;
+  cpu_img.device = DeviceType::Cpu;
+  cpu_img.data = buf.data();
+  cpu_img.width = 64;
+  cpu_img.height = 64;
+  cpu_img.channels = 3;
+  cpu_img.dtype = DataType::Uint8;
+
+  // CPU submit with a nonexistent model: should get InvalidModelId, NOT Unsupported
+  try {
+    runtime.submit("nonexistent", cpu_img);
+    FAIL() << "Expected VieError for nonexistent model";
+  } catch (const VieError& e) {
+    EXPECT_NE(e.code(), ErrorCode::Unsupported)
+        << "CPU inputs must not be rejected as Unsupported device";
+    EXPECT_EQ(e.code(), ErrorCode::InvalidModelId)
+        << "CPU submit with valid model should not be device-rejected";
+  }
+}
+
+// =============================================================================
+// 6. Runtime shutdown drains all queues correctly (ORTEST)
 // =============================================================================
 
 #if defined(VIE_HAS_ONNXRUNTIME)
