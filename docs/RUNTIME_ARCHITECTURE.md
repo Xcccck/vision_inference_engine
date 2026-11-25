@@ -673,6 +673,100 @@ performance numbers, and the default production path keeps it off.
 - `OnnxRuntimeCudaBackend.StrictIdentityProfilePlacesAllNodesOnCuda` — positive
   strict-CUDA control proving the profiler reads CUDA placement.
 
+### YOLOv8n Resize CUDA Compatibility Investigation (Phase 9.3.3)
+
+This phase is an **investigation**, not a production change. It answers *why* the
+two `Resize` nodes land on the CPU EP and whether strict CUDA is reachable. No
+Runtime / Backend / Aggregator / Staging / Decoder code was modified; only
+read-only diagnostic scripts under `tools/diagnostics/resize_cuda_compat/` and
+this document were touched. Baseline: `yolov8n.onnx` SHA256
+`65158dad735be799c2466fa15e260c09558080bd530b42a8d0c3d1b419afd8b5`.
+
+**Root cause — CONFIRMED (category A: CUDA EP operator-coverage limit, gated by
+opset version).** ORT **1.20.1** registers a CUDA `Resize` kernel for the
+`Resize` v13–v18 schemas but **not** for the `Resize` v19 schema (opset ≥ 19,
+which added `antialias`). `yolov8n.onnx` is exported at **opset 20**, so its
+`Resize` nodes resolve to the unregistered v19/v20 kernel and are assigned to the
+default CPU EP. Verbose ORT logs state it directly:
+`CUDA kernel not found in registries for Op type: Resize`. This is *not* caused
+by dynamic shapes, `scales`-vs-`sizes`, graph partitioning, the ONNX structure,
+or a VIE backend misconfiguration (each ruled out below).
+
+**The two nodes (read from the raw ONNX, not inferred from the profile):**
+
+| item | `/model.10/Resize` | `/model.13/Resize` |
+|---|---|---|
+| Op / domain / opset | Resize / ai.onnx / 20 | Resize / ai.onnx / 20 |
+| mode / coord / nearest | nearest / asymmetric / floor | nearest / asymmetric / floor |
+| cubic_coeff_a | -0.75 | -0.75 |
+| X (dtype/shape) | float32 `[1,256,20,20]` (from Mul) | float32 `[1,128,40,40]` (from Mul) |
+| roi | omitted (`""`) | omitted (`""`) |
+| scales | **constant initializer** `[1,1,2,2]` (shared `/model.10/Constant_output_0`) | same constant |
+| sizes | absent | absent |
+| output | float32 `[1,256,40,40]` | float32 `[1,128,80,80]` |
+| producer / consumer | Mul → Resize → Concat | Mul → Resize → Concat |
+
+`onnx.checker` and strict `shape_inference` both PASS. Static shapes, constant
+`scales`, standard nearest — the most-supported configuration, yet still CPU.
+
+**Minimal repro (`resize_cuda_probe`, same ORT 1.20.1 GPU + same strict config
+key as production).** Isolated single-node Resize models change one factor at a
+time; every valid variant at opset 20 reproduces `kernel not found` → CPU, while
+the SAME model at opset 13–18 runs the Resize on CUDA:
+
+| opset | 13 | 15 | 16 | 17 | 18 | 19 | 20 | 21 |
+|---|---|---|---|---|---|---|---|---|
+| CUDA `Resize` kernel found | yes | yes | yes | yes | yes | **no** | **no** | **no** |
+| provider placement (profile) | CUDA | CUDA | CUDA | CUDA | CUDA | CPU | CPU | CPU |
+
+Independent of `mode` (nearest/linear), `coordinate_transformation_mode`
+(asymmetric/half_pixel), rank (3D/4D), constant-vs-dynamic `scales`, `scales`-vs
+-`sizes`, or static-vs-dynamic batch — the ONLY variable that flips placement is
+the **opset**. A single isolated node reproduces it, which rules out graph
+partitioning (D) and export structure (C); the production probe call mirrors
+VIE exactly, which rules out a VIE backend defect (F).
+
+**The fix is proven end-to-end on the real model.** Version-converting the
+baseline to opset 18 (`downgrade_opset.py`, read-only, writes a copy):
+- Strict CUDA (fallback **OFF**): `SESSION_CREATE=OK`, real inference runs.
+- Profile: **175/175 nodes on CUDA, CPU=0, Unknown=0, and the four `Memcpy`
+  transfer events are now 0** — those memcpys were exactly the CPU↔CUDA
+  boundary shuttles around the two CPU `Resize` nodes.
+- Numerical equivalence of the conversion (opset 20 vs opset 18, CPU EP, same
+  input): `MaxAbsErr = 0.000e+00`, `MeanAbsErr = 0.000e+00`, no NaN/Inf.
+- Steady-state latency (profiling OFF, 80 runs, same GPU): opset-20 fallback-ON
+  ≈ 5.12 ms mean / 6.82 ms p95 vs opset-18 strict-CUDA ≈ 3.94 ms mean /
+  5.02 ms p95 (~23% faster, tighter tail) — the CPU `Resize` + memcpys are not
+  free, so "just accept the fallback" costs measurable latency.
+
+**Option assessment:**
+- **A — adjust export opset (≤18, ≥13): RECOMMENDED.** Evidence-backed, zero
+  semantic change (`MaxAbsErr=0`), removes the CPU fallback and the memcpys,
+  enables strict CUDA, and even improves latency. Applies to any model, so it
+  is a model-export/deployment step, not YOLO-specific logic in the backend.
+- **B — ONNX graph optimization:** cannot create a missing CUDA kernel; folding
+  the constant `scales` does not change placement. Not useful for this cause.
+- **C — upgrade ORT:** plausible (newer builds may register a Resize-v19 CUDA
+  kernel) but **untested here** — only the 1.20.1 GPU package is available and
+  the Python ORT in this env is CPU-only. Acknowledged evidence gap.
+- **D — custom CUDA Resize op:** unnecessary; a kernel already exists for the
+  v18 schema. Would add YOLO-specific complexity to a general backend — rejected.
+- **E — accept the CPU fallback:** works only with fallback ON, is *not*
+  GPU-only, and costs the ~23% latency + memcpys measured above. Acceptable as a
+  stopgap, inferior to A.
+
+**Recommended next step:** adopt **Option A** — export/deploy YOLOv8n (and similar
+Ultralytics models) at **opset 18**, which turns the Phase 9.3.2.1 **A3 = FAIL
+into PASS** with no VIE code change. Re-run this probe to confirm placement if
+the ORT version changes (upgrading ORT is an untested alternative).
+
+**Diagnostic scripts (read-only, non-production):** `inspect_resize_nodes.py`
+(Phase-2 node dump), `build_minimal_resize_model.py` + `opset_sweep.py` (minimal
+variants), `resize_cuda_probe.cpp` (CUDA strict/profiling/verbose-log/optimize-
+dump/perf probe mirroring the production ORT calls), `downgrade_opset.py`
+(opset-18 copy for the fix test). They write only to an explicit output dir and
+never modify the baseline model or test data.
+
 ### RuntimeConfig
 
 ```cpp
