@@ -105,4 +105,16 @@ void MetricsCollector::record_batch_execution_failure() {
   metrics_.batch_execution_failures++;
 }
 
+// Phase 9.3: Device-aware scheduling metric. wait_ms is the time a batch spent
+// parked in the scheduler waiting for a resource permit. It is kept separate
+// from Backend execution time so GPU/CPU resource waits are never folded into
+// kernel-execution statistics.
+void MetricsCollector::record_resource_admission(const std::string& resource_key, double wait_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  metrics_.total_resource_admissions++;
+  metrics_.total_resource_wait_ms += wait_ms;
+  metrics_.per_resource_admissions[resource_key]++;
+  metrics_.per_resource_wait_ms[resource_key] += wait_ms;
+}
+
 }  // namespace vie

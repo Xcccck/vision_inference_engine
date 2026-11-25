@@ -44,6 +44,7 @@ Thread-safe collector for runtime performance metrics.
 - **Phase 9.2.1**: Queue wait time, execution time, end-to-end time
 - **Phase 9.2.1**: Current and max queue size
 - **Phase 9.2.2**: Batch aggregation metrics (total_batches, batch_size_histogram, flush counts)
+- **Phase 9.3**: Resource scheduling metrics (total_resource_admissions, total_resource_wait_ms, per_resource_admissions/wait_ms keyed by "cpu"/"cuda:N")
 
 **Usage**:
 ```cpp
@@ -119,6 +120,7 @@ Top-level coordinator that owns ThreadPool, MetricsCollector, ModelManager, and 
 - **Phase 9.2.2**: Single aggregator thread with deadline-driven flush strategy
 - **Phase 9.2.2**: CUDA models automatically forced to batch_size=1
 - **Phase 9.2.2.3**: `submit()` (async RequestQueue path) accepts CPU/Borrowed `ImageInput` only; CUDA device inputs are rejected synchronously before entering the queue (see "Input Device Support" below)
+- **Phase 9.3**: Device-aware execution scheduling — formed batches are routed into per-`ExecutionResource` lanes with independent concurrency limits (see "Device-aware Execution Scheduling" below)
 
 **Usage (synchronous via ThreadPool)**:
 ```cpp
@@ -313,6 +315,50 @@ Automatically groups compatible single-image requests into batches for `infer_ba
 
 **Thread Safety**: NOT thread-safe — designed for single aggregator thread access only.
 
+### Device-aware Execution Scheduling (Phase 9.3)
+
+**Location**: `include/vie/runtime/execution_resource.hpp`, `include/vie/runtime/execution_scheduling_config.hpp`, `include/vie/runtime/execution_resource_manager.hpp`, `src/runtime/execution_resource_manager.cpp`
+
+Phase 9.3 adds a resource-aware admission layer between the aggregator and the execution workers. It replaces the single FIFO `BatchExecutionQueue` as the hand-off point: formed batches are routed into a lane keyed by their model's `ExecutionResource`, and a worker receives a batch only when that lane currently has a free concurrency permit.
+
+**ExecutionResource** — what identifies the resource:
+
+```cpp
+enum class ExecutionResourceType { Cpu, Cuda, Unknown };
+struct ExecutionResource { ExecutionResourceType type; int device_id; };
+```
+
+1. **Definition & source of truth**: The resource is derived from the *real execution path*, NOT from `ImageInput.device`. `InferenceEngine::load()` commits a single `DeviceContext` (`engine.device()`), and preprocess / backend execute / decode all use that same committed device (verified in the Phase 9.3 audit). `resolve_backend()` guarantees `OnnxRuntimeCuda ⇔ DeviceType::Cuda` and forces `OnnxRuntime ⇒ Cpu`; the Mock backend never runs on CUDA. So for a loaded engine, `device()` is the authoritative execution resource of the whole request.
+2. **ModelInstance mapping**: `ModelInstance::execution_resource()` returns `execution_resource_from_device(engine_.device())` for a loaded engine, and `Unknown` if the engine was never loaded. A `ModelManager`-stored instance is always loaded, so `Unknown` cannot legitimately reach the scheduler; it is rejected defensively rather than being treated as CPU.
+3. **Device ID**: CUDA resources are distinguished by `device_id`; `cuda:0` and `cuda:1` are separate lanes with separate permits. CPU collapses to a single `cpu` lane.
+
+**Scheduling policy** (per lane):
+
+| Resource | Concurrency limit | Default |
+|---|---|---|
+| CPU lane | `cpu_max_concurrent`, or **unbounded** when `0` | `0` (unbounded) — preserves pre-9.3 behavior |
+| Each CUDA device | `cuda_max_concurrent_per_device` (must be ≥ 1) | `1` (conservative) |
+| Unknown | — | Rejected (`Unsupported`); never silently CPU |
+
+- **CPU**: There is deliberately **no** global CPU serial lock. The CPU lane is unbounded by default, so CPU parallelism stays governed only by `inference_worker_count` and the per-`ModelInstance` mutex — exactly as before Phase 9.3. A non-zero `cpu_max_concurrent` imposes an explicit ceiling when desired.
+- **CUDA**: The default cap of 1 is a conservative Runtime-level **admission gate**, NOT a claim of GPU kernel concurrency, multi-stream execution, or a session pool. With the current single-stream ORT CUDA EP, admitting more than one concurrent batch per device has no proven wall-clock benefit, so the safe default serializes them.
+
+**Head-of-line blocking avoidance**: `pop()` waits until *some* lane has a staged batch **and** a free permit, then hands back that batch. Because the predicate only requires an *eligible* lane (not a specific one), a worker never parks on a saturated GPU lane while CPU or another device still has runnable work. `CpuNotBlockedBySaturatedCudaLane` proves a CPU batch is popped and executed while the CUDA lane is pinned at its cap; `DifferentCudaDevicesAreIndependent` proves `cuda:0` saturation does not block `cuda:1`.
+
+**Backpressure preserved**: permits gate *execution*, but staging is bounded by one shared pool (`total_staged_ < capacity_`) across all lanes, so splitting into lanes never admits more in-flight batches than the single bounded queue did. `lane_capacity` defaults (falls back) to `batch_execution_queue_capacity`.
+
+**Batch ↔ permit relationship**: One `BatchWorkItem` (regardless of batch size) occupies exactly **one** permit of its resource lane for its whole execution. Requests in a batch are never re-ordered and each keeps its own `GeometryTransform`/result mapping. CUDA batch stays forced to size 1 (Phase 9.2.2 unchanged).
+
+**Permit lifecycle & exception safety (RAII)**: `pop()` reserves a permit and returns a `ScheduledBatch { BatchWorkItem item; ResourceLease lease; }`. `ResourceLease` is move-only; its destructor calls `release()`. The permit is therefore returned exactly once on every path — normal return, exception unwinding, or worker exit — and there is no way to double-release (a manual release racing the destructor is impossible). `pop()` releases any permit already held by a reused `ScheduledBatch` *before* taking the internal mutex, so it never self-deadlocks. Execution order is always *permit acquired (pop) → then `ModelInstance` mutex (inside `execute_batch`)*, so the scheduler lock is never held while acquiring an instance lock — no lock-order inversion.
+
+**Shutdown**: `Runtime::shutdown()` joins the aggregator first (so every formed batch is already pushed), then calls `resource_mgr_->shutdown()`, which only sets the flag and wakes everyone. Workers keep draining already-staged batches (their futures still complete) and exit only once every lane is empty. No accepted request is stranded, no permit leaks, and there is no deadlock (`ShutdownDrainsAllAcceptedBatches`).
+
+**Metrics** (see `MetricsCollector`): `total_resource_admissions`, `total_resource_wait_ms`, and per-resource `per_resource_admissions` / `per_resource_wait_ms`. Resource *wait* time (time a batch spent parked waiting for a permit) is tracked separately from and never folded into backend execution time or GPU kernel time. The manager records admissions after releasing its own lock, so the scheduler mutex never nests with the metrics mutex.
+
+**Thread Safety**: `ExecutionResourceManager` is fully thread-safe (single internal mutex + condition variable). Producers call `push()`, workers call `pop()`; permits return via `ResourceLease` destructors on worker threads.
+
+**Explicitly NOT implemented in Phase 9.3**: CUDA multi-stream, ORT session pools, and GPU auto load-balancing remain future work. This layer is resource *admission* only.
+
 ### RuntimeConfig
 
 ```cpp
@@ -328,6 +374,8 @@ struct RuntimeConfig {
   bool defer_start = false;
   // Phase 9.2.2
   BatchAggregationConfig batch_aggregation;
+  // Phase 9.3
+  ExecutionSchedulingConfig scheduling;
 };
 ```
 
@@ -339,6 +387,21 @@ struct BatchAggregationConfig {
   std::size_t max_pending_requests = 256;          // Backpressure limit
 };
 ```
+
+```cpp
+// Phase 9.3 — resource-level admission policy (NOT backend kernel capability).
+struct ExecutionSchedulingConfig {
+  std::size_t cuda_max_concurrent_per_device = 1;  // per CUDA device gate; 0 is ILLEGAL (throws)
+  std::size_t cpu_max_concurrent = 0;              // 0 = unbounded (worker-governed)
+  std::size_t lane_capacity = 0;                   // 0 = fall back to batch_execution_queue_capacity
+};
+```
+
+**cuda_max_concurrent_per_device**: Max batches the scheduler runs concurrently on the *same* CUDA device. Default `1`. Must be ≥ 1 — `0` throws `VieError(InvalidArgument)` at construction (it does **not** mean unlimited). This is a conservative Runtime admission gate; it does not imply GPU kernel concurrency, multiple streams, or a session pool.
+
+**cpu_max_concurrent**: Concurrency ceiling for the CPU lane. Default `0` = unbounded, preserving pre-Phase-9.3 CPU parallelism (worker count + per-instance mutex remain the only limits).
+
+**lane_capacity**: Shared staging budget across all resource lanes (backpressure). `0` falls back to `batch_execution_queue_capacity`.
 
 **thread_pool_size**: Number of worker threads. Set based on concurrency needs and available cores.
 

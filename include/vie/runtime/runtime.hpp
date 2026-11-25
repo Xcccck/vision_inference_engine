@@ -3,6 +3,7 @@
 #include "vie/model/model_config.hpp"
 #include "vie/runtime/batch_execution_queue.hpp"
 #include "vie/runtime/dynamic_batch_aggregator.hpp"
+#include "vie/runtime/execution_resource_manager.hpp"
 #include "vie/runtime/model_instance.hpp"
 #include "vie/runtime/request_queue.hpp"
 #include "vie/runtime/runtime_config.hpp"
@@ -120,8 +121,12 @@ class Runtime {
   // Phase 9.2.2: Dynamic batch aggregator (single thread)
   std::unique_ptr<DynamicBatchAggregator> aggregator_;
 
-  // Phase 9.2.2.1: Batch execution queue (bounded, connects aggregator to workers)
-  std::unique_ptr<BatchExecutionQueue> exec_queue_;
+  // Phase 9.2.2.1 / 9.3: Batch staging + device-aware admission control. The
+  // aggregator pushes formed batches into per-resource lanes; execution workers
+  // pop a batch only when its resource has a free permit, so a saturated GPU
+  // device cannot head-of-line-block CPU or other devices. Replaces the single
+  // BatchExecutionQueue as the Runtime's execution hand-off point.
+  std::unique_ptr<ExecutionResourceManager> resource_mgr_;
 
   // Threads
   std::thread aggregator_thread_;

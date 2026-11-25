@@ -44,6 +44,15 @@ struct RuntimeMetrics {
   std::size_t max_batch_size_achieved = 0;     // Largest batch actually executed
   std::map<int, std::size_t> batch_size_histogram;  // batch_size -> count
 
+  // Phase 9.3: Device-aware scheduling metrics. Resource wait time is tracked
+  // separately from Backend execution time and is NOT counted as GPU kernel
+  // time; it is the time a batch spent parked in the scheduler waiting for a
+  // free permit on its execution resource.
+  std::size_t total_resource_admissions = 0;
+  double total_resource_wait_ms = 0.0;
+  std::map<std::string, std::size_t> per_resource_admissions;  // "cpu"/"cuda:0" -> count
+  std::map<std::string, double> per_resource_wait_ms;          // "cpu"/"cuda:0" -> ms
+
   void reset() {
     total_inferences = 0;
     failed_inferences = 0;
@@ -75,6 +84,11 @@ struct RuntimeMetrics {
     batch_execution_failures = 0;
     max_batch_size_achieved = 0;
     batch_size_histogram.clear();
+    // Phase 9.3
+    total_resource_admissions = 0;
+    total_resource_wait_ms = 0.0;
+    per_resource_admissions.clear();
+    per_resource_wait_ms.clear();
   }
 };
 
@@ -101,6 +115,9 @@ class MetricsCollector {
   void record_batch_timeout_flush();
   void record_batch_shutdown_flush();
   void record_batch_execution_failure();
+
+  // Phase 9.3: Device-aware scheduling metrics.
+  void record_resource_admission(const std::string& resource_key, double wait_ms);
 
  private:
   mutable std::mutex mutex_;

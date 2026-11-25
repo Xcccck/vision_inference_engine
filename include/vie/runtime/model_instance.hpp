@@ -3,6 +3,7 @@
 #include "vie/core/tensor.hpp"
 #include "vie/engine/inference_engine.hpp"
 #include "vie/model/model_config.hpp"
+#include "vie/runtime/execution_resource.hpp"
 #include "vie/runtime/runtime_metrics.hpp"
 
 #include <memory>
@@ -25,6 +26,19 @@ class ModelInstance {
   const ModelConfig& config() const noexcept { return config_; }
   bool loaded() const noexcept { return engine_.loaded(); }
   const ModelManifest& manifest() const { return engine_.manifest(); }
+
+  // Phase 9.3: The real execution resource of this instance, derived from the
+  // committed engine DeviceContext (NOT from ImageInput.device). Because
+  // InferenceEngine commits preprocess/backend/decode all to one device and
+  // resolve_backend() guarantees OnnxRuntimeCuda <=> Cuda, this is authoritative
+  // for a loaded engine. A never-loaded engine (not possible for an instance
+  // stored in ModelManager) reports Unknown; the scheduler rejects Unknown.
+  ExecutionResource execution_resource() const {
+    if (!engine_.loaded()) {
+      return ExecutionResource{};  // Unknown
+    }
+    return execution_resource_from_device(engine_.device());
+  }
 
   // Thread-safe inference methods (serialize concurrent calls)
   DetectionBatch infer(const ImageInput& image, DetectionInferTiming* timing = nullptr);

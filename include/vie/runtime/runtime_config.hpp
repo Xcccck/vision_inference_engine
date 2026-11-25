@@ -2,6 +2,7 @@
 
 #include "vie/core/device_context.hpp"
 #include "vie/runtime/batch_aggregation_config.hpp"
+#include "vie/runtime/execution_scheduling_config.hpp"
 
 #include <cstddef>
 #include <string>
@@ -26,6 +27,10 @@ struct RuntimeConfig {
   // The aggregator is always a single dedicated thread.
   std::size_t inference_worker_count = 2;
   std::size_t batch_execution_queue_capacity = 64;
+  // Phase 9.3: Device-aware execution scheduling. Controls resource-level
+  // admission per execution resource (CPU / CUDA device). Does not change
+  // inference_worker_count semantics for the CPU lane by default.
+  ExecutionSchedulingConfig scheduling;
 };
 
 }  // namespace vie
