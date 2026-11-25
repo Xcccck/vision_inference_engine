@@ -48,6 +48,12 @@ class IInferenceBackend {
   virtual void prepare(const BackendConfig& config) = 0;
   virtual BackendOutput execute(const BackendRequest& request) = 0;
   virtual BackendInfo info() const = 0;
+
+  // Phase 9.3.2.1: Diagnostic-only. Flush ORT profiling for this backend's own
+  // session and return the generated Chrome-trace JSON path (empty when
+  // profiling was not enabled or not supported). Default no-op so backends that
+  // never profile are unaffected; it never alters inference behavior.
+  virtual std::string end_profiling() { return {}; }
 };
 
 }  // namespace vie

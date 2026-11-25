@@ -3,6 +3,7 @@
 
 #include "vie/backend/onnxruntime_backend.hpp"
 #include "vie/backend/onnxruntime_cuda_backend.hpp"
+#include "vie/diagnostics/ort_profile_parser.hpp"
 #include "vie/engine/inference_engine.hpp"
 
 #include <cuda_runtime.h>
@@ -552,4 +553,41 @@ TEST(OnnxRuntimeCudaBackend, ComparesYoloV8nCpuAndCuda) {
          "cudaDeviceSynchronize. GPU time is their sum. Session creation is excluded from execute samples.\n";
   EXPECT_GT(cpu_summary.mean, 0.0);
   EXPECT_GT(ready_summary.mean, 0.0);
+}
+
+// Phase 9.3.2.1 Step 7 (A10): strict-CUDA positive control. An identity graph
+// that loads WITHOUT the CPU EP fallback is profiled on its real session; the
+// parser must attribute every executed node to CUDAExecutionProvider and report
+// zero CPU / zero unknown / zero transfer events. This proves the profiling
+// mechanism genuinely recognizes CUDA EP placement (so a CPU node in the YOLOv8n
+// trace is a real signal, not a parser artifact).
+TEST(OnnxRuntimeCudaBackend, StrictIdentityProfilePlacesAllNodesOnCuda) {
+  const std::string path =
+      write_model("identity_profile.onnx", identity_model({static_dim(4)}, "images", "predictions"));
+  const std::string prefix = (fixture_dir() / "vie_identity_strict_").string();
+
+  vie::OnnxRuntimeCudaBackend backend;
+  backend.set_log_severity(0);
+  backend.set_intra_op_threads(1);
+  backend.set_profiling(true, prefix);
+  EXPECT_FALSE(backend.cpu_ep_fallback());  // strict: no CPU EP fallback
+  backend.prepare(cuda_config(path));
+
+  vie::BackendRequest request;
+  request.inputs.emplace("images", cuda_tensor({1.f, 2.f, 3.f, 4.f}, {4}));
+  const vie::BackendOutput output = backend.execute(request);
+  ASSERT_EQ(output.tensors.count("predictions"), 1u);
+
+  const std::string profile = backend.end_profiling();
+  ASSERT_FALSE(profile.empty()) << "strict session produced no profile path";
+  std::error_code ec;
+  ASSERT_TRUE(std::filesystem::exists(profile, ec)) << profile;
+
+  const vie::OrtProfileStats stats = vie::parse_ort_profile_file(profile);
+  EXPECT_GE(stats.total_node_events, 1u);
+  EXPECT_EQ(stats.cuda_node_events, stats.total_node_events);
+  EXPECT_EQ(stats.cpu_node_events, 0u);
+  EXPECT_EQ(stats.other_provider_events, 0u);
+  EXPECT_EQ(stats.unknown_provider_events, 0u);
+  EXPECT_EQ(stats.transfer_events, 0u);
 }

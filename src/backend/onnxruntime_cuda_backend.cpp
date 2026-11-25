@@ -211,6 +211,8 @@ struct OnnxRuntimeCudaBackend::Impl {
   OnnxRuntimeOptimization optimization = OnnxRuntimeOptimization::All;
   int log_severity = 2;
   bool cpu_ep_fallback = false;
+  bool profiling_enabled = false;
+  std::string profiling_prefix;
   bool prepared = false;
   bool device_ready = false;
   int device_id = 0;
@@ -282,6 +284,11 @@ void OnnxRuntimeCudaBackend::set_log_severity(int severity) {
 
 void OnnxRuntimeCudaBackend::set_cpu_ep_fallback(bool enabled) { impl_->cpu_ep_fallback = enabled; }
 
+void OnnxRuntimeCudaBackend::set_profiling(bool enabled, std::string output_prefix) {
+  impl_->profiling_enabled = enabled;
+  impl_->profiling_prefix = std::move(output_prefix);
+}
+
 void OnnxRuntimeCudaBackend::prepare(const BackendConfig& config) {
   if (config.model_format != ModelFormat::Onnx) {
     throw VieError(ErrorCode::Unsupported,
@@ -344,6 +351,15 @@ void OnnxRuntimeCudaBackend::prepare(const BackendConfig& config) {
     impl_->options.SetLogSeverityLevel(impl_->log_severity);
     impl_->options.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback,
                                   impl_->cpu_ep_fallback ? "0" : "1");
+
+    // Phase 9.3.2.1: When profiling is opted in, enable it on the SAME session
+    // options that create the inference session (never a second session). This
+    // only records telemetry; it does not change the CUDA EP, CPU fallback, or
+    // the execution path. Disabled by default, so this branch is skipped in the
+    // normal production path.
+    if (impl_->profiling_enabled && !impl_->profiling_prefix.empty()) {
+      impl_->options.EnableProfiling(impl_->profiling_prefix.c_str());
+    }
 
     OrtCUDAProviderOptions cuda_options;
     cuda_options.device_id = config.device_id;
@@ -564,6 +580,17 @@ BackendInfo OnnxRuntimeCudaBackend::info() const {
 const OnnxRuntimeCudaTiming& OnnxRuntimeCudaBackend::timing() const { return impl_->timing; }
 
 bool OnnxRuntimeCudaBackend::cpu_ep_fallback() const { return impl_->cpu_ep_fallback; }
+
+std::string OnnxRuntimeCudaBackend::end_profiling() {
+  if (!impl_->profiling_enabled || impl_->session == nullptr) return {};
+  // Flushes the profile to <prefix><timestamp>.json and returns the real path.
+  // Safe to call once inference has completed; does not touch the session state
+  // used for further runs. Called before release_session()/destruction so the
+  // file handle is closed deterministically (§4.2 requirements 6-8).
+  Ort::AllocatorWithDefaultOptions allocator;
+  Ort::AllocatedStringPtr path = impl_->session->EndProfilingAllocated(allocator);
+  return path.get() != nullptr ? std::string(path.get()) : std::string();
+}
 
 std::string OnnxRuntimeCudaBackend::session_log() const {
   std::lock_guard<std::mutex> guard(impl_->log_mu);

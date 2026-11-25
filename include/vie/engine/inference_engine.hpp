@@ -205,6 +205,12 @@ class InferenceEngine {
 
   void synchronize() const;
 
+  // Phase 9.3.2.1: Flush ORT profiling for the engine's real backend session and
+  // return the generated Chrome-trace JSON path. Empty when profiling was not
+  // enabled at load() or the backend does not support it. Diagnostic only; it
+  // never changes inference behavior and returns "" in CPU-only builds.
+  std::string end_profiling();
+
   BackendRegistry& backends() noexcept { return backends_; }
   DecoderRegistry& decoders() noexcept { return decoders_; }
 

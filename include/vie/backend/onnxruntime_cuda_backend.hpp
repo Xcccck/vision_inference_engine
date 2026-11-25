@@ -42,10 +42,17 @@ class OnnxRuntimeCudaBackend final : public IInferenceBackend {
   void set_graph_optimization(OnnxRuntimeOptimization level);
   void set_log_severity(int severity);
   void set_cpu_ep_fallback(bool enabled);
+  // Phase 9.3.2.1: Opt-in ORT profiling. Must be set before prepare(). Applies
+  // Ort::SessionOptions::EnableProfiling to the same session used for inference.
+  // Default disabled; enabling it does not change the CUDA EP or fallback config.
+  void set_profiling(bool enabled, std::string output_prefix);
 
   void prepare(const BackendConfig& config) override;
   BackendOutput execute(const BackendRequest& request) override;
   BackendInfo info() const override;
+  // Flushes the real session's profile and returns the Chrome-trace JSON path
+  // (empty if profiling was not enabled). Call after inference, before unload.
+  std::string end_profiling() override;
 
   const OnnxRuntimeCudaTiming& timing() const;
   bool cpu_ep_fallback() const;

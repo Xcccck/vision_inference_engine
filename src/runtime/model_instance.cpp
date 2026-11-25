@@ -167,4 +167,12 @@ BackendOutput ModelInstance::execute(const BackendRequest& request) {
   return result;
 }
 
+// Phase 9.3.2.1: diagnostic flush of the real session profile. Shares the
+// instance mutex so it runs strictly after any in-flight inference, ensuring
+// every issued ORT node has been recorded before EndProfiling is called.
+std::string ModelInstance::end_profiling() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return engine_.end_profiling();
+}
+
 }  // namespace vie

@@ -333,10 +333,17 @@ void InferenceEngine::load(const ModelConfig& config) {
   
   // Configure CUDA-specific options before prepare if applicable
 #if defined(VIE_HAS_ONNXRUNTIME_CUDA)
-  if (kind == BackendKind::OnnxRuntimeCuda && config.cuda_cpu_ep_fallback) {
+  if (kind == BackendKind::OnnxRuntimeCuda) {
     auto* cuda_backend = dynamic_cast<OnnxRuntimeCudaBackend*>(backend.get());
-    if (cuda_backend) {
-      cuda_backend->set_cpu_ep_fallback(true);
+    if (cuda_backend != nullptr) {
+      if (config.cuda_cpu_ep_fallback) {
+        cuda_backend->set_cpu_ep_fallback(true);
+      }
+      // Phase 9.3.2.1: opt-in profiling on the real inference session. Default
+      // off; when off this leaves the backend exactly as before.
+      if (config.ort_enable_profiling) {
+        cuda_backend->set_profiling(true, config.ort_profile_prefix);
+      }
     }
   }
 #endif
@@ -831,5 +838,12 @@ RawPredictions InferenceEngine::run(const BackendRequest& request) {
 }
 
 void InferenceEngine::synchronize() const { device_.synchronize(); }
+
+std::string InferenceEngine::end_profiling() {
+  // Forwards to the real backend's session; the default interface method returns
+  // "" for backends that never profile, so this is a no-op unless the model was
+  // loaded with ort_enable_profiling.
+  return backend_ != nullptr ? backend_->end_profiling() : std::string();
+}
 
 }  // namespace vie

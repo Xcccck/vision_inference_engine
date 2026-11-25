@@ -146,6 +146,7 @@ add_library(vie
   src/runtime/execution_resource_manager.cpp
   src/runtime/cuda_input_staging.cpp
   src/runtime/runtime.cpp
+  src/diagnostics/ort_profile_parser.cpp
 )
 
 add_library(vie::vie ALIAS vie)
@@ -235,6 +236,7 @@ if(VIE_BUILD_TESTS)
     tests/test_runtime_concurrency.cpp
     tests/test_async_lifecycle_audit.cpp
     tests/test_execution_scheduling.cpp
+    tests/test_ort_profile_parser.cpp
   )
   target_link_libraries(vie_tests PRIVATE vie::vie GTest::gtest GTest::gtest_main)
   target_compile_options(vie_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)

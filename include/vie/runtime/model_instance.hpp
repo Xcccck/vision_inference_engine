@@ -77,6 +77,12 @@ class ModelInstance {
   // Direct backend execution (thread-safe)
   BackendOutput execute(const BackendRequest& request);
 
+  // Phase 9.3.2.1: Flush ORT profiling for THIS instance's real engine session
+  // and return the Chrome-trace JSON path. Empty unless the model was loaded
+  // with ModelConfig::ort_enable_profiling. Serializes on the same mutex as the
+  // infer methods so it cannot race an in-flight run; it never changes results.
+  std::string end_profiling();
+
  private:
   std::string id_;
   ModelConfig config_;

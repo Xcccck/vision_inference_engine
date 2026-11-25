@@ -11,6 +11,7 @@
 
 #include "vie/core/device_context.hpp"
 #include "vie/core/error.hpp"
+#include "vie/diagnostics/ort_profile_parser.hpp"
 #include "vie/runtime/cuda_input_staging.hpp"
 #include "vie/runtime/dynamic_batch_aggregator.hpp"
 #include "vie/runtime/execution_resource.hpp"
@@ -29,6 +30,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -1122,6 +1124,175 @@ TEST_F(CudaSchedulingRuntimeTest, PerformanceReferenceReport) {
     EXPECT_EQ(runtime.snapshot_metrics().failed_requests, 0u);
     runtime.shutdown();
   }
+}
+
+// -----------------------------------------------------------------------------
+// Phase 9.3.2.1: CUDA Execution Provider placement verification.
+//
+// These tests profile the REAL asynchronous Runtime session (ModelConfig
+// .ort_enable_profiling feeds the same Ort::Session the worker's infer_async
+// runs), flush it via ModelInstance::end_profiling(), and parse the resulting
+// ORT 1.20.1 Chrome trace to attribute every executed node to an Execution
+// Provider. They are the node-level evidence Phase 9.3.2's execution_device
+// signal could not provide.
+// -----------------------------------------------------------------------------
+namespace {
+
+bool op_is_memcpy(const std::string& op) {
+  return op.find("Memcpy") != std::string::npos || op.find("memcpy") != std::string::npos;
+}
+
+const char* provider_label(OrtProviderClass c) {
+  switch (c) {
+    case OrtProviderClass::Cuda: return "CUDA";
+    case OrtProviderClass::Cpu: return "CPU";
+    case OrtProviderClass::Other: return "OTHER";
+    case OrtProviderClass::Unknown: return "UNKNOWN";
+  }
+  return "?";
+}
+
+// Prints the §6.2 report block plus the per-provider node detail. Purely
+// diagnostic; the assertions live in the tests.
+void print_ort_stats(const char* label, const OrtProfileStats& s) {
+  const std::size_t known = s.cuda_node_events + s.cpu_node_events + s.other_provider_events;
+  const double cuda_pct = known ? 100.0 * static_cast<double>(s.cuda_node_events) / static_cast<double>(known) : 0.0;
+  const double cpu_pct = known ? 100.0 * static_cast<double>(s.cpu_node_events) / static_cast<double>(known) : 0.0;
+  std::cout << "\n=== ORT EP placement: " << label << " ===\n"
+            << "  total_trace_events   = " << s.total_trace_events << "\n"
+            << "  total_node_events    = " << s.total_node_events << "\n"
+            << "  cuda_node_events     = " << s.cuda_node_events << "\n"
+            << "  cpu_node_events      = " << s.cpu_node_events << "\n"
+            << "  other_provider_events= " << s.other_provider_events << "\n"
+            << "  unknown_provider_evts= " << s.unknown_provider_events << "\n"
+            << "  transfer_events      = " << s.transfer_events << "\n"
+            << "  unique_node_names    = " << s.unique_node_names << "\n"
+            << "  CUDA% (of placed)    = " << std::fixed << std::setprecision(2) << cuda_pct << "%\n"
+            << "  CPU%  (of placed)    = " << cpu_pct << "%\n";
+  std::cout << "  -- CPU-placed nodes --\n";
+  for (const OrtNodeEvent& n : s.node_events) {
+    if (n.provider_class == OrtProviderClass::Cpu) {
+      std::cout << "    [CPU ] " << n.name << "  op=" << n.op_type << "\n";
+    }
+  }
+  std::cout << "  -- memcpy-family nodes --\n";
+  for (const OrtNodeEvent& n : s.node_events) {
+    if (op_is_memcpy(n.op_type)) {
+      std::cout << "    [" << provider_label(n.provider_class) << "] " << n.name
+                << "  op=" << n.op_type << "\n";
+    }
+  }
+}
+
+}  // namespace
+
+// -----------------------------------------------------------------------------
+// Step 5 / A3 A4 A5 A6 A7 A8: profile the actual async Runtime CUDA session and
+// attribute every executed node to an EP. yolov8n runs with cuda_cpu_ep_fallback
+// = true; the trace must show most nodes on CUDA, the four Memcpy kernels, and
+// the genuine CPU fallback being the two Resize ops (NOT the memcpys).
+// -----------------------------------------------------------------------------
+TEST_F(CudaSchedulingRuntimeTest, Yolov8nFallbackOnAsyncProfileIsCudaWithResizeFallback) {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path();
+  Runtime runtime(sched_config());
+  auto cfg = model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0);
+  cfg.ort_enable_profiling = true;
+  cfg.ort_profile_prefix = (dir / "vie_yolov8n_fallback_on_").string();
+  auto model = runtime.models().load("cuda_det", cfg);
+
+  std::vector<std::uint8_t> pixels;
+  ImageInput bus = load_bus(pixels);
+  DetectionResult res = runtime.submit("cuda_det", bus).get();
+  const std::string path = model->end_profiling();
+  runtime.shutdown();
+
+  // A4: the real asynchronous CUDA detection path produced a non-empty result.
+  ASSERT_FALSE(res.detections.empty());
+  EXPECT_EQ(res.execution_device, DeviceType::Cuda);
+  // A3: a profile exists and came from the Runtime session just used.
+  ASSERT_FALSE(path.empty()) << "end_profiling returned no path";
+  std::error_code ec;
+  ASSERT_TRUE(fs::exists(path, ec)) << path;
+  EXPECT_GT(fs::file_size(path, ec), 0u);
+
+  const OrtProfileStats stats = parse_ort_profile_file(path);
+  print_ort_stats("yolov8n fallback=ON (async Runtime)", stats);
+
+  // A5/A6/A7: placement is attributed for every node; none silently unknown.
+  EXPECT_GT(stats.total_node_events, 100u);
+  EXPECT_EQ(stats.unknown_provider_events, 0u);
+  EXPECT_GT(stats.cuda_node_events, 0u);
+  EXPECT_GT(stats.cpu_node_events, 0u) << "fallback=ON must expose a genuine CPU fallback";
+  // A8: exactly the four Memcpy transfer nodes.
+  EXPECT_EQ(stats.transfer_events, 4u);
+  EXPECT_EQ(stats.memcpy_names.size(), 4u);
+
+  // The CPU-placed nodes are the two Resize ops, not the memcpys: this is the
+  // precise, node-level reason cuda_cpu_ep_fallback is required.
+  for (const OrtNodeEvent& n : stats.node_events) {
+    if (n.provider_class == OrtProviderClass::Cpu) {
+      EXPECT_EQ(n.op_type, "Resize") << "unexpected CPU node " << n.name;
+    }
+    if (op_is_memcpy(n.op_type)) {
+      EXPECT_EQ(n.provider_class, OrtProviderClass::Cuda)
+          << "memcpy node " << n.name << " unexpectedly not on CUDA";
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Step 5 / A12 (§11.2): with profiling left at its default (off) the production
+// path is byte-for-byte unchanged -- inference still succeeds and NO profile is
+// flushed.
+// -----------------------------------------------------------------------------
+TEST_F(CudaSchedulingRuntimeTest, ProfilingDisabledByDefaultEmitsNoProfile) {
+  Runtime runtime(sched_config());
+  auto cfg = model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0);
+  cfg.ort_enable_profiling = false;  // explicit about the default
+  auto model = runtime.models().load("cuda_det", cfg);
+
+  std::vector<std::uint8_t> pixels;
+  ImageInput bus = load_bus(pixels);
+  DetectionResult res = runtime.submit("cuda_det", bus).get();
+  const std::string path = model->end_profiling();
+  runtime.shutdown();
+
+  EXPECT_EQ(res.execution_device, DeviceType::Cuda);
+  ASSERT_FALSE(res.detections.empty());  // no inference regression
+  EXPECT_TRUE(path.empty()) << "no profile must be produced when disabled";
+}
+
+// -----------------------------------------------------------------------------
+// Step 6 / A9 (§11.3): the same model with cuda_cpu_ep_fallback = false fails at
+// SESSION CREATION (ModelInstance load), never reaching submit. Records the real
+// ORT error rather than skipping.
+// -----------------------------------------------------------------------------
+TEST_F(CudaSchedulingRuntimeTest, Yolov8nStrictCudaFallbackOffFailsAtLoad) {
+  Runtime runtime(sched_config());
+  auto cfg = model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0);
+  cfg.cuda_cpu_ep_fallback = false;  // strict CUDA: CPU EP not appended
+
+  std::string stage = "load";
+  std::string message;
+  bool threw = false;
+  try {
+    auto model = runtime.models().load("cuda_det", cfg);
+    stage = "submit";  // load returned; any throw from here is a submit-stage failure
+    std::vector<std::uint8_t> pixels;
+    ImageInput bus = load_bus(pixels);
+    (void)runtime.submit("cuda_det", bus).get();
+  } catch (const VieError& e) {
+    threw = true;
+    message = e.what();
+  }
+  runtime.shutdown();
+
+  EXPECT_TRUE(threw) << "strict CUDA must not silently succeed for yolov8n";
+  EXPECT_EQ(stage, "load") << "must fail at session creation, not at submit";
+  // ORT refuses to build the session because the Resize nodes need the CPU EP.
+  EXPECT_NE(message.find("CPU EP"), std::string::npos) << message;
+  std::cout << "[strict] stage=" << stage << " error=" << message << "\n";
 }
 
 #endif  // VIE_HAS_ONNXRUNTIME_CUDA

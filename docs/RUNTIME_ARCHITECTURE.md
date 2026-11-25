@@ -72,6 +72,10 @@ Wraps a single `InferenceEngine` with thread-safe access and automatic metrics r
   inference; otherwise (CPU instances, already-on-device images, and all
   synchronous `infer()`/`infer_batch()` callers) they behave exactly like the
   synchronous methods. The synchronous APIs are unchanged.
+- **Phase 9.3.2.1**: `end_profiling()` flushes ORT profiling for *this* instance's
+  real engine session and returns the Chrome-trace path (empty unless the model was
+  loaded with `ModelConfig::ort_enable_profiling`). It shares the instance mutex, so
+  it never races an in-flight run and never changes inference results.
 
 **Usage**:
 ```cpp
@@ -529,6 +533,94 @@ are the existing CPU-only stubs that throw `Unsupported`.
   - `StagingFailureRejectsFutureAndLaterRequestSucceeds` — §9.5 exception path.
   - `ConcurrentCudaRequestsDoNotShareInputBuffer` — §9.6 (each request decodes its
     own staged copy).
+
+### CUDA Execution Provider Placement Verification (Phase 9.3.2.1)
+
+Phase 9.3.2 proved a CPU image drives a real CUDA `ModelInstance` to a non-empty
+result and tagged `execution_device == Cuda`. That tag identifies the **device
+the Runtime committed and the engine was configured for**; it is **not** proof
+that every ONNX graph node was placed on the `CUDAExecutionProvider`. With
+`cuda_cpu_ep_fallback = true` ORT is explicitly allowed to keep some nodes on
+CPU, so the placement was unmeasured. Phase 9.3.2.1 closes that evidence gap with
+**node-level ONNX Runtime profiling** of the *real asynchronous Runtime session*.
+
+**Four distinct concepts — never conflated:**
+- `execution_device` — the device the Runtime lane/engine ran on (Phase 9.3.2).
+- **EP placement** — which `ExecutionProvider` ORT assigned each *graph node* to
+  (this phase; read from `args.provider` in the profile).
+- **CUDA kernel execution** — GPU kernel time recorded for a CUDA-placed node.
+- **Host/device memory transfer** — ORT-inserted `Memcpy*` movement between EPs.
+
+**Profiling mechanism (opt-in, default off, production path unchanged):**
+- ORT version: **1.20.1** (`/opt/onnxruntime-linux-x64-gpu-1.20.1`).
+- API: `Ort::SessionOptions::EnableProfiling(prefix)` is called on the **same**
+  `SessionOptions` that builds the inference session (never a second session),
+  and `Ort::Session::EndProfilingAllocated()` flushes it and returns the
+  Chrome-trace JSON path.
+- Plumbing: `ModelConfig::ort_enable_profiling` + `ort_profile_prefix` →
+  `InferenceEngine::load` → `OnnxRuntimeCudaBackend::set_profiling` → session;
+  flush via `InferenceEngine::end_profiling()` / `ModelInstance::end_profiling()`
+  (which serializes on the instance mutex so it runs strictly after any in-flight
+  inference). Both flags default off, so `EnableProfiling` is never called and the
+  normal Session is byte-for-byte identical. CPU-only builds return `""`.
+- Output is written to a configurable directory (tests use
+  `std::filesystem::temp_directory_path()`), never the source tree.
+
+**Parser** (`include/vie/diagnostics/ort_profile_parser.hpp`,
+`src/diagnostics/ort_profile_parser.cpp`, CUDA-free / ORT-free, built into every
+build; uses the existing `nlohmann::json` dependency internally, plain structs
+publicly). Real ORT 1.20.1 emits a **bare top-level JSON array**; each executed
+node appears as three events (`*_fence_before`, `*_kernel_time`, `*_fence_after`),
+and **only `*_kernel_time` carries `args.provider`**. Rule applied:
+- A **node event** = any event with a string `args.provider` (the authoritative
+  placement). Session/fence/thread events (no provider) are never counted as nodes.
+- Provider substring classification: contains `cuda` → CUDA, `cpu` → CPU, empty →
+  **Unknown** (never silently folded into CPU), otherwise Other.
+- A **memcpy/transfer event** = a provider-carrying node whose op/name contains
+  `memcpy`; it is tallied BOTH as a placed node and as a transfer, so the
+  placement view and the transfer view never contradict each other.
+- Node-event count and unique-node-name count are kept separate.
+
+**Measured results (`test_execution_scheduling.cpp`, Build D, bus.ppm 810×1080,
+async `submit()`, single graph execution, same session):**
+
+| Configuration | placed nodes | CUDA | CPU | Other | Unknown | Transfer (memcpy) |
+|---|---:|---:|---:|---:|---:|---:|
+| `yolov8n`, `cuda_cpu_ep_fallback = true` | 179 | 177 (98.88%) | 2 (1.12%) | 0 | 0 | 4 |
+| `identity.onnx`, strict CUDA (control) | ≥1 | all | 0 | 0 | 0 | 0 |
+
+- The **only two CPU-placed nodes** are `/model.10/Resize` and `/model.13/Resize`
+  (`op_type == Resize`). These — not the memcpys — are the genuine CPU fallback and
+  the reason `cuda_cpu_ep_fallback` must be `true`.
+- The **four "memcpy nodes"** are `Memcpy` / `Memcpy_token_0..2` with op types
+  `MemcpyFromHost` / `MemcpyToHost`, and every one is attributed to
+  **`CUDAExecutionProvider`**. They are ORT-inserted host/device copy kernels
+  that shuttle tensors to and from the two CPU `Resize` nodes; a `Memcpy` event is
+  **not** evidence of a CPU compute fallback.
+- Strict mode (`cuda_cpu_ep_fallback = false`) fails at **session creation**
+  (`ModelInstance::load`, never reaching `submit`) with ORT:
+  `"This session contains graph nodes that are assigned to the default CPU EP, but
+  fallback to CPU EP has been explicitly disabled by the user."` No inference
+  profile exists in that case, and none is fabricated.
+- The identity strict-CUDA control proves the profiler genuinely recognizes CUDA
+  placement (0 CPU / 0 unknown / 0 transfer), so a CPU node in the `yolov8n` trace
+  is a real signal rather than a parser artifact.
+
+**What is now proven / still not proven:** a `yolov8n` async CUDA inference
+places 177 of 179 nodes on CUDA and 2 `Resize` nodes on CPU, with four CUDA-side
+memcpy transfers. Profiling is diagnostic only; its ON timings are not product
+performance numbers, and the default production path keeps it off.
+
+**Tests added (Phase 9.3.2.1):**
+- `OrtProfileParserTest` (18, all builds): array/object roots, CUDA/CPU/Other/
+  Unknown classification, fence & Session exclusion, memcpy dual tally, missing
+  args/provider, empty/invalid JSON, repeated-node vs unique-name, file I/O.
+- `CudaSchedulingRuntimeTest.Yolov8nFallbackOnAsyncProfileIsCudaWithResizeFallback`
+  — the core node-level EP audit of the real async Runtime session.
+- `...ProfilingDisabledByDefaultEmitsNoProfile` — default path unchanged.
+- `...Yolov8nStrictCudaFallbackOffFailsAtLoad` — strict failure stage + message.
+- `OnnxRuntimeCudaBackend.StrictIdentityProfilePlacesAllNodesOnCuda` — positive
+  strict-CUDA control proving the profiler reads CUDA placement.
 
 ### RuntimeConfig
 
