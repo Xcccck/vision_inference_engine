@@ -29,6 +29,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(VIE_HAS_ONNXRUNTIME_CUDA)
+#include <cuda_runtime.h>
+#endif
+
 using namespace vie;
 
 namespace {
@@ -312,13 +316,20 @@ class ExecutionSchedulingRuntimeTest : public ::testing::Test {
  protected:
   void SetUp() override { model_path_ = vie_fixture("testdata/onnx/yolov8n.onnx"); }
 
-  ModelConfig model_config() {
+  ModelConfig model_config(BackendKind backend = BackendKind::OnnxRuntime,
+                           DeviceType device = DeviceType::Cpu, int device_id = 0) {
     ModelConfig config;
     config.model_path = model_path_;
     config.task = TaskType::Detection;
-    config.backend = BackendKind::OnnxRuntime;
-    config.device = DeviceType::Cpu;
-    config.device_id = 0;
+    config.backend = backend;
+    config.device = device;
+    config.device_id = device_id;
+    // yolov8n.onnx has a few CPU-assigned memcpy nodes, so a CUDA session needs
+    // EP fallback to LOAD (the same way the existing CUDA backend tests run it).
+    // This is independent of the scheduling questions below; the strict
+    // "all nodes on CUDAExecutionProvider" proof lives in the identity.onnx
+    // backend test, and the async CPU-image boundary is device-match based.
+    config.cuda_cpu_ep_fallback = (device == DeviceType::Cuda);
 
     ModelManifest manifest;
     manifest.model_name = "yolov8n";
@@ -473,5 +484,137 @@ TEST_F(ExecutionSchedulingRuntimeTest, CudaInputSubmitStillRejected) {
     EXPECT_EQ(e.code(), ErrorCode::Unsupported);
   }
 }
+
+// =============================================================================
+// 4. Real CUDA Runtime scheduling integration (Build D only).
+//
+// Phase 9.3.1 audit result (Conclusion B): a CUDA-loaded ModelInstance's
+// execution resource IS cuda:N, and the scheduler DOES route its batches into
+// the CUDA lane and grant/release exactly one permit. But the current async
+// pipeline cannot drive the CUDA backend to *success*: Runtime::submit()
+// accepts only CPU ImageInput (Phase 9.2.2.3), the request keeps image.device
+// == Cpu (adopt_cpu_pixels), and ImagePreprocessor::execute rejects a CPU
+// image against a CUDA execution device ("H2D stays outside preprocess"). So
+// an async CUDA batch is admitted to the cuda lane, fails at the preprocess
+// boundary, and its permit is released during unwinding.
+//
+// These tests verify that SCHEDULER integration on a genuine CUDA resource
+// lane plus the boundary itself. The CUDA backend's real execution is proven
+// separately by the synchronous inference below (a genuine on-device image),
+// not by execution_resource() alone. We deliberately do NOT claim a successful
+// async CUDA inference.
+// =============================================================================
+#if defined(VIE_HAS_ONNXRUNTIME_CUDA)
+
+namespace {
+// Owns a genuine device buffer so the synchronous CUDA inference test can feed
+// an on-device ImageInput (the caller-owned-buffer contract from 9.2.2.3).
+struct DeviceBuffer {
+  std::uint8_t* ptr = nullptr;
+  std::vector<std::uint8_t> host;
+  ~DeviceBuffer() {
+    if (ptr != nullptr) cudaFree(ptr);
+  }
+};
+}  // namespace
+
+// Reuses the CPU fixture's manifest/config/image builders; only the device and
+// backend differ, so the CUDA model is loaded through the exact same validated
+// manifest path as the CPU models above.
+class CudaSchedulingRuntimeTest : public ExecutionSchedulingRuntimeTest {};
+
+TEST_F(CudaSchedulingRuntimeTest, LoadedCudaModelReportsCudaResource) {
+  Runtime runtime(sched_config());
+  auto model = runtime.models().load(
+      "cuda_det", model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0));
+  const ExecutionResource r = model->execution_resource();
+  EXPECT_EQ(r.type, ExecutionResourceType::Cuda);
+  EXPECT_EQ(r.device_id, 0);
+  EXPECT_EQ(r.key(), "cuda:0");
+}
+
+TEST_F(CudaSchedulingRuntimeTest, CudaBackendExecutesSynchronouslyOnRealGpu) {
+  // Proves the CUDA-loaded ModelInstance really runs its inference through the
+  // CUDA-configured engine on a genuine on-device image (H2D done by the
+  // caller) -> CUDA preprocess -> OnnxRuntimeCuda backend -> decoder, returning
+  // a result mapped back to the 640x640 input space and tagged execution_device
+  // == Cuda. yolov8n loads with cuda_cpu_ep_fallback=true (a few memcpy nodes),
+  // so the strict "every node on CUDAExecutionProvider" guarantee is provided by
+  // the identity.onnx backend test; here we only need the CUDA path to execute.
+  Runtime runtime(sched_config());
+  auto model = runtime.models().load(
+      "cuda_det", model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0));
+
+  const std::size_t bytes = 640 * 640 * 3;
+  DeviceBuffer buf;
+  buf.host.assign(bytes, 127);
+  ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&buf.ptr), bytes), cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(buf.ptr, buf.host.data(), bytes, cudaMemcpyHostToDevice), cudaSuccess);
+
+  ImageInput img;
+  img.data = buf.ptr;
+  img.width = 640;
+  img.height = 640;
+  img.channels = 3;
+  img.color = ColorOrder::Rgb;
+  img.layout = ImageLayout::Hwc;
+  img.dtype = DataType::Uint8;
+  img.device = DeviceType::Cuda;
+  img.device_id = 0;
+
+  DetectionBatch batch = model->infer(img);
+  ASSERT_EQ(batch.results.size(), 1u);
+  EXPECT_EQ(batch.results[0].original_width, 640);
+  EXPECT_EQ(batch.results[0].original_height, 640);
+  // The decoder reports the execution device it actually ran on: a real CUDA
+  // run must say Cuda, not a silent CPU fallback.
+  EXPECT_EQ(batch.results[0].execution_device, DeviceType::Cuda);
+}
+
+TEST_F(CudaSchedulingRuntimeTest, CudaModelCpuImageIsRoutedToCudaLaneAndReleasesPermit) {
+  // The async boundary: submit accepts the CPU image, the scheduler admits the
+  // batch to the real cuda:0 lane, execution fails at the preprocess device
+  // mismatch, and the permit is released (no hang, future resolves).
+  Runtime runtime(sched_config());
+  runtime.models().load("cuda_det",
+                        model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0));
+  auto f = runtime.submit("cuda_det", cpu_image());
+  ASSERT_THROW(f.get(), VieError);  // device mismatch surfaces from preprocess
+  runtime.shutdown();
+
+  auto m = runtime.snapshot_metrics();
+  auto it = m.per_resource_admissions.find("cuda:0");
+  ASSERT_NE(it, m.per_resource_admissions.end());  // admitted to the CUDA lane
+  EXPECT_GE(it->second, 1u);
+  EXPECT_GE(m.completed_requests, 1u);
+  EXPECT_GE(m.failed_requests, 1u);  // permit path finished even on failure
+}
+
+TEST_F(CudaSchedulingRuntimeTest, CpuAndCudaLanesAreIndependentInRuntime) {
+  // With a real CUDA lane present, CPU work must still flow: CPU futures
+  // resolve successfully, the CUDA request is admitted to its own lane and
+  // fails only at the preprocess boundary. Proves cross-resource routing and
+  // that CPU requests are not blocked behind the cuda lane.
+  Runtime runtime(sched_config());
+  runtime.models().load("cpu_det", model_config());
+  runtime.models().load("cuda_det",
+                        model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0));
+
+  std::vector<std::future<DetectionResult>> cpu_futures;
+  for (int i = 0; i < 4; ++i) cpu_futures.push_back(runtime.submit("cpu_det", cpu_image()));
+  auto cuda_future = runtime.submit("cuda_det", cpu_image());
+
+  for (auto& f : cpu_futures) f.get();  // succeed, not blocked by the cuda lane
+  EXPECT_THROW(cuda_future.get(), VieError);
+  runtime.shutdown();
+
+  auto m = runtime.snapshot_metrics();
+  EXPECT_EQ(m.completed_requests, 5u);
+  EXPECT_EQ(m.failed_requests, 1u);
+  EXPECT_NE(m.per_resource_admissions.find("cpu"), m.per_resource_admissions.end());
+  EXPECT_NE(m.per_resource_admissions.find("cuda:0"), m.per_resource_admissions.end());
+}
+
+#endif  // VIE_HAS_ONNXRUNTIME_CUDA
 
 #endif  // VIE_HAS_ONNXRUNTIME

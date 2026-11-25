@@ -189,6 +189,8 @@ auto f2 = runtime.submit("det", image2);
 
 **Migrating existing CUDA async callers**: submit work through `Runtime::thread_pool().submit([model, image]{ return model->infer(image); })` instead — this keeps the call fully synchronous from `Runtime`'s RequestQueue/aggregator/batch-worker pipeline's point of view, so the caller's own buffer-lifetime discipline (holding the CUDA buffer alive until `future.get()`) remains the single, explicit contract, exactly as before this phase.
 
+**Does a *CPU* `ImageInput` reach a *CUDA* model through async `submit()`?** Not in the current build. `submit()` still enqueues the request and the Phase 9.3 scheduler still routes it into the model's `cuda:N` lane and grants a permit, but execution fails at `ImagePreprocessor::execute()` which rejects a CPU image against a CUDA device — the async path has no Runtime-owned H2D step. This is a scheduling-adjacent **input-ownership** boundary, not a scheduler limitation; see "CUDA Runtime Scheduling Integration Audit (Phase 9.3.1)" below for the traced call chain and tests.
+
 **Known limitation**: two timing-based multi-model concurrency tests (`MultiModelConcurrencyTest.DifferentModelsExecuteInParallel`, `RuntimeConcurrencySemanticsTest.DifferentModelsHaveOverlappingExecution`) remain conditionally skipped in the ORT-CUDA (Build D) configuration only — the ONNX Runtime CUDA Execution Provider serializes inference through a single CUDA stream, making wall-clock overlap assertions unreliable in that build. Mock-backend concurrency tests (which do not depend on real GPU timing) continue to run and prove scheduling parallelism in every build.
 
 ## Concurrency Model
@@ -358,6 +360,89 @@ struct ExecutionResource { ExecutionResourceType type; int device_id; };
 **Thread Safety**: `ExecutionResourceManager` is fully thread-safe (single internal mutex + condition variable). Producers call `push()`, workers call `pop()`; permits return via `ResourceLease` destructors on worker threads.
 
 **Explicitly NOT implemented in Phase 9.3**: CUDA multi-stream, ORT session pools, and GPU auto load-balancing remain future work. This layer is resource *admission* only.
+
+### CUDA Runtime Scheduling Integration Audit (Phase 9.3.1)
+
+Phase 9.3.1 verifies whether the device-aware scheduler is *actually wired into the
+Runtime's CUDA execution path*, and corrects a possible misreading of the
+Phase 9.2.2.3 CUDA-input rejection. The finding is an **audit conclusion, not a
+new feature**: with the current code, a CUDA-loaded `ModelInstance` is correctly
+recognised and routed into its `cuda:N` lane (permit acquired and released), but
+the *async* `Runtime::submit()` pipeline cannot drive the CUDA backend to a
+successful inference, because of a deliberate input-ownership boundary — not a
+scheduling defect.
+
+**Actual CPU-image → CUDA-backend call chain (Build D, traced):**
+
+```text
+Runtime::submit(model_id, image)      // runtime.cpp: rejects image.device != Cpu
+  -> models_.get(id)                  // CUDA-loaded ModelInstance
+  -> model->execution_resource()       // == cuda:N (valid)  -> lane registered
+  -> RequestQueue::push                // InferenceRequest::adopt_cpu_pixels(): device stays Cpu
+  -> DynamicBatchAggregator            // CUDA forced batch_size=1 (unchanged)
+  -> dispatch_batch: resource=cuda:N   // routed into the cuda:N lane
+  -> ExecutionResourceManager::pop()   // acquires 1 permit, records per_resource_admissions["cuda:N"]
+  -> execute_batch -> ModelInstance::infer(cpu_image)
+       -> InferenceEngine::infer -> preprocess(image)  // preprocess.cpp, uses engine device_ (Cuda)
+            -> ImagePreprocessor::execute(cpu_image, cuda_device)  // preprocess.cpp:284
+                 THROW InvalidArgument "image device cpu does not match execution device cuda"
+  -> promise set_exception -> permit released (ResourceLease dtor) -> future.get() throws
+```
+
+**Why a CPU `ImageInput` cannot reach the CUDA backend today (Conclusion B):**
+
+1. `Runtime::submit()` accepts only `image.device == Cpu` (Phase 9.2.2.3).
+2. `adopt_cpu_pixels()` keeps `image.device == Cpu` (it never moves pixels to device).
+3. `InferenceEngine::infer()` preprocesses with the engine's committed `device_`
+   (CUDA), and `ImagePreprocessor::execute()` **requires** `image.device == device.device()`
+   and throws otherwise (`src/preprocess/preprocess.cpp:284`).
+4. `preprocess_cuda()` additionally assumes the image is *already on device*
+   ("H2D cost stays outside this function", `src/preprocess/preprocess_cuda.cu:109`).
+
+So the only missing step is a Runtime-owned H2D copy plus a device-buffer lifetime
+manager. Introducing it would mean a **new CUDA buffer-ownership system inside
+`InferenceRequest`/`Runtime`** — exactly what Phase 9.2.2.3 declined and Phase 9.3.1
+scoped out. It is therefore left as future work, and this audit does **not** change
+the CUDA raw-device-pointer rejection.
+
+**What this means for the scheduler**: `submit()` of a *CPU* image to a *CUDA* model
+still enqueues and is admitted to the `cuda:N` lane (an admission *is* recorded), so
+the cross-resource routing and the permit acquire/release lifecycle are exercised on
+a genuine CUDA resource lane even though the inference itself fails at the
+preprocess boundary. This is the point Phase 9.3 could only prove at unit level;
+Phase 9.3.1 proves it end-to-end through `Runtime::submit()` with a real
+CUDA-loaded model.
+
+**Terminology guardrail**: *CUDA `ImageInput` is not accepted by `submit()`* ≠ *CUDA
+backends cannot be scheduled*. The scheduler fully supports CUDA resources and lanes;
+what is not yet supported is feeding the CUDA backend through the **async** input path.
+The **synchronous** CUDA path (`ModelInstance::infer`/`infer_batch` with a caller-owned
+on-device image) is fully supported and is what executes the real CUDA EP.
+
+**Runtime permit vs GPU kernel concurrency (unchanged)**: the `cuda_max_concurrent_per_device`
+= 1 gate is a Runtime admission limit, not a GPU kernel-stream guarantee. It is proven
+by the manager-level tests (`CudaCapEnforcedSerializesSameDevice`, max active permit == 1;
+`DifferentCudaDevicesAreIndependent`; `LeaseReleasesOnException`) plus the new Build-D
+runtime tests below. The public Runtime surface exposes resource admissions
+(`per_resource_admissions`), not live permit counts; the authoritative permit-count
+assertions therefore stay at the manager level.
+
+**Real-CUDA test coverage added in Phase 9.3.1** (`test_execution_scheduling.cpp`,
+Section 4, compiled only under `VIE_HAS_ONNXRUNTIME_CUDA`):
+- `LoadedCudaModelReportsCudaResource` — a real CUDA-loaded model reports `cuda:0`.
+- `CudaBackendExecutesSynchronouslyOnRealGpu` — a genuine on-device image runs through
+  the CUDA-configured engine and returns a result tagged `execution_device == Cuda`
+  (proves the CUDA path really executes; the strict "every node on CUDAExecutionProvider"
+  guarantee is the `identity.onnx` backend test — `yolov8n` loads with
+  `cuda_cpu_ep_fallback=true` because a few memcpy nodes are CPU-assigned).
+- `CudaModelCpuImageIsRoutedToCudaLaneAndReleasesPermit` — the async boundary: a CPU
+  image on a CUDA model is admitted to `cuda:0`, fails at preprocess, and its permit is
+  released without hanging (`failed_requests >= 1`, `per_resource_admissions["cuda:0"] >= 1`).
+- `CpuAndCudaLanesAreIndependentInRuntime` — CPU work completes while a real CUDA lane
+  is present, and both `cpu` and `cuda:0` admissions are recorded.
+
+The CUDA `ImageInput` rejection itself is unchanged and still regression-tested
+(`CudaInputSubmitStillRejected`, `PreprocessBatchCuda.CudaRejectsHostImageInputs`).
 
 ### RuntimeConfig
 
