@@ -66,6 +66,12 @@ Wraps a single `InferenceEngine` with thread-safe access and automatic metrics r
 - Automatically records inference timing and success/failure
 - Exposes all `InferenceEngine` infer methods
 - Thread-safe preprocess and execute
+- **Phase 9.3.2**: `infer_async()` / `infer_batch_async()` are the async-only
+  execution boundary used by `Runtime::submit()`'s worker. On a CUDA instance fed
+  a Runtime-owned CPU image they perform a `CudaInputBuffer`-owned H2D before
+  inference; otherwise (CPU instances, already-on-device images, and all
+  synchronous `infer()`/`infer_batch()` callers) they behave exactly like the
+  synchronous methods. The synchronous APIs are unchanged.
 
 **Usage**:
 ```cpp
@@ -189,7 +195,7 @@ auto f2 = runtime.submit("det", image2);
 
 **Migrating existing CUDA async callers**: submit work through `Runtime::thread_pool().submit([model, image]{ return model->infer(image); })` instead — this keeps the call fully synchronous from `Runtime`'s RequestQueue/aggregator/batch-worker pipeline's point of view, so the caller's own buffer-lifetime discipline (holding the CUDA buffer alive until `future.get()`) remains the single, explicit contract, exactly as before this phase.
 
-**Does a *CPU* `ImageInput` reach a *CUDA* model through async `submit()`?** Not in the current build. `submit()` still enqueues the request and the Phase 9.3 scheduler still routes it into the model's `cuda:N` lane and grants a permit, but execution fails at `ImagePreprocessor::execute()` which rejects a CPU image against a CUDA device — the async path has no Runtime-owned H2D step. This is a scheduling-adjacent **input-ownership** boundary, not a scheduler limitation; see "CUDA Runtime Scheduling Integration Audit (Phase 9.3.1)" below for the traced call chain and tests.
+**Does a *CPU* `ImageInput` reach a *CUDA* model through async `submit()`?** **Yes, as of Phase 9.3.2.** `submit()` still enqueues the CPU image and the Phase 9.3 scheduler still routes it into the model's `cuda:N` lane and grants a permit; the async execution worker (`ModelInstance::infer_async()`) now performs a **Runtime-owned H2D** into a `CudaInputBuffer` before preprocess, so the CUDA backend executes and returns a real result. This does **not** change the row above: an *external* CUDA `ImageInput` is still rejected at `submit()` — only the pixels `Runtime` deep-copied at submit are ever uploaded. See "CPU-to-CUDA Input Staging (Phase 9.3.2)" and the traced Phase 9.3.1 call chain below.
 
 **Known limitation**: two timing-based multi-model concurrency tests (`MultiModelConcurrencyTest.DifferentModelsExecuteInParallel`, `RuntimeConcurrencySemanticsTest.DifferentModelsHaveOverlappingExecution`) remain conditionally skipped in the ORT-CUDA (Build D) configuration only — the ONNX Runtime CUDA Execution Provider serializes inference through a single CUDA stream, making wall-clock overlap assertions unreliable in that build. Mock-backend concurrency tests (which do not depend on real GPU timing) continue to run and prove scheduling parallelism in every build.
 
@@ -443,6 +449,86 @@ Section 4, compiled only under `VIE_HAS_ONNXRUNTIME_CUDA`):
 
 The CUDA `ImageInput` rejection itself is unchanged and still regression-tested
 (`CudaInputSubmitStillRejected`, `PreprocessBatchCuda.CudaRejectsHostImageInputs`).
+
+### CPU-to-CUDA Input Staging (Phase 9.3.2)
+
+Phase 9.3.2 closes the single gap Phase 9.3.1 identified: it adds a **Runtime-owned
+H2D step** so a CPU `ImageInput` can now drive a CUDA `ModelInstance` through the
+**asynchronous** `submit()` path to a real result. It does **not** relax the
+external-CUDA-`ImageInput` ban and does **not** change the synchronous APIs.
+
+**Where staging lives.** A new async-only boundary, `ModelInstance::infer_async()` /
+`infer_batch_async()` (called only by `Runtime`'s execution worker via
+`execute_batch()`), performs the upload. When the instance's committed engine device
+is CUDA and the incoming image is a Runtime-owned CPU image, it uploads the pixels
+to the device and runs the unchanged synchronous `InferenceEngine::infer()` on the
+staged image. The plain synchronous `infer()`/`infer_batch()` still require the image
+device to match the engine device and never stage — so `ModelInstance::infer()` /
+`InferenceEngine::infer()` semantics are untouched (§1.2). CPU instances do no staging.
+
+**Ownership and lifetime.** `CudaInputBuffer` (`include/vie/runtime/cuda_input_staging.hpp`,
+`src/runtime/cuda_input_staging.cpp`) is a move-only RAII owner of exactly one staged
+input. Internally it reuses the existing device-memory facility: `Tensor::from_host()`
+allocates a `cudaMalloc` buffer via `TensorStorage`, issues a **stream-ordered H2D on
+the engine's own `DeviceContext` stream** (`cudaMemcpyAsync` + `cudaStreamSynchronize`),
+and returns a `Tensor` whose `shared_ptr<TensorStorage>` `cudaFree`s the memory on
+destruction. No raw device pointer is ever the sole owner, and none is handed to the
+caller. Because `InferenceEngine::infer()` is host-synchronous (the backend/D2H
+complete before it returns), the buffer is held for the whole
+`staging → preprocess → backend → decoder → D2H` span by the local `CudaInputBuffer`
+in `infer_async()`; it is freed on normal return **and** on every exception path via
+RAII (§4/§6.4). CUDA Batch stays **1** (the aggregator still forces size 1 upstream);
+`infer_batch_async()` stages each image into its **own** buffer, never shared.
+
+**Sizing/validation.** `cuda_stage_byte_count()` is CUDA-free and computes the exact
+transfer span from the validated image layout — `row_bytes = row_stride_bytes ?:
+width*channels*dtype_size`, `total = row_bytes*height` — with checked multiplies and
+rejects of null data, non-positive dimensions, unsupported dtype, and a stride smaller
+than one packed row, plus integer-overflow detection. It never uses an unvalidated
+`width*height*channels`. `CudaInputBuffer::stage()` reuses the same row layout that
+`InferenceRequest::adopt_cpu_pixels()` produced at submit, so the on-device image
+keeps width/height/channels/pixel-format/row-stride identical to the source and is
+tagged `device == Cuda` (never a CPU pointer mislabeled as CUDA).
+
+**Stream order.** The H2D runs on the engine's committed stream and is synchronized
+before `stage()` returns; the subsequent preprocess/backend work is issued on the same
+stream, so ordering is guaranteed by stream order plus the synchronous upload, with no
+extra global `cudaDeviceSynchronize` introduced by the staging layer (§3.3, §7).
+
+**Why external CUDA `ImageInput` is still rejected.** The `submit()`-time ban
+(`image.device != Cpu` → `ErrorCode::Unsupported`, §6.3/§12.1) survives: an external
+bare device pointer has no provable ownership across the unbounded queue delay. Only
+pixels the Runtime itself deep-copied at submit are ever uploaded, so there is no
+GPU-side use-after-free. This is a different input path and is kept distinct.
+
+**CPU-only build isolation (§8).** `cuda_input_staging.hpp`/`.cpp` include no CUDA
+headers; they build only on `Tensor`/`DeviceContext`/`ImageInput`. In Build A/B
+(CUDA OFF) the engine can never report a CUDA device, so `infer_async()` takes the
+plain synchronous path and `stage()` is unreachable. Verified at **link** level: the
+CPU-only `libvie.a`/`vie_tests` contain no raw CUDA runtime symbols (`cudaMalloc`/
+`cudaMemcpy`/…), and `ldd` shows no CUDA libraries; the CUDA allocation entry points
+are the existing CPU-only stubs that throw `Unsupported`.
+
+**Real-CUDA test coverage added in Phase 9.3.2** (`test_execution_scheduling.cpp`):
+- CPU-only (`CudaInputStagingUnitTest`, all builds): byte-count layout/stride,
+  overflow, non-positive/unknown-dtype/null rejection, and the move-only/empty
+  ownership contract.
+- Build D (`CudaSchedulingRuntimeTest`):
+  - `AsyncCpuImageDrivesRealCudaDetectionNonEmpty` — **the core A1/A3 proof**: a
+    real bus.ppm submitted to a CUDA `yolov8n` returns a **non-empty** detection
+    set through the async path with `execution_device == Cuda` (no silent CPU
+    fallback).
+  - `CudaModelCpuImageIsStagedAndSucceedsAsync` / `CpuAndCudaLanesAreIndependentInRuntime`
+    — the Phase 9.3.1 failure assertions are now **success** assertions
+    (`failed_requests == 0`, permit admitted on `cuda:0`).
+  - `MutatingSourceAfterSubmitDoesNotChangeResult` / `FreeingSourceAfterSubmitStillSucceeds`
+    — §9.4 ownership: the deep copy at submit, not the caller buffer, feeds staging.
+  - `CudaInputBufferStagesAndCopiesExactly` (H2D byte-for-byte round-trip),
+    `...MovePreservesOwnership`, `...RejectsNonCpuSource`,
+    `...RepeatedStageFreesWithoutLeak` — §9.2 buffer semantics.
+  - `StagingFailureRejectsFutureAndLaterRequestSucceeds` — §9.5 exception path.
+  - `ConcurrentCudaRequestsDoNotShareInputBuffer` — §9.6 (each request decodes its
+    own staged copy).
 
 ### RuntimeConfig
 

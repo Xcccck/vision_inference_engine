@@ -11,6 +11,7 @@
 
 #include "vie/core/device_context.hpp"
 #include "vie/core/error.hpp"
+#include "vie/runtime/cuda_input_staging.hpp"
 #include "vie/runtime/dynamic_batch_aggregator.hpp"
 #include "vie/runtime/execution_resource.hpp"
 #include "vie/runtime/execution_resource_manager.hpp"
@@ -21,13 +22,24 @@
 #include "vie/runtime/runtime_metrics.hpp"
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <vector>
+
+#include "vie/preprocess/image_input.hpp"
 
 #if defined(VIE_HAS_ONNXRUNTIME_CUDA)
 #include <cuda_runtime.h>
@@ -98,6 +110,107 @@ TEST(ExecutionResourceTest, DefaultEngineGivesCpuNeverUnknown) {
   DeviceContext def;
   EXPECT_EQ(def.device(), DeviceType::Cpu);
   EXPECT_EQ(execution_resource_from_device(def).type, ExecutionResourceType::Cpu);
+}
+
+// =============================================================================
+// 1b. CUDA input staging size/layout checks (Phase 9.3.2, §9.1 CPU-only).
+//
+// cuda_stage_byte_count() is CUDA-free and allocation-free, so these size /
+// stride / overflow rules are proven in every build (A/B/C/D) without a GPU.
+// They are the single source of truth CudaInputBuffer::stage() uses to size the
+// H2D transfer, so validating them here covers the CPU-side half of the staging
+// contract even where no CUDA runtime is linked.
+// =============================================================================
+
+namespace {
+ImageInput make_stage_image(int w, int h, int c, std::vector<std::uint8_t>& storage,
+                            std::size_t row_stride = 0) {
+  const std::size_t pitch = row_stride != 0 ? row_stride : static_cast<std::size_t>(w) * c;
+  storage.resize(pitch * static_cast<std::size_t>(h), 7);
+  ImageInput img;
+  img.data = storage.data();
+  img.width = w;
+  img.height = h;
+  img.channels = c;
+  img.dtype = DataType::Uint8;
+  img.row_stride_bytes = row_stride;
+  img.device = DeviceType::Cpu;
+  return img;
+}
+}  // namespace
+
+TEST(CudaInputStagingUnitTest, TightRowByteCountMatchesWidthHeightChannels) {
+  std::vector<std::uint8_t> storage;
+  ImageInput img = make_stage_image(64, 32, 3, storage);
+  // No explicit stride -> width*channels*height, dtype Uint8 (1 byte).
+  EXPECT_EQ(cuda_stage_byte_count(img), 64u * 3u * 32u);
+}
+
+TEST(CudaInputStagingUnitTest, ExplicitRowStrideIsHonored) {
+  std::vector<std::uint8_t> storage;
+  // Padded rows: pitch 256 > packed 64*3=192, so bytes = pitch*height.
+  ImageInput img = make_stage_image(64, 32, 3, storage, /*row_stride=*/256);
+  EXPECT_EQ(cuda_stage_byte_count(img), 256u * 32u);
+}
+
+TEST(CudaInputStagingUnitTest, StrideSmallerThanPackedRowThrows) {
+  std::vector<std::uint8_t> storage;
+  ImageInput img = make_stage_image(64, 32, 3, storage, /*row_stride=*/100);
+  EXPECT_THROW(cuda_stage_byte_count(img), VieError);
+}
+
+TEST(CudaInputStagingUnitTest, NullDataThrows) {
+  ImageInput img;
+  img.width = 8;
+  img.height = 8;
+  img.channels = 3;
+  img.dtype = DataType::Uint8;
+  img.data = nullptr;
+  EXPECT_THROW(cuda_stage_byte_count(img), VieError);
+}
+
+TEST(CudaInputStagingUnitTest, NonPositiveDimensionsThrow) {
+  std::vector<std::uint8_t> storage;
+  EXPECT_THROW(cuda_stage_byte_count(make_stage_image(0, 8, 3, storage)), VieError);
+  EXPECT_THROW(cuda_stage_byte_count(make_stage_image(8, 0, 3, storage)), VieError);
+  EXPECT_THROW(cuda_stage_byte_count(make_stage_image(8, 8, 0, storage)), VieError);
+  // A negative dimension cannot be built through the storage-backed helper (the
+  // allocation itself would be malformed), so describe the image directly.
+  ImageInput negative;
+  negative.data = storage.data();  // non-null
+  negative.width = -4;
+  negative.height = 8;
+  negative.channels = 3;
+  negative.dtype = DataType::Uint8;
+  EXPECT_THROW(cuda_stage_byte_count(negative), VieError);
+}
+
+TEST(CudaInputStagingUnitTest, UnsupportedDtypeThrows) {
+  std::vector<std::uint8_t> storage;
+  ImageInput img = make_stage_image(8, 8, 3, storage);
+  img.dtype = DataType::Unknown;
+  EXPECT_THROW(cuda_stage_byte_count(img), VieError);
+}
+
+TEST(CudaInputStagingUnitTest, DimensionOverflowThrows) {
+  std::vector<std::uint8_t> storage;
+  ImageInput img = make_stage_image(8, 8, 3, storage);
+  // An explicit row stride near SIZE_MAX times any height > 1 must overflow the
+  // final row_bytes*height multiply rather than wrap silently.
+  img.row_stride_bytes = std::numeric_limits<std::size_t>::max() - 1;
+  img.height = 2;
+  EXPECT_THROW(cuda_stage_byte_count(img), VieError);
+}
+
+TEST(CudaInputStagingUnitTest, BufferIsMoveOnlyAndDefaultEmpty) {
+  // Ownership contract: never copyable, movable, and a default buffer is empty.
+  static_assert(!std::is_copy_constructible<CudaInputBuffer>::value, "must not be copyable");
+  static_assert(!std::is_copy_assignable<CudaInputBuffer>::value, "must not be copy-assignable");
+  static_assert(std::is_move_constructible<CudaInputBuffer>::value, "must be move-constructible");
+  static_assert(std::is_move_assignable<CudaInputBuffer>::value, "must be move-assignable");
+  CudaInputBuffer empty;
+  EXPECT_FALSE(empty.valid());
+  EXPECT_EQ(empty.device_bytes(), 0u);
 }
 
 // =============================================================================
@@ -486,23 +599,21 @@ TEST_F(ExecutionSchedulingRuntimeTest, CudaInputSubmitStillRejected) {
 }
 
 // =============================================================================
-// 4. Real CUDA Runtime scheduling integration (Build D only).
+// 4. Real CUDA Runtime scheduling + input staging integration (Build D only).
 //
-// Phase 9.3.1 audit result (Conclusion B): a CUDA-loaded ModelInstance's
-// execution resource IS cuda:N, and the scheduler DOES route its batches into
-// the CUDA lane and grant/release exactly one permit. But the current async
-// pipeline cannot drive the CUDA backend to *success*: Runtime::submit()
-// accepts only CPU ImageInput (Phase 9.2.2.3), the request keeps image.device
-// == Cpu (adopt_cpu_pixels), and ImagePreprocessor::execute rejects a CPU
-// image against a CUDA execution device ("H2D stays outside preprocess"). So
-// an async CUDA batch is admitted to the cuda lane, fails at the preprocess
-// boundary, and its permit is released during unwinding.
+// Phase 9.3.1 established Conclusion B: the scheduler routed a CPU-image batch
+// to the real cuda:N lane and released the permit, but execution FAILED at the
+// preprocess boundary because a CPU image was handed to a CUDA engine (no H2D).
 //
-// These tests verify that SCHEDULER integration on a genuine CUDA resource
-// lane plus the boundary itself. The CUDA backend's real execution is proven
-// separately by the synchronous inference below (a genuine on-device image),
-// not by execution_resource() alone. We deliberately do NOT claim a successful
-// async CUDA inference.
+// Phase 9.3.2 closes that gap. ModelInstance::infer_async()/infer_batch_async()
+// (used only by the async worker path) now stage the Runtime-owned CPU image
+// onto the committed CUDA device through CudaInputBuffer before calling the
+// engine. These tests prove the full asynchronous data path: a CPU ImageInput
+// submitted to Runtime drives a genuine CUDA ModelInstance to a real, non-empty
+// DetectionResult, the CUDA backend actually executes (execution_device==Cuda,
+// no silent CPU fallback), the buffer lifetime spans the call, and the permit is
+// released. The synchronous infer() API and the submit-time external-CUDA-image
+// ban are unchanged and still verified here.
 // =============================================================================
 #if defined(VIE_HAS_ONNXRUNTIME_CUDA)
 
@@ -516,6 +627,35 @@ struct DeviceBuffer {
     if (ptr != nullptr) cudaFree(ptr);
   }
 };
+
+// Loads the real COCO bus.ppm (P6, 810x1080, RGB) that yolov8n reliably
+// detects a bus in at conf>=0.25, so the async CUDA E2E can assert a NON-EMPTY
+// result rather than an empty decode on a synthetic image.
+ImageInput load_bus(std::vector<std::uint8_t>& pixels) {
+  std::ifstream image_file(vie_fixture("testdata/images/bus.ppm"), std::ios::binary);
+  std::string magic;
+  int width = 0;
+  int height = 0;
+  int max_value = 0;
+  image_file >> magic >> width >> height >> max_value;
+  image_file.get();
+  EXPECT_EQ(magic, "P6");
+  pixels.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3u);
+  image_file.read(reinterpret_cast<char*>(pixels.data()),
+                  static_cast<std::streamsize>(pixels.size()));
+  EXPECT_TRUE(image_file);
+  ImageInput image;
+  image.data = pixels.data();
+  image.width = width;
+  image.height = height;
+  image.channels = 3;
+  image.color = ColorOrder::Rgb;
+  image.layout = ImageLayout::Hwc;
+  image.dtype = DataType::Uint8;
+  image.device = DeviceType::Cpu;
+  image.device_id = 0;
+  return image;
+}
 }  // namespace
 
 // Reuses the CPU fixture's manifest/config/image builders; only the device and
@@ -571,30 +711,36 @@ TEST_F(CudaSchedulingRuntimeTest, CudaBackendExecutesSynchronouslyOnRealGpu) {
   EXPECT_EQ(batch.results[0].execution_device, DeviceType::Cuda);
 }
 
-TEST_F(CudaSchedulingRuntimeTest, CudaModelCpuImageIsRoutedToCudaLaneAndReleasesPermit) {
-  // The async boundary: submit accepts the CPU image, the scheduler admits the
-  // batch to the real cuda:0 lane, execution fails at the preprocess device
-  // mismatch, and the permit is released (no hang, future resolves).
+TEST_F(CudaSchedulingRuntimeTest, CudaModelCpuImageIsStagedAndSucceedsAsync) {
+  // Phase 9.3.2: the async boundary now stages the Runtime-owned CPU image onto
+  // cuda:0, runs the real CUDA backend, and returns a valid result. The permit
+  // is granted to the cuda lane and released, and the request is counted as a
+  // SUCCESS (no preprocess failure, as Phase 9.3.1 Conclusion B required).
   Runtime runtime(sched_config());
   runtime.models().load("cuda_det",
                         model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0));
   auto f = runtime.submit("cuda_det", cpu_image());
-  ASSERT_THROW(f.get(), VieError);  // device mismatch surfaces from preprocess
+  DetectionResult res;  // must not throw now
+  ASSERT_NO_THROW(res = f.get());
   runtime.shutdown();
 
   auto m = runtime.snapshot_metrics();
   auto it = m.per_resource_admissions.find("cuda:0");
   ASSERT_NE(it, m.per_resource_admissions.end());  // admitted to the CUDA lane
   EXPECT_GE(it->second, 1u);
-  EXPECT_GE(m.completed_requests, 1u);
-  EXPECT_GE(m.failed_requests, 1u);  // permit path finished even on failure
+  EXPECT_EQ(m.completed_requests, 1u);
+  EXPECT_EQ(m.failed_requests, 0u);  // staging fixed the preprocess rejection
+  // The result really came from the CUDA engine, not a CPU fallback.
+  EXPECT_EQ(res.original_width, 640);
+  EXPECT_EQ(res.original_height, 640);
+  EXPECT_EQ(res.execution_device, DeviceType::Cuda);
 }
 
 TEST_F(CudaSchedulingRuntimeTest, CpuAndCudaLanesAreIndependentInRuntime) {
-  // With a real CUDA lane present, CPU work must still flow: CPU futures
-  // resolve successfully, the CUDA request is admitted to its own lane and
-  // fails only at the preprocess boundary. Proves cross-resource routing and
-  // that CPU requests are not blocked behind the cuda lane.
+  // With a real CUDA lane present, CPU work must still flow and the CUDA
+  // request must now SUCCEED through staging. Proves cross-resource routing,
+  // that CPU requests are not blocked behind the cuda lane, and that neither
+  // lane's staging affects the other. All 5 requests complete, none fail.
   Runtime runtime(sched_config());
   runtime.models().load("cpu_det", model_config());
   runtime.models().load("cuda_det",
@@ -605,14 +751,377 @@ TEST_F(CudaSchedulingRuntimeTest, CpuAndCudaLanesAreIndependentInRuntime) {
   auto cuda_future = runtime.submit("cuda_det", cpu_image());
 
   for (auto& f : cpu_futures) f.get();  // succeed, not blocked by the cuda lane
-  EXPECT_THROW(cuda_future.get(), VieError);
+  DetectionResult cuda_res;
+  ASSERT_NO_THROW(cuda_res = cuda_future.get());
   runtime.shutdown();
 
+  EXPECT_EQ(cuda_res.execution_device, DeviceType::Cuda);
   auto m = runtime.snapshot_metrics();
   EXPECT_EQ(m.completed_requests, 5u);
-  EXPECT_EQ(m.failed_requests, 1u);
+  EXPECT_EQ(m.failed_requests, 0u);
   EXPECT_NE(m.per_resource_admissions.find("cpu"), m.per_resource_admissions.end());
   EXPECT_NE(m.per_resource_admissions.find("cuda:0"), m.per_resource_admissions.end());
+}
+
+// -----------------------------------------------------------------------------
+// 9.3 Real CUDA Runtime E2E: a genuine detection model returns a NON-EMPTY
+// DetectionResult through the asynchronous submit() path on a real GPU.
+// -----------------------------------------------------------------------------
+TEST_F(CudaSchedulingRuntimeTest, AsyncCpuImageDrivesRealCudaDetectionNonEmpty) {
+  Runtime runtime(sched_config());
+  runtime.models().load("cuda_det",
+                        model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0));
+
+  std::vector<std::uint8_t> pixels;
+  ImageInput bus = load_bus(pixels);
+  auto f = runtime.submit("cuda_det", bus);
+  DetectionResult res;
+  ASSERT_NO_THROW(res = f.get());
+  runtime.shutdown();
+
+  // Real bus image -> yolov8n must find the bus (matches the CPU baseline in
+  // test_integration_regression.cpp). Non-empty proves the H2D actually moved
+  // the pixels and the CUDA backend decoded them, not an empty synthetic run.
+  EXPECT_EQ(res.execution_device, DeviceType::Cuda);
+  EXPECT_EQ(res.original_width, bus.width);
+  EXPECT_EQ(res.original_height, bus.height);
+  ASSERT_FALSE(res.detections.empty());
+  EXPECT_GE(res.detections[0].confidence, 0.25f);
+
+  auto m = runtime.snapshot_metrics();
+  EXPECT_EQ(m.failed_requests, 0u);
+  EXPECT_NE(m.per_resource_admissions.find("cuda:0"), m.per_resource_admissions.end());
+}
+
+// -----------------------------------------------------------------------------
+// 9.4 Input ownership: the submit-time deep copy (not the caller buffer) feeds
+// staging, so mutating or freeing the caller image after submit is safe.
+// -----------------------------------------------------------------------------
+TEST_F(CudaSchedulingRuntimeTest, MutatingSourceAfterSubmitDoesNotChangeResult) {
+  // Test A: submit, then memset the ORIGINAL caller buffer. The deep-copied,
+  // then staged copy must be unaffected. Compare against a pristine baseline.
+  Runtime runtime(sched_config());
+  runtime.models().load("cuda_det",
+                        model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0));
+
+  std::vector<std::uint8_t> pixels;
+  ImageInput bus = load_bus(pixels);
+  auto baseline = runtime.submit("cuda_det", bus).get();
+
+  // Second submission; corrupt the caller buffer immediately after submit.
+  auto f = runtime.submit("cuda_det", bus);
+  std::memset(pixels.data(), 0, pixels.size());
+  DetectionResult res = f.get();
+  runtime.shutdown();
+
+  ASSERT_FALSE(res.detections.empty());
+  // Deep copy happened at submit, so the result must equal the untouched run.
+  ASSERT_EQ(res.detections.size(), baseline.detections.size());
+  for (std::size_t i = 0; i < res.detections.size(); ++i) {
+    EXPECT_NEAR(res.detections[i].confidence, baseline.detections[i].confidence, 1e-4);
+  }
+}
+
+TEST_F(CudaSchedulingRuntimeTest, FreeingSourceAfterSubmitStillSucceeds) {
+  // Test B: the caller pixels vector is destroyed right after submit; the async
+  // CUDA path must still succeed because Runtime owns its deep copy.
+  Runtime runtime(sched_config());
+  runtime.models().load("cuda_det",
+                        model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0));
+
+  std::future<DetectionResult> future;
+  {
+    std::vector<std::uint8_t> pixels;
+    ImageInput bus = load_bus(pixels);
+    future = runtime.submit("cuda_det", bus);
+    // pixels (and bus.data) go out of scope here.
+  }
+
+  DetectionResult res;
+  ASSERT_NO_THROW(res = future.get());
+  runtime.shutdown();
+  EXPECT_EQ(res.execution_device, DeviceType::Cuda);
+  ASSERT_FALSE(res.detections.empty());
+}
+
+// -----------------------------------------------------------------------------
+// 9.2 CUDA buffer tests (Build D): RAII allocation, H2D correctness, device
+// guard, and release with no leak across repeated staging.
+// -----------------------------------------------------------------------------
+TEST_F(CudaSchedulingRuntimeTest, CudaInputBufferStagesAndCopiesExactly) {
+  DeviceContext cuda(DeviceType::Cuda, 0);
+  std::vector<std::uint8_t> storage;
+  ImageInput img = make_stage_image(16, 8, 3, storage);
+  // Fill with a recognizable pattern to verify the H2D byte-for-byte.
+  for (std::size_t i = 0; i < storage.size(); ++i) storage[i] = static_cast<std::uint8_t>(i & 0xFF);
+
+  CudaInputBuffer buf = CudaInputBuffer::stage(img, cuda);
+  ASSERT_TRUE(buf.valid());
+  EXPECT_EQ(buf.device_bytes(), 16u * 3u * 8u);
+  EXPECT_EQ(buf.image().device, DeviceType::Cuda);
+  EXPECT_EQ(buf.image().width, 16);
+  EXPECT_EQ(buf.image().height, 8);
+  EXPECT_EQ(buf.image().channels, 3);
+
+  // Copy the staged device buffer back to host and compare to the source.
+  std::vector<std::uint8_t> roundtrip(storage.size());
+  ASSERT_EQ(cudaMemcpy(roundtrip.data(), buf.image().data, storage.size(),
+                       cudaMemcpyDeviceToHost),
+            cudaSuccess);
+  EXPECT_EQ(std::memcmp(roundtrip.data(), storage.data(), storage.size()), 0);
+}
+
+TEST_F(CudaSchedulingRuntimeTest, CudaInputBufferMovePreservesOwnership) {
+  DeviceContext cuda(DeviceType::Cuda, 0);
+  std::vector<std::uint8_t> storage;
+  ImageInput img = make_stage_image(8, 8, 3, storage);
+  CudaInputBuffer a = CudaInputBuffer::stage(img, cuda);
+  const void* ptr = a.image().data;
+  std::size_t bytes = a.device_bytes();
+
+  CudaInputBuffer b(std::move(a));  // move construction
+  EXPECT_TRUE(b.valid());
+  EXPECT_EQ(b.image().data, ptr);
+  EXPECT_EQ(b.device_bytes(), bytes);
+
+  CudaInputBuffer c;
+  c = std::move(b);  // move assignment
+  EXPECT_TRUE(c.valid());
+  EXPECT_EQ(c.image().data, ptr);
+}
+
+TEST_F(CudaSchedulingRuntimeTest, CudaInputBufferRejectsNonCpuSource) {
+  DeviceContext cuda(DeviceType::Cuda, 0);
+  ImageInput not_cpu;
+  not_cpu.device = DeviceType::Cuda;  // pretend an external device image
+  not_cpu.width = 4;
+  not_cpu.height = 4;
+  not_cpu.channels = 3;
+  not_cpu.dtype = DataType::Uint8;
+  not_cpu.data = reinterpret_cast<const void*>(0x1);  // non-null so it passes null check
+  EXPECT_THROW(CudaInputBuffer::stage(not_cpu, cuda), VieError);
+}
+
+TEST_F(CudaSchedulingRuntimeTest, CudaInputBufferRepeatedStageFreesWithoutLeak) {
+  // Allocate and release many buffers; if the RAII TensorStorage leaked the
+  // device memory the repeated cudaMalloc/cudaFree churn would error out.
+  DeviceContext cuda(DeviceType::Cuda, 0);
+  std::vector<std::uint8_t> storage;
+  ImageInput img = make_stage_image(64, 64, 3, storage);
+  for (int i = 0; i < 200; ++i) {
+    CudaInputBuffer buf = CudaInputBuffer::stage(img, cuda);
+    ASSERT_TRUE(buf.valid());
+  }
+  // Reaching here with valid() true every iteration and no throw is the check.
+  SUCCEED();
+}
+
+// -----------------------------------------------------------------------------
+// 9.5 Exception path: a malformed CPU image that passes submit() but fails at
+// the staging boundary surfaces as a future exception, releases its permit and
+// staging buffer without polluting global CUDA state, and a later valid
+// request still succeeds.
+// -----------------------------------------------------------------------------
+TEST_F(CudaSchedulingRuntimeTest, StagingFailureRejectsFutureAndLaterRequestSucceeds) {
+  Runtime runtime(sched_config());
+  runtime.models().load("cuda_det",
+                        model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0));
+
+  // A CPU image with a valid (non-null) buffer but zero width passes submit's
+  // device/model checks, then cuda_stage_byte_count rejects it inside the
+  // worker, so the failure arrives through the future, not submit().
+  std::vector<std::uint8_t> dummy(16, 3);
+  ImageInput bad;
+  bad.data = dummy.data();
+  bad.width = 0;  // invalid dimension -> staging InvalidArgument
+  bad.height = 4;
+  bad.channels = 3;
+  bad.dtype = DataType::Uint8;
+  bad.device = DeviceType::Cpu;
+
+  auto bad_future = runtime.submit("cuda_det", bad);
+  EXPECT_THROW(bad_future.get(), VieError);
+
+  // The failed request must not have poisoned the lane: a real bus image now
+  // still stages and detects.
+  std::vector<std::uint8_t> pixels;
+  ImageInput bus = load_bus(pixels);
+  DetectionResult res = runtime.submit("cuda_det", bus).get();
+  runtime.shutdown();
+
+  ASSERT_FALSE(res.detections.empty());
+  EXPECT_EQ(res.execution_device, DeviceType::Cuda);
+  auto m = runtime.snapshot_metrics();
+  EXPECT_GE(m.failed_requests, 1u);   // the staging failure was counted
+  EXPECT_GE(m.completed_requests, 1u); // the follow-up succeeded
+}
+
+// -----------------------------------------------------------------------------
+// 9.6 Concurrency: several CUDA requests on the same lane each own a distinct
+// staged buffer. Same-device permit serialization must hold, and no request may
+// observe another's input (all results equal the synchronous baseline).
+// -----------------------------------------------------------------------------
+TEST_F(CudaSchedulingRuntimeTest, ConcurrentCudaRequestsDoNotShareInputBuffer) {
+  Runtime runtime(sched_config());
+  runtime.models().load("cuda_det",
+                        model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0));
+
+  std::vector<std::uint8_t> pixels;
+  ImageInput bus = load_bus(pixels);
+  DetectionResult baseline = runtime.submit("cuda_det", bus).get();  // warm, serialized
+
+  std::vector<std::future<DetectionResult>> futures;
+  for (int i = 0; i < 6; ++i) futures.push_back(runtime.submit("cuda_det", bus));
+  std::vector<DetectionResult> results;
+  for (auto& f : futures) results.push_back(f.get());
+  runtime.shutdown();
+
+  ASSERT_FALSE(baseline.detections.empty());
+  for (const auto& res : results) {
+    EXPECT_EQ(res.execution_device, DeviceType::Cuda);
+    // Every request decoded its OWN staged copy; none borrowed another's buffer,
+    // so each matches the baseline detection set exactly.
+    EXPECT_EQ(res.detections.size(), baseline.detections.size());
+    for (std::size_t i = 0; i < res.detections.size() && i < baseline.detections.size(); ++i) {
+      EXPECT_NEAR(res.detections[i].confidence, baseline.detections[i].confidence, 1e-4);
+    }
+  }
+
+  auto m = runtime.snapshot_metrics();
+  EXPECT_EQ(m.failed_requests, 0u);
+  EXPECT_EQ(m.completed_requests, 7u);  // 1 baseline + 6 concurrent
+}
+
+// -----------------------------------------------------------------------------
+// 10. Performance reference (unified timing). Not a pass/fail gate: Phase 9.3.2
+// is correctness, not optimization. It measures three paths under one method so
+// the numbers are comparable:
+//   * sync CUDA   : ModelInstance::infer() on a caller-owned on-device image
+//                   (H2D done by the caller before timing, as the sync API does).
+//   * async CUDA  : Runtime::submit(cpu_image) -> future.get()  [includes the
+//                   Runtime-owned H2D staging + queue wait + CUDA inference].
+//   * async CPU   : Runtime::submit(cpu_image) -> future.get()  [no H2D].
+// All async timings start at submit() and end when the future resolves, exactly
+// as required; H2D and queue time are inside the async CUDA number, not excluded.
+// -----------------------------------------------------------------------------
+namespace {
+struct PerfStats {
+  double mean_ms, p50_ms, p95_ms, max_ms, throughput_rps;
+};
+PerfStats summarize(std::vector<double>& lat_ms, double wall_ms) {
+  std::sort(lat_ms.begin(), lat_ms.end());
+  PerfStats s{};
+  const std::size_t n = lat_ms.size();
+  if (n == 0) return s;
+  double sum = 0.0;
+  for (double v : lat_ms) sum += v;
+  s.mean_ms = sum / static_cast<double>(n);
+  auto rank = [&](double p) {
+    std::size_t r = static_cast<std::size_t>(std::ceil(p / 100.0 * static_cast<double>(n)));
+    if (r == 0) r = 1;
+    if (r > n) r = n;
+    return lat_ms[r - 1];
+  };
+  s.p50_ms = rank(50);
+  s.p95_ms = rank(95);
+  s.max_ms = lat_ms.back();
+  s.throughput_rps = wall_ms > 0 ? static_cast<double>(n) / (wall_ms / 1000.0) : 0.0;
+  return s;
+}
+void print_perf(const char* name, const PerfStats& s, int warmup, int requests) {
+  std::cout << "  [perf] " << name << "  warmup=" << warmup << " requests=" << requests
+            << " mean=" << std::fixed << std::setprecision(2) << s.mean_ms
+            << "ms p50=" << s.p50_ms << "ms p95=" << s.p95_ms << "ms max=" << s.max_ms
+            << "ms throughput=" << std::setprecision(1) << s.throughput_rps << " req/s\n";
+}
+}  // namespace
+
+TEST_F(CudaSchedulingRuntimeTest, PerformanceReferenceReport) {
+  constexpr int kWarmup = 10;
+  constexpr int kRequests = 50;
+  const std::size_t img_bytes = 640u * 640u * 3u;
+
+  // --- async CUDA via staging (Runtime-owned H2D included) ---
+  {
+    Runtime runtime(sched_config());
+    runtime.models().load("cuda_det",
+                          model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0));
+    std::vector<std::uint8_t> pixels;
+    ImageInput bus = load_bus(pixels);
+    for (int i = 0; i < kWarmup; ++i) runtime.submit("cuda_det", bus).get();
+    std::vector<double> lat;
+    auto wall0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kRequests; ++i) {
+      auto t0 = std::chrono::steady_clock::now();
+      runtime.submit("cuda_det", bus).get();
+      auto t1 = std::chrono::steady_clock::now();
+      lat.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    auto wall1 = std::chrono::steady_clock::now();
+    double wall = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+    std::cout << "\n=== Phase 9.3.2 CUDA staging performance reference (bus.ppm 810x1080) ===\n";
+    print_perf("async CUDA (submit->get, incl. H2D+queue)", summarize(lat, wall), kWarmup, kRequests);
+    runtime.shutdown();
+  }
+
+  // --- sync CUDA (caller-owned device buffer, no Runtime staging) ---
+  {
+    Runtime runtime(sched_config());
+    auto model = runtime.models().load(
+        "cuda_det", model_config(BackendKind::OnnxRuntimeCuda, DeviceType::Cuda, 0));
+    DeviceBuffer buf;
+    buf.host.assign(img_bytes, 127);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&buf.ptr), img_bytes), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(buf.ptr, buf.host.data(), img_bytes, cudaMemcpyHostToDevice), cudaSuccess);
+    ImageInput img;
+    img.data = buf.ptr;
+    img.width = 640;
+    img.height = 640;
+    img.channels = 3;
+    img.color = ColorOrder::Rgb;
+    img.layout = ImageLayout::Hwc;
+    img.dtype = DataType::Uint8;
+    img.device = DeviceType::Cuda;
+    img.device_id = 0;
+    for (int i = 0; i < kWarmup; ++i) model->infer(img);
+    std::vector<double> lat;
+    auto wall0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kRequests; ++i) {
+      auto t0 = std::chrono::steady_clock::now();
+      model->infer(img);
+      auto t1 = std::chrono::steady_clock::now();
+      lat.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    auto wall1 = std::chrono::steady_clock::now();
+    double wall = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+    // Note: uniform 127 fill (empty detections); this isolates the pipeline cost
+    // from decode work and is a different input than the async bus run, so the
+    // comparison is directional, not an apples-to-apples H2D delta.
+    print_perf("sync CUDA (infer, on-device, uniform fill)", summarize(lat, wall), kWarmup, kRequests);
+    runtime.shutdown();
+  }
+
+  // --- async CPU (no H2D, reference for CPU non-regression) ---
+  {
+    Runtime runtime(sched_config());
+    runtime.models().load("cpu_det", model_config());
+    std::vector<std::uint8_t> pixels;
+    ImageInput bus = load_bus(pixels);
+    for (int i = 0; i < kWarmup; ++i) runtime.submit("cpu_det", bus).get();
+    std::vector<double> lat;
+    auto wall0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kRequests; ++i) {
+      auto t0 = std::chrono::steady_clock::now();
+      runtime.submit("cpu_det", bus).get();
+      auto t1 = std::chrono::steady_clock::now();
+      lat.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    auto wall1 = std::chrono::steady_clock::now();
+    double wall = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+    print_perf("async CPU (submit->get, no H2D)", summarize(lat, wall), kWarmup, kRequests);
+    EXPECT_EQ(runtime.snapshot_metrics().failed_requests, 0u);
+    runtime.shutdown();
+  }
 }
 
 #endif  // VIE_HAS_ONNXRUNTIME_CUDA

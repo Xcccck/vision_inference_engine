@@ -144,6 +144,7 @@ add_library(vie
   src/runtime/dynamic_batch_aggregator.cpp
   src/runtime/batch_execution_queue.cpp
   src/runtime/execution_resource_manager.cpp
+  src/runtime/cuda_input_staging.cpp
   src/runtime/runtime.cpp
 )
 

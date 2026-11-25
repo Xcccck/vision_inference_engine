@@ -49,6 +49,21 @@ class ModelInstance {
   // Unsupported for batch sizes greater than one.
   DetectionBatch infer_batch(const std::vector<ImageInput>& images,
                              DetectionInferTiming* timing = nullptr);
+
+  // Phase 9.3.2: Async-only execution boundary used by Runtime::submit()'s
+  // worker path. Semantically identical to infer()/infer_batch() EXCEPT that
+  // when this instance runs on a CUDA device and the request image is a
+  // Runtime-owned CPU image (already deep-copied at submit), it first stages
+  // that CPU image onto the committed CUDA device (synchronous, stream-ordered
+  // H2D) with an owning CudaInputBuffer whose lifetime spans the whole
+  // preprocess/backend/decode call, then runs inference on the staged image.
+  // The synchronous infer()/infer_batch() APIs are intentionally left unchanged:
+  // they still require the caller's image device to match the engine device and
+  // never accept an external CUDA image through this path. CPU instances do no
+  // staging. These methods do not relax the submit-time CUDA ImageInput ban.
+  DetectionBatch infer_async(const ImageInput& image, DetectionInferTiming* timing = nullptr);
+  DetectionBatch infer_batch_async(const std::vector<ImageInput>& images,
+                                   DetectionInferTiming* timing = nullptr);
   SegmentationBatch infer_segmentation(const ImageInput& image, const SegmentationRuntimeConfig& runtime,
                                        SegmentationInferTiming* timing = nullptr);
   ClassificationBatch infer_classification(const ImageInput& image, const ClassificationRuntimeConfig& runtime,

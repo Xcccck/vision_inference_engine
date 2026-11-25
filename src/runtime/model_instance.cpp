@@ -1,6 +1,7 @@
 #include "vie/runtime/model_instance.hpp"
 
 #include "vie/core/error.hpp"
+#include "vie/runtime/cuda_input_staging.hpp"
 
 #include <chrono>
 
@@ -59,6 +60,56 @@ DetectionBatch ModelInstance::infer_batch(const std::vector<ImageInput>& images,
                                           DetectionInferTiming* timing) {
   std::lock_guard<std::mutex> lock(mutex_);
   InferenceGuard guard(metrics_, id_);
+  auto result = engine_.infer_batch(images, timing);
+  guard.set_success(true);
+  return result;
+}
+
+// Phase 9.3.2: async-only staging boundary. Only CUDA instances feeding on a
+// Runtime-owned CPU image perform an H2D; the owned CudaInputBuffer lives for
+// the whole engine_.infer() call (staging -> preprocess -> backend -> decoder
+// -> D2H), which is host-synchronous, so the device input is never freed while
+// still in use and is freed on every exception path via RAII. CPU instances and
+// already-on-device images take the identical synchronous path as before.
+DetectionBatch ModelInstance::infer_async(const ImageInput& image, DetectionInferTiming* timing) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  InferenceGuard guard(metrics_, id_);
+  const DeviceContext& dev = engine_.device();
+  if (dev.device() == DeviceType::Cuda && image.device == DeviceType::Cpu) {
+    CudaInputBuffer staged = CudaInputBuffer::stage(image, dev);
+    auto result = engine_.infer(staged.image(), timing);
+    guard.set_success(true);
+    return result;
+  }
+  auto result = engine_.infer(image, timing);
+  guard.set_success(true);
+  return result;
+}
+
+DetectionBatch ModelInstance::infer_batch_async(const std::vector<ImageInput>& images,
+                                                DetectionInferTiming* timing) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  InferenceGuard guard(metrics_, id_);
+  const DeviceContext& dev = engine_.device();
+  if (dev.device() == DeviceType::Cuda) {
+    // CUDA stays Batch=1 upstream, but stage defensively: each request gets its
+    // OWN device buffer (never shared across requests), held alive for the call.
+    std::vector<CudaInputBuffer> buffers;
+    buffers.reserve(images.size());
+    std::vector<ImageInput> staged_images;
+    staged_images.reserve(images.size());
+    for (const auto& img : images) {
+      if (img.device == DeviceType::Cpu) {
+        buffers.push_back(CudaInputBuffer::stage(img, dev));
+        staged_images.push_back(buffers.back().image());
+      } else {
+        staged_images.push_back(img);
+      }
+    }
+    auto result = engine_.infer_batch(staged_images, timing);
+    guard.set_success(true);
+    return result;
+  }
   auto result = engine_.infer_batch(images, timing);
   guard.set_success(true);
   return result;

@@ -333,14 +333,17 @@ void Runtime::execute_batch(BatchWorkItem& batch) {
       images.push_back(req.image);
     }
 
-    // Execute inference: use infer() for batch_size=1 (compatible with
-    // fixed-batch models), infer_batch() for batch_size>1 (requires
-    // dynamic batch model).
+    // Execute inference: use the async staging boundary. batch_size==1 goes
+    // through infer_async() (compatible with fixed-batch models and, for CUDA
+    // instances, performs the Runtime-owned CPU->CUDA H2D staging); batch_size>1
+    // goes through infer_batch_async() (dynamic-batch CPU models; CUDA is
+    // forced to size 1 upstream). CPU models take the unchanged synchronous
+    // path inside these methods.
     if (batch_size == 1) {
-      result = batch.model->infer(images[0]);
+      result = batch.model->infer_async(images[0]);
       metrics_->record_single_infer();
     } else {
-      result = batch.model->infer_batch(images);
+      result = batch.model->infer_batch_async(images);
     }
 
     // Validate result count matches batch size
