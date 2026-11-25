@@ -136,12 +136,21 @@ TEST(OrtProfileParserTest, MemcpyWithoutProviderCountsNothing) {
   EXPECT_EQ(stats.transfer_events, 0u);
 }
 
-TEST(OrtProfileParserTest, MissingArgsIsNotANode) {
+TEST(OrtProfileParserTest, NodeEventMissingArgsIsUnknownAndIncomplete) {
+  // A Node-category event with no args (hence no provider) is an executed node
+  // we cannot attribute: it is kept as Unknown, never guessed as CPU/CUDA, and
+  // marks the profile incomplete (§5.2, §5.5). Kernel_time events that DO carry
+  // a provider are the real executed nodes; a bare kernel_time without one is a
+  // truncated/unattributable record.
   auto stats = parse_ort_profile_string(array_trace({
       R"({"cat":"Node","name":"/a/Op_kernel_time","ph":"X","dur":10})",
   }));
   EXPECT_EQ(stats.total_trace_events, 1u);
-  EXPECT_EQ(stats.total_node_events, 0u);
+  EXPECT_EQ(stats.total_node_events, 1u);
+  EXPECT_EQ(stats.unknown_provider_events, 1u);
+  EXPECT_EQ(stats.cuda_node_events, 0u);
+  EXPECT_EQ(stats.cpu_node_events, 0u);
+  EXPECT_TRUE(stats.incomplete);
 }
 
 TEST(OrtProfileParserTest, EmptyProfileYieldsZeroStats) {
@@ -201,6 +210,43 @@ TEST(OrtProfileParserTest, RealisticMixedTraceMatchesYolov8Shape) {
   EXPECT_EQ(stats.transfer_events, 2u);   // two memcpy
   EXPECT_EQ(stats.unknown_provider_events, 0u);
   EXPECT_EQ(stats.total_node_events, 5u);
+}
+
+TEST(OrtProfileParserTest, CategoryTalliesRawEvents) {
+  // category_* counts every raw event by "cat", independent of provider
+  // attribution: fences are Node-cat events even though they are not counted
+  // as executed nodes (§5.2, §6).
+  auto stats = parse_ort_profile_string(array_trace({kSession, kFence, kCudaConv}));
+  EXPECT_EQ(stats.category_node_events, 2u);  // fence + kernel_time (both cat Node)
+  EXPECT_EQ(stats.category_session_events, 1u);
+  EXPECT_EQ(stats.category_threadpool_events, 0u);
+  EXPECT_EQ(stats.total_node_events, 1u);     // only the kernel_time is an executed node
+}
+
+TEST(OrtProfileParserTest, ThreadMemcpyOtherCategoriesCounted) {
+  auto stats = parse_ort_profile_string(array_trace({
+      R"({"cat":"Threads","name":"t0","ph":"X"})",
+      R"({"cat":"Memcpy","name":"copy1","ph":"X"})",
+      R"({"cat":"GraphTransformations","name":"gt","ph":"X"})",
+  }));
+  EXPECT_EQ(stats.category_threadpool_events, 1u);  // "Threads" contains "thread"
+  EXPECT_EQ(stats.category_memcpy_events, 1u);
+  EXPECT_EQ(stats.category_other_events, 1u);
+  EXPECT_EQ(stats.total_node_events, 0u);           // none are executed nodes
+  EXPECT_FALSE(stats.incomplete);
+}
+
+TEST(OrtProfileParserTest, CompleteProfileIsNotIncomplete) {
+  auto stats = parse_ort_profile_string(array_trace({kCudaConv, kCpuResize, kMemcpyToHost}));
+  EXPECT_FALSE(stats.incomplete);
+  EXPECT_EQ(stats.unknown_provider_events, 0u);
+}
+
+TEST(OrtProfileParserTest, ParserLeavesOriginalOnnxNodesUnknown) {
+  // The parser never fabricates the original graph size; an ORT profile has none.
+  auto stats = parse_ort_profile_string(array_trace({kCudaConv}));
+  EXPECT_FALSE(stats.original_onnx_nodes_known);
+  EXPECT_EQ(stats.original_onnx_nodes, 0u);
 }
 
 TEST(OrtProfileParserTest, ParseFileReadsFromDisk) {

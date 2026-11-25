@@ -68,6 +68,33 @@ std::string base_node_name(const std::string& name) {
   return name;
 }
 
+// True when the trace event name ends with the given suffix.
+bool ends_with(const std::string& value, const char* suffix) {
+  const std::string s(suffix);
+  return value.size() >= s.size() && value.compare(value.size() - s.size(), s.size(), s) == 0;
+}
+
+// *_fence_before/_fence_after are per-node timing markers, not separate nodes.
+bool is_fence(const std::string& name) {
+  return ends_with(name, "_fence_before") || ends_with(name, "_fence_after");
+}
+
+// Tallies a raw trace event into the category buckets used by the CLI Events
+// block (§5.2, §6). Classification is by the "cat" string only and never
+// infers a provider. Order matters: Session/ThreadPool/Memcpy match before Node.
+void tally_category(OrtProfileStats& stats, const std::string& cat) {
+  if (cat.empty()) {
+    ++stats.category_unknown_events;
+    return;
+  }
+  if (contains_ci(cat, "session")) ++stats.category_session_events;
+  else if (contains_ci(cat, "thread")) ++stats.category_threadpool_events;
+  else if (contains_ci(cat, "memcpy") || contains_ci(cat, "transfer") || contains_ci(cat, "copy"))
+    ++stats.category_memcpy_events;
+  else if (contains_ci(cat, "node")) ++stats.category_node_events;
+  else ++stats.category_other_events;
+}
+
 }  // namespace
 
 OrtProviderClass classify_ort_provider(const std::string& provider) {
@@ -107,52 +134,83 @@ OrtProfileStats parse_ort_profile_string(std::string_view json_text) {
   std::set<std::string> unique_memcpy;
 
   for (const json& ev : *events) {
-    if (!ev.is_object()) continue;
+    if (!ev.is_object()) {
+      ++stats.category_unknown_events;  // a non-object entry is unclassifiable
+      continue;
+    }
     ++stats.total_trace_events;
     std::string cat = get_string(ev, "cat");
     if (cat.empty()) cat = get_string(ev, "category");
     const std::string name = get_string(ev, "name");
+
+    // Raw category tally, independent of provider attribution (§5.2, §6).
+    tally_category(stats, cat);
 
     const auto args_it = ev.find("args");
     const bool has_args = args_it != ev.end() && args_it->is_object();
     const bool has_provider =
         has_args && args_it->find("provider") != args_it->end() && (*args_it)["provider"].is_string();
 
-    // The only events ORT tags with args.provider are the per-node kernel_time
-    // events. Every other event (Session init, the *_fence_before/_fence_after
-    // markers, thread metadata) has no provider and is NOT an executed node, so
-    // it is skipped rather than guessed at (§5.1, A7).
-    if (!has_provider) continue;
+    if (has_provider) {
+      // The only events ORT tags with args.provider are the per-node kernel_time
+      // events: this is the authoritative EP placement (§5.1, A7).
+      const std::string provider = get_string(*args_it, "provider");
+      const std::string op_name = get_string(*args_it, "op_name");
 
-    const std::string provider = get_string(*args_it, "provider");
-    const std::string op_name = get_string(*args_it, "op_name");
+      OrtNodeEvent node;
+      node.name = base_node_name(name);
+      node.op_type = op_name;
+      node.provider = provider;
+      node.provider_class = classify_ort_provider(provider);
+      node.category = cat;
+      node.duration_us = get_number(ev, "dur");
 
-    OrtNodeEvent node;
-    node.name = base_node_name(name);
-    node.op_type = op_name;
-    node.provider = provider;
-    node.provider_class = classify_ort_provider(provider);
-    node.category = cat;
-    node.duration_us = get_number(ev, "dur");
+      ++stats.total_node_events;
+      switch (node.provider_class) {
+        case OrtProviderClass::Cuda: ++stats.cuda_node_events; break;
+        case OrtProviderClass::Cpu: ++stats.cpu_node_events; break;
+        case OrtProviderClass::Other: ++stats.other_provider_events; break;
+        case OrtProviderClass::Unknown: ++stats.unknown_provider_events; break;
+      }
+      // A provider key that is present but empty/unclassifiable means this
+      // executed node was not attributed -- flag the profile incomplete.
+      if (node.provider_class == OrtProviderClass::Unknown) stats.incomplete = true;
+      if (!node.name.empty()) unique_names.insert(node.name);
 
-    ++stats.total_node_events;
-    switch (node.provider_class) {
-      case OrtProviderClass::Cuda: ++stats.cuda_node_events; break;
-      case OrtProviderClass::Cpu: ++stats.cpu_node_events; break;
-      case OrtProviderClass::Other: ++stats.other_provider_events; break;
-      case OrtProviderClass::Unknown: ++stats.unknown_provider_events; break;
+      // A memcpy-family kernel_time event is both a host/device transfer and an
+      // executed node; count it in both views so "which EP runs it" and "data
+      // crossed EPs" never contradict each other (§5.4).
+      if (looks_like_memcpy(cat, name, op_name)) {
+        ++stats.transfer_events;
+        if (!node.name.empty()) unique_memcpy.insert(node.name);
+      }
+
+      stats.node_events.push_back(std::move(node));
+      continue;
     }
-    if (!node.name.empty()) unique_names.insert(node.name);
 
-    // A memcpy-family kernel_time event is both a host/device transfer and an
-    // executed node; count it in both views so "which EP runs it" and "data
-    // crossed EPs" never contradict each other (§5.4).
-    if (looks_like_memcpy(cat, name, op_name)) {
-      ++stats.transfer_events;
-      if (!node.name.empty()) unique_memcpy.insert(node.name);
+    // No provider. *_fence_before/_fence_after are timing markers of an already
+    // counted node, so they are never separate nodes and are never guessed at.
+    if (is_fence(name)) continue;
+
+    // A *_kernel_time or Node-category event that carries no provider at all is
+    // an executed node we cannot attribute. Keep it as Unknown (never inferred
+    // as CPU/CUDA) and mark the profile incomplete (§5.2, §5.5, A7).
+    const bool node_like = ends_with(name, "_kernel_time") || contains_ci(cat, "node");
+    if (node_like) {
+      OrtNodeEvent node;
+      node.name = base_node_name(name);
+      node.provider_class = OrtProviderClass::Unknown;
+      node.category = cat;
+      node.duration_us = get_number(ev, "dur");
+      ++stats.total_node_events;
+      ++stats.unknown_provider_events;
+      stats.incomplete = true;
+      if (!node.name.empty()) unique_names.insert(node.name);
+      stats.node_events.push_back(std::move(node));
     }
-
-    stats.node_events.push_back(std::move(node));
+    // Every other event (Session init, thread metadata, ...) is only counted in
+    // the category tally above, never as an executed node.
   }
 
   stats.unique_node_names = unique_names.size();

@@ -444,7 +444,9 @@ Section 4, compiled only under `VIE_HAS_ONNXRUNTIME_CUDA`):
   the CUDA-configured engine and returns a result tagged `execution_device == Cuda`
   (proves the CUDA path really executes; the strict "every node on CUDAExecutionProvider"
   guarantee is the `identity.onnx` backend test — `yolov8n` loads with
-  `cuda_cpu_ep_fallback=true` because a few memcpy nodes are CPU-assigned).
+  `cuda_cpu_ep_fallback=true` because two `Resize` nodes are placed on the CPU EP
+  while its four `Memcpy` kernels stay on CUDA; see "CUDA Execution Provider
+  Placement Verification (Phase 9.3.2.1)" for the node-level evidence).
 - `CudaModelCpuImageIsRoutedToCudaLaneAndReleasesPermit` — the async boundary: a CPU
   image on a CUDA model is admitted to `cuda:0`, fails at preprocess, and its permit is
   released without hanging (`failed_requests >= 1`, `per_resource_admissions["cuda:0"] >= 1`).
@@ -565,29 +567,74 @@ CPU, so the placement was unmeasured. Phase 9.3.2.1 closes that evidence gap wit
   normal Session is byte-for-byte identical. CPU-only builds return `""`.
 - Output is written to a configurable directory (tests use
   `std::filesystem::temp_directory_path()`), never the source tree.
+- **Lifecycle:** profiling is fixed at *session creation* (there is deliberately
+  no runtime on/off toggle, which would need unsafe concurrent control). Enable
+  = set `ort_enable_profiling` before `load`; events accrue across every
+  `Session::Run`; flush = `end_profiling()` (`EndProfilingAllocated`) which must
+  be called *before* the Session is destroyed to guarantee a complete trace. If
+  flush fails it surfaces as a `VieError`; a missing/unwritable profile is never
+  reported as success.
+- **Disable / default:** both config flags default off, so `EnableProfiling` is
+  never called, no file is produced, and `end_profiling()` returns `""`.
+- **Concurrent-session file isolation:** each enabled session gets a distinct
+  `ort_profile_prefix` (tests embed the model/id in the prefix under the temp
+  dir), and ORT appends its own pid/timestamp suffix, so two concurrently
+  profiled sessions never overwrite the same trace file (§4.2).
 
 **Parser** (`include/vie/diagnostics/ort_profile_parser.hpp`,
 `src/diagnostics/ort_profile_parser.cpp`, CUDA-free / ORT-free, built into every
 build; uses the existing `nlohmann::json` dependency internally, plain structs
 publicly). Real ORT 1.20.1 emits a **bare top-level JSON array**; each executed
 node appears as three events (`*_fence_before`, `*_kernel_time`, `*_fence_after`),
-and **only `*_kernel_time` carries `args.provider`**. Rule applied:
-- A **node event** = any event with a string `args.provider` (the authoritative
-  placement). Session/fence/thread events (no provider) are never counted as nodes.
-- Provider substring classification: contains `cuda` → CUDA, `cpu` → CPU, empty →
-  **Unknown** (never silently folded into CPU), otherwise Other.
+and **only `*_kernel_time` carries `args.provider`**. Two independent views are
+kept so nothing is conflated (§5.4):
+- **Provider view (executed nodes)** = events with a string `args.provider` (the
+  authoritative placement). `*_fence_*` markers and Session/thread events are
+  never counted as executed nodes. Provider substring classification: contains
+  `cuda` → CUDA, `cpu` → CPU, empty → **Unknown** (never silently folded into
+  CPU), otherwise Other.
+- **Category view (raw events)** = every trace entry bucketed by its `cat` field
+  (`category_node_events`, `category_session_events`, `category_threadpool_events`,
+  `category_memcpy_events`, `category_other_events`, `category_unknown_events`).
+  Because each executed node emits three Node-category events, the raw
+  `category_node_events` (537) far exceeds the executed-node count (179) — this
+  is why Profile Node Events must never be read as the original node count.
 - A **memcpy/transfer event** = a provider-carrying node whose op/name contains
   `memcpy`; it is tallied BOTH as a placed node and as a transfer, so the
   placement view and the transfer view never contradict each other.
-- Node-event count and unique-node-name count are kept separate.
+- **Incomplete profiles (§5.5):** a Node-category event that is neither a fence
+  marker nor carries a provider is an executed node we cannot attribute; it is
+  kept as `unknown_provider_events` (never guessed) and sets `incomplete = true`.
+  `unknown_provider_events > 0` ⇒ placement is at best INCONCLUSIVE.
+- **Original ONNX Nodes** are not derivable from a profile; the parser leaves
+  `original_onnx_nodes_known = false` and only the CLI/caller can supply it, so
+  the count is never fabricated (§5.4, §6).
+
+**Provider Placement auditor CLI** (`tools/vie_ort_profile_inspect.cpp`, target
+`vie_ort_profile_inspect`, built in every configuration, CPU-only — it reads an
+already-generated profile file and never loads a model, creates a Session, or
+touches CUDA): `vie_ort_profile_inspect <profile.json> [--onnx-nodes N]` prints
+the `Profile / Events / Provider Placement / Graph Information / Conclusion`
+report (§6). The `Conclusion` line distinguishes *all-CUDA*, *confirmed CPU EP
+placement*, and *INCONCLUSIVE (unknown nodes)*, and never treats a memcpy event
+as a CPU fallback. Exit code is non-zero for an unparseable file or an
+incomplete (unattributable-node) profile.
 
 **Measured results (`test_execution_scheduling.cpp`, Build D, bus.ppm 810×1080,
 async `submit()`, single graph execution, same session):**
 
-| Configuration | placed nodes | CUDA | CPU | Other | Unknown | Transfer (memcpy) |
-|---|---:|---:|---:|---:|---:|---:|
-| `yolov8n`, `cuda_cpu_ep_fallback = true` | 179 | 177 (98.88%) | 2 (1.12%) | 0 | 0 | 4 |
-| `identity.onnx`, strict CUDA (control) | ≥1 | all | 0 | 0 | 0 | 0 |
+| Configuration | placed nodes | CUDA | CPU | Other | Unknown | Transfer (memcpy) | raw Node-cat events | incomplete |
+|---|---:|---:|---:|---:|---:|---:|---:|:--:|
+| `yolov8n`, `cuda_cpu_ep_fallback = true` | 179 | 177 (98.88%) | 2 (1.12%) | 0 | 0 | 4 | 537 | no |
+| `identity.onnx`, strict CUDA (control) | ≥1 | all | 0 | 0 | 0 | 0 | ≥3 | no |
+
+- **A3 acceptance = FAIL.** The node-level evidence confirms two CPU EP nodes
+  exist for `yolov8n` while `fallback = false` cannot even create the Session.
+  Per the acceptance rule, a confirmed CPU EP Node Event means placement is NOT
+  fully CUDA — the honest verdict is FAIL, not PASS. (Total trace events 541 =
+  537 Node + 4 Session; every one of the 179 executed nodes is attributed, so
+  `unknown = 0` and `incomplete = no` — the FAIL is a genuine CPU placement, not
+  a parsing gap.)
 
 - The **only two CPU-placed nodes** are `/model.10/Resize` and `/model.13/Resize`
   (`op_type == Resize`). These — not the memcpys — are the genuine CPU fallback and
@@ -612,11 +659,15 @@ memcpy transfers. Profiling is diagnostic only; its ON timings are not product
 performance numbers, and the default production path keeps it off.
 
 **Tests added (Phase 9.3.2.1):**
-- `OrtProfileParserTest` (18, all builds): array/object roots, CUDA/CPU/Other/
+- `OrtProfileParserTest` (22, all builds): array/object roots, CUDA/CPU/Other/
   Unknown classification, fence & Session exclusion, memcpy dual tally, missing
-  args/provider, empty/invalid JSON, repeated-node vs unique-name, file I/O.
+  args/provider, empty/invalid JSON, repeated-node vs unique-name, raw category
+  tallies (Node/Thread/Memcpy/Other), provider-less Node event → Unknown +
+  `incomplete`, complete-profile → not incomplete, `original_onnx_nodes` left
+  unknown, file I/O.
 - `CudaSchedulingRuntimeTest.Yolov8nFallbackOnAsyncProfileIsCudaWithResizeFallback`
-  — the core node-level EP audit of the real async Runtime session.
+  — the core node-level EP audit of the real async Runtime session (asserts
+  `unknown == 0`, `incomplete == false`, `category_node_events > total_node_events`).
 - `...ProfilingDisabledByDefaultEmitsNoProfile` — default path unchanged.
 - `...Yolov8nStrictCudaFallbackOffFailsAtLoad` — strict failure stage + message.
 - `OnnxRuntimeCudaBackend.StrictIdentityProfilePlacesAllNodesOnCuda` — positive

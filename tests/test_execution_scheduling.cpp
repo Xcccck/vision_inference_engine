@@ -37,6 +37,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -1167,6 +1168,13 @@ void print_ort_stats(const char* label, const OrtProfileStats& s) {
             << "  unknown_provider_evts= " << s.unknown_provider_events << "\n"
             << "  transfer_events      = " << s.transfer_events << "\n"
             << "  unique_node_names    = " << s.unique_node_names << "\n"
+            << "  incomplete           = " << (s.incomplete ? "yes" : "no") << "\n"
+            << "  cat_node_events      = " << s.category_node_events << "\n"
+            << "  cat_session_events   = " << s.category_session_events << "\n"
+            << "  original_onnx_nodes  = "
+            << (s.original_onnx_nodes_known ? std::to_string(s.original_onnx_nodes)
+                                            : std::string("Not Available"))
+            << "\n"
             << "  CUDA% (of placed)    = " << std::fixed << std::setprecision(2) << cuda_pct << "%\n"
             << "  CPU%  (of placed)    = " << cpu_pct << "%\n";
   std::cout << "  -- CPU-placed nodes --\n";
@@ -1222,8 +1230,15 @@ TEST_F(CudaSchedulingRuntimeTest, Yolov8nFallbackOnAsyncProfileIsCudaWithResizeF
   // A5/A6/A7: placement is attributed for every node; none silently unknown.
   EXPECT_GT(stats.total_node_events, 100u);
   EXPECT_EQ(stats.unknown_provider_events, 0u);
+  EXPECT_FALSE(stats.incomplete) << "a real Runtime session profile must be attributable";
   EXPECT_GT(stats.cuda_node_events, 0u);
   EXPECT_GT(stats.cpu_node_events, 0u) << "fallback=ON must expose a genuine CPU fallback";
+  // A3: the confirmed CPU EP node(s) (below) are exactly why placement is NOT
+  // all-CUDA and why fallback=OFF cannot create the session -> A3 is FAIL.
+  // §5.4: raw Node-category events (fences + kernel_time + fences) strictly
+  // exceed the number of executed nodes -- never conflate the two.
+  EXPECT_GT(stats.category_node_events, stats.total_node_events)
+      << "fence markers must inflate the raw Node-cat count above executed nodes";
   // A8: exactly the four Memcpy transfer nodes.
   EXPECT_EQ(stats.transfer_events, 4u);
   EXPECT_EQ(stats.memcpy_names.size(), 4u);
