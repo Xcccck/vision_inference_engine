@@ -70,6 +70,12 @@ class ModelInstance {
                                            ClassificationInferTiming* timing = nullptr);
   ObbBatch infer_obb(const ImageInput& image, const ObbRuntimeConfig& runtime, ObbInferTiming* timing = nullptr);
   PoseBatch infer_pose(const ImageInput& image, const PoseRuntimeConfig& runtime, PoseInferTiming* timing = nullptr);
+  // Thread-safe dense semantic segmentation. Serializes on the same mutex as
+  // the other infer methods. Only task semantic_segmentation with protocol
+  // deeplabv3_semantic_seg_raw is accepted; the engine reports Unsupported
+  // otherwise. This never returns detections or instance masks.
+  SemanticSegmentationResult infer_semantic_segmentation(const ImageInput& image,
+                                                         SemanticSegmentationInferTiming* timing = nullptr);
 
   // Thread-safe preprocess
   PreprocessResult preprocess(const ImageInput& image) const;

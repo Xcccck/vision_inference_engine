@@ -862,6 +862,132 @@ JSON report), `vie_deploy_verify.cpp` (CMake target reusing the VIE engine),
 skip when no GPU/tools are present -- a skip is never a pass). Build the native
 tools with `cmake --build <build> --target vie_deploy_verify vie_ort_profile_inspect`.
 
+### Semantic Segmentation Task (Phase 9.4)
+
+Phase 9.4 introduces an independent `TaskType::SemanticSegmentation`, strictly
+distinguished from the existing `TaskType::Segmentation` (which is instance
+segmentation from YOLOv8-seg). The task turns a dense per-pixel class-logit
+tensor into a per-pixel class-id map restored to the original image grid.
+
+**Recognizer.** `Deeplabv3SemanticSegmentationRecognizer` accepts only graphs
+whose single 4-D output has (a) axis 1 in `[2, num_classes]`, (b) axes 2/3
+static and `>= 1`, (c) an axis-1 count matching a terminal 1x1 Conv weight's
+first dimension, and (d) a head path from output to Conv that walks only
+`Resize`/`Upsample` and shape/passthrough nodes. `Softmax`, `LogSoftmax`,
+`ArgMax`, or any pooling on that head path disqualifies the graph, so the
+recognizer never accepts a post-processed (already-argmaxed or already-
+softmaxed) segmentation model. SE-block `GlobalAveragePool`s live inside the
+backbone and are therefore allowed. When it also matches any other task the
+registry returns `Ambiguous`; the model name is never used as evidence.
+
+**Manifest.** Schema 1.0 gained a `semantic_segmentation` block (`output_name`,
+`channel_axis`, `logits_semantics`, `output_interpolation`,
+`class_id_interpolation`). `ManifestGenerator` fills them with Inferred/Observed
+provenance; `input.color`, `input.normalization`, `input.resize`, and
+`input.interpolation` stay Unresolved until the caller records the transform
+contract as User provenance (see `vie_semantic_verify.cpp`, which pins RGB +
+ImageNet mean/std + stretch bilinear with a User entry so
+`ensure_provenance()` accepts the manifest).
+
+**Decoder.** `SemanticSegmentationDecoder` is CPU-only. It takes
+class-logits in NCHW (`channel_axis` from the manifest), and for every
+original pixel computes `mx = ox * scale_x + geometry_model_origin_x` and
+samples each channel bilinearly. Before sampling it resizes the logits to
+the preprocessed grid bilinearly when their spatial shape differs. ArgMax
+uses a strict `>` comparison so ties resolve to the smallest class id
+deterministically. NaN / Inf inputs raise `InvalidArgument`; wrong rank,
+wrong channel count, or wrong dtype raise `InvalidArgument`; a CUDA tensor
+raises `Unsupported` (there is no CUDA decoder pretending to be CPU).
+
+**Engine.** `InferenceEngine::infer_semantic_segmentation(image, timing*)`
+follows the same shape as `infer_classification`: preprocess -> execute ->
+explicit D2H (recording `d2h_bytes` / `d2h_ms`) -> CPU decode ->
+`SemanticSegmentationResult` carrying class_ids, original width/height,
+logits width/height, num_classes, and `execution_device` (the device the
+decoder actually ran on, i.e. always Cpu). `infer()` and `infer_batch()`
+throw `Unsupported` for this task so callers cannot mistake it for
+detection. `ModelInstance::infer_semantic_segmentation` is a locked
+passthrough with the usual metrics.
+
+**Real-model E2E.** `tools/diagnostics/semantic_segmentation/vie_semantic_verify.cpp`
+recognizes `testdata/onnx/deeplabv3_mobilenet_v3_large_520_opset18.onnx` (a
+torchvision `COCO_WITH_VOC_LABELS_V1` DeepLabV3-MobileNetV3-Large exported at
+opset 18 with a fixed `1x3x520x520` input, 168 nodes, SHA256 `ba4c4376…`),
+generates and reloads the schema 1.0 manifest, then dumps the three raw
+artifacts `reference_infer.py` compares against. CUDA runs the ONNX Runtime
+CUDA EP with `cuda_cpu_ep_fallback=false` (Strict CUDA) and stages the
+input via `CudaInputBuffer` — there is no silent fallback to CPU.
+
+**ORT provider placement (Strict CUDA).** Re-running the tool with
+`--profile-prefix <path>` and feeding the Chrome trace to
+`vie_ort_profile_inspect` reports 348 node events across 2 executed
+inferences, 174 unique nodes, **0 CPU-EP nodes, 0 unknown-provider nodes,
+and 0 Memcpy events**; every executed node lands on the CUDA Execution
+Provider. The 22,713,600-byte D2H reported by the tool is a separate
+`Tensor::to(Cpu,0)` copy VIE performs before the CPU decoder, not an
+ORT-side fallback.
+
+Measured on `testdata/images/bus.ppm` (810x1080):
+
+| Lane         | preprocess | execute | d2h | decode | total | d2h bytes |
+|--------------|-----------:|--------:|----:|-------:|------:|----------:|
+| CPU (ORT)    |   11.5 ms  | 44.4 ms |  –  | 43.0 ms| 98.9 ms|   0       |
+| CUDA (ORT, strict) | 1.1 ms | 5.8 ms | ~5 ms | 51.3 ms | 58.3 ms | 22,713,600 |
+
+Numeric comparison against the torchvision reference (same transform
+contract, `F.interpolate bilinear align_corners=False` for both
+preprocess and class-map upsample):
+
+| Comparison           | preprocess MaxAbs | logits MaxAbs | logits RMSE | PixelAcc | MeanIoU |
+|----------------------|------------------:|--------------:|------------:|---------:|--------:|
+| CPU VIE vs reference |         5.6e-06   |     2.8e-05   |   4.3e-06   |  0.99785 | 0.9941  |
+| CUDA VIE vs reference|         9.5e-07   |     1.6e-02   |   2.2e-03   |  0.99784 | 0.9941  |
+| CPU vs CUDA (VIE)    |         –         |     1.6e-02   |   2.2e-03   |  0.99993 |   –     |
+
+All three lanes agree on the class histogram (background ≈ 56.5 %, bus
+≈ 31.5 %, pottedplant ≈ 11.9 %); no NaN/Inf, no out-of-range class ids,
+oor `out_of_range_ids > 0` was observed. Disagreement pixels between VIE
+and the reference are edge pixels where two logits nearly tie; the strict
+`>` tie-break is what keeps the count deterministic across runs.
+
+**Compatibility matrix (Phase 9.4).**
+
+| Configuration | Recognizer | Decoder | Engine API | Real-model verify | CUDA E2E |
+|---------------|-----------|---------|------------|-------------------|----------|
+| Build A: Mock backend, CPU       | yes (synthetic ONNX graph) | yes | yes | n/a | n/a |
+| Build B: ORT, CPU                | yes | yes | yes | PASS | n/a |
+| Build C: ORT, CUDA (strict EP)   | yes | yes (CPU-only) | yes | PASS | PASS (22.7 MB D2H) |
+| Build D: ORT, CUDA + EP fallback | allowed but discouraged | same | same | same | same |
+
+Tests: 19 new cases in `tests/test_semantic_segmentation.cpp` cover §12.1
+decoder contract, §12.2 GeometryTransform inverse (landscape / portrait /
+stretch / letterbox / odd padding / low-resolution logits), §12.3
+recognizer + manifest (synthetic `seg_graph` positive and five negative
+shapes), and §12.4 mock-engine end-to-end. Combined with the existing
+suite the CPU-only build reports 294 / 294 passing.
+
+**Scope and current limits.** Phase 9.4 delivers the first end-to-end
+semantic-segmentation lane; the following are **not** supported and are
+not silently proxied:
+
+- Only the DeepLabV3-MobileNetV3-Large representative graph is proven.
+  The recognizer may accept other graphs whose structure matches, but no
+  other model has been verified.
+- `SemanticSegmentationDecoder` is CPU-only. A CUDA decoder (GPU ArgMax,
+  fused resize) is future work.
+- `SemanticSegmentationResult` is one map per call. There is no
+  `infer_semantic_segmentation_batch()` and no async submit path for this
+  task in this phase; the `infer_batch()` entry point rejects
+  `TaskType::SemanticSegmentation` explicitly.
+- Only the `deeplabv3_semantic_seg_raw` protocol is accepted. `Softmax`ed
+  probabilities, `ArgMax`ed class id maps, or non-NCHW outputs throw
+  `Unsupported`; the recognizer does not fabricate a fallback protocol.
+
+**Tools:** `vie_semantic_verify.cpp` (CMake target, produces
+`<prefix>_input.f32 / _logits.f32 / _classids.i32 / manifest.json`),
+`reference_infer.py` (torchvision reference + numeric deltas JSON report),
+`visualize_result.py` (class-map PNG + overlay + histogram).
+
 ### RuntimeConfig
 
 ```cpp

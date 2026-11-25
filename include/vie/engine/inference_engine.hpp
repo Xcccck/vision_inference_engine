@@ -6,6 +6,7 @@
 #include "vie/decoder/decoder_registry.hpp"
 #include "vie/decoder/obb.hpp"
 #include "vie/decoder/pose.hpp"
+#include "vie/decoder/semantic_segmentation.hpp"
 #include "vie/decoder/segmentation.hpp"
 #include "vie/model/model_config.hpp"
 #include "vie/preprocess/preprocess.hpp"
@@ -126,6 +127,24 @@ struct ClassificationInferTiming {
   bool includes_d2h = false;
 };
 
+// Wall time of one infer_semantic_segmentation() call. decode_ms is d2h_ms plus
+// the decoder's validate_ms and argmax_ms. On CUDA the logits are copied D2H
+// here (d2h_bytes) before the CPU decoder runs; includes_d2h reports that.
+struct SemanticSegmentationInferTiming {
+  double preprocess_ms = 0;
+  double execute_ms = 0;
+  double d2h_ms = 0;
+  double validate_ms = 0;
+  double argmax_ms = 0;
+  double decode_ms = 0;
+  double total_ms = 0;
+  std::size_t output_bytes = 0;
+  std::size_t d2h_bytes = 0;
+  bool includes_sync = false;
+  bool includes_h2d = false;
+  bool includes_d2h = false;
+};
+
 // Wall time of one infer_segmentation() call. includes_sync is true on CUDA
 // because preprocess, the backend, and the decoder synchronize before return.
 // The caller's H2D of ImageInput and a later Mask::to_cpu() are outside this.
@@ -200,6 +219,12 @@ class InferenceEngine {
   // pose decoder and person-box NMS. Only task pose with yolov8_pose_raw is
   // accepted. Keypoints are inverse-mapped on their own, not from the box.
   PoseBatch infer_pose(const ImageInput& image, const PoseRuntimeConfig& runtime, PoseInferTiming* timing = nullptr);
+  // Preprocess, execute, explicit D2H when the output is on CUDA, then the CPU
+  // semantic segmentation decoder (ArgMax over the class axis with inverse
+  // coordinate recovery to the original image). Only task semantic_segmentation
+  // with deeplabv3_semantic_seg_raw is accepted. Returns one dense class map.
+  SemanticSegmentationResult infer_semantic_segmentation(const ImageInput& image,
+                                                         SemanticSegmentationInferTiming* timing = nullptr);
   RawPredictions decode(const BackendOutput& output) const;
   RawPredictions run(const BackendRequest& request);
 

@@ -452,6 +452,48 @@ ModelManifest ManifestGenerator::generate(const ModelAnalysisReport& report,
       }
     }
   }
+  if (selected != nullptr && selected->architecture == "deeplabv3_semantic_segmentation") {
+    const std::string because = joined_evidence(*selected);
+    if (!selected->family.empty()) {
+      manifest.model_family = selected->family;
+      put(manifest, "model_family", Certainty::Inferred, because);
+    }
+    manifest.task = TaskType::SemanticSegmentation;
+    put(manifest, "task", Certainty::Inferred, because);
+    if (selected->decoder.num_classes.has_value()) {
+      manifest.num_classes = selected->decoder.num_classes;
+      put(manifest, "num_classes", Certainty::Inferred, because);
+    }
+    if (manifest.input.shape.size() == 4 && manifest.input.shape[1] == 3) {
+      manifest.input.layout = Layout::Nchw;
+      put(manifest, "input.layout", Certainty::Inferred, "declared input axis 1 is static 3");
+    }
+    manifest.decoder.protocol = selected->decoder.protocol;
+    put(manifest, "decoder.protocol", Certainty::Inferred, because);
+    if (!selected->decoder.output_name.empty()) {
+      manifest.semantic_segmentation.output_name = selected->decoder.output_name;
+      put(manifest, "semantic_segmentation.output_name", Certainty::Observed, "declared output name");
+    }
+    if (selected->decoder.channel_axis >= 0) {
+      manifest.semantic_segmentation.channel_axis = selected->decoder.channel_axis;
+      put(manifest, "semantic_segmentation.channel_axis", Certainty::Inferred, because);
+    }
+    manifest.semantic_segmentation.logits_semantics = "per_pixel_class_logits";
+    put(manifest, "semantic_segmentation.logits_semantics", Certainty::Inferred,
+        "the head emits raw per-pixel class logits and runs no Softmax");
+    manifest.semantic_segmentation.output_interpolation = "bilinear";
+    put(manifest, "semantic_segmentation.output_interpolation", Certainty::Inferred,
+        "continuous logits are resampled to the model-input grid with bilinear interpolation");
+    manifest.semantic_segmentation.class_id_interpolation = "nearest";
+    put(manifest, "semantic_segmentation.class_id_interpolation", Certainty::Inferred,
+        "integer class ids are only ever resampled with nearest, never bilinear");
+    for (std::size_t index = 0; index < manifest.outputs.size(); ++index) {
+      if (manifest.outputs[index].name == selected->decoder.output_name) {
+        manifest.outputs[index].semantic = "semantic_logits";
+        put(manifest, "outputs." + std::to_string(index) + ".semantic", Certainty::Inferred, because);
+      }
+    }
+  }
 
   manifest.ensure_provenance();
   return manifest;

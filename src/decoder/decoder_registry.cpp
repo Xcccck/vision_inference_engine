@@ -4,6 +4,7 @@
 #include "vie/decoder/classification.hpp"
 #include "vie/decoder/obb.hpp"
 #include "vie/decoder/pose.hpp"
+#include "vie/decoder/semantic_segmentation.hpp"
 
 #include <mutex>
 
@@ -30,6 +31,11 @@ ObbBatch IModelDecoder::decode_obb(const DecoderInput&, const ObbDecodeConfig&, 
 
 PoseBatch IModelDecoder::decode_pose(const DecoderInput&, const PoseDecodeConfig&, const DeviceContext&) const {
   throw VieError(ErrorCode::Unsupported, "this decoder does not produce poses");
+}
+
+SemanticSegmentationBatch IModelDecoder::decode_semantic_segmentation(
+    const DecoderInput&, const SemanticSegmentationDecodeRequest&, const DeviceContext&) const {
+  throw VieError(ErrorCode::Unsupported, "this decoder does not produce semantic segmentation");
 }
 
 void DecoderRegistry::register_factory(std::string protocol, Factory factory) {

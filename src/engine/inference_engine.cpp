@@ -262,6 +262,8 @@ InferenceEngine::InferenceEngine() {
                              [] { return std::make_unique<ClassificationDecoder>(); });
   decoders_.register_factory("classification_probabilities_raw",
                              [] { return std::make_unique<ClassificationProbabilitiesDecoder>(); });
+  decoders_.register_factory("deeplabv3_semantic_seg_raw",
+                             [] { return std::make_unique<SemanticSegmentationDecoder>(); });
 #if defined(VIE_HAS_ONNXRUNTIME)
   backends_.register_factory(BackendKind::OnnxRuntime,
                              [] { return std::make_unique<OnnxRuntimeBackend>(); });
@@ -401,6 +403,10 @@ DetectionBatch InferenceEngine::infer(const ImageInput& image, DetectionInferTim
   if (manifest_.task == TaskType::Pose) {
     throw VieError(ErrorCode::Unsupported, "task pose does not produce DetectionBatch; call infer_pose()");
   }
+  if (manifest_.task == TaskType::SemanticSegmentation) {
+    throw VieError(ErrorCode::Unsupported,
+                   "task semantic_segmentation does not produce DetectionBatch; call infer_semantic_segmentation()");
+  }
   const auto total_start = std::chrono::steady_clock::now();
   const PreprocessResult prepared = preprocess(image);
   const double preprocess_ms = elapsed_ms(total_start);
@@ -457,6 +463,10 @@ DetectionBatch InferenceEngine::infer_batch(const std::vector<ImageInput>& image
   }
   if (manifest_.task == TaskType::Pose) {
     throw VieError(ErrorCode::Unsupported, "task pose does not produce DetectionBatch; call infer_pose()");
+  }
+  if (manifest_.task == TaskType::SemanticSegmentation) {
+    throw VieError(ErrorCode::Unsupported,
+                   "task semantic_segmentation does not produce DetectionBatch; call infer_semantic_segmentation()");
   }
   // Reject mixed devices so the batch Tensor stays on one execution device.
   for (std::size_t i = 1; i < images.size(); ++i) {
@@ -648,6 +658,88 @@ ClassificationBatch InferenceEngine::infer_classification(const ImageInput& imag
     timing->includes_d2h = d2h_bytes > 0;
   }
   return batch;
+}
+
+SemanticSegmentationResult InferenceEngine::infer_semantic_segmentation(const ImageInput& image,
+                                                                        SemanticSegmentationInferTiming* timing) {
+  if (!loaded_ || backend_ == nullptr || decoder_ == nullptr) {
+    throw VieError(ErrorCode::InvalidArgument, "engine is not loaded");
+  }
+  if (manifest_.task != TaskType::SemanticSegmentation) {
+    throw VieError(ErrorCode::Unsupported, "infer_semantic_segmentation() requires task semantic_segmentation");
+  }
+  if (manifest_.decoder.protocol != "deeplabv3_semantic_seg_raw") {
+    throw VieError(ErrorCode::Unsupported,
+                   "infer_semantic_segmentation() requires decoder protocol deeplabv3_semantic_seg_raw");
+  }
+
+  const auto total_start = std::chrono::steady_clock::now();
+  const PreprocessResult prepared = preprocess(image);
+  const double preprocess_ms = elapsed_ms(total_start);
+  require_same_device(prepared.output, device_, "preprocess output");
+  BackendRequest request;
+  request.inputs.emplace(manifest_.input.name, prepared.output);
+  const auto execute_start = std::chrono::steady_clock::now();
+  const BackendOutput output = execute(request);
+  const double execute_ms = elapsed_ms(execute_start);
+
+  const std::string output_name = manifest_.semantic_segmentation.output_name;
+  if (output_name.empty()) {
+    throw VieError(ErrorCode::UnresolvedField, "semantic_segmentation.output_name is unresolved");
+  }
+  const auto found = output.tensors.find(output_name);
+  if (found == output.tensors.end()) {
+    throw VieError(ErrorCode::InvalidArgument, "semantic segmentation output '" + output_name + "' is missing");
+  }
+  require_same_device(found->second.tensor, device_, "backend output '" + output_name + "'");
+  Tensor logits = found->second.tensor;
+  const std::size_t output_bytes = logits.nbytes();
+  std::size_t d2h_bytes = 0;
+  double d2h_ms = 0;
+  // The decoder is CPU-only. A CUDA backend leaves the logits on the device,
+  // so this explicit D2H is recorded and reported; it does not change any
+  // tensor's default device semantics outside this call.
+  if (logits.is_cuda()) {
+    const auto d2h_start = std::chrono::steady_clock::now();
+    logits = logits.to(DeviceContext(DeviceType::Cpu, 0));
+    d2h_ms = elapsed_ms(d2h_start);
+    d2h_bytes = output_bytes;
+  }
+
+  SemanticSegmentationDecodeRequest decoded;
+  decoded.output_name = output_name;
+  decoded.num_classes = manifest_.num_classes.value_or(0);
+  decoded.channel_axis = manifest_.semantic_segmentation.channel_axis.value_or(1);
+  decoded.logits_semantics = manifest_.semantic_segmentation.logits_semantics;
+  decoded.output_interpolation = manifest_.semantic_segmentation.output_interpolation;
+  decoded.class_id_interpolation = manifest_.semantic_segmentation.class_id_interpolation;
+  DecoderInput decoder_input;
+  decoder_input.outputs.emplace(output_name, std::move(logits));
+  decoder_input.geometry = prepared.geometry;
+  const auto decode_start = std::chrono::steady_clock::now();
+  SemanticSegmentationBatch batch =
+      decoder_->decode_semantic_segmentation(decoder_input, decoded, DeviceContext{});
+  const double decode_ms = elapsed_ms(decode_start);
+  if (batch.results.empty()) {
+    throw VieError(ErrorCode::Internal, "semantic segmentation decoder produced no result");
+  }
+  SemanticSegmentationResult result = std::move(batch.results.front());
+  result.d2h_bytes = d2h_bytes;
+  if (timing != nullptr) {
+    timing->preprocess_ms = preprocess_ms;
+    timing->execute_ms = execute_ms;
+    timing->d2h_ms = d2h_ms;
+    timing->validate_ms = result.validate_ms;
+    timing->argmax_ms = result.argmax_ms;
+    timing->decode_ms = d2h_ms + decode_ms;
+    timing->total_ms = elapsed_ms(total_start);
+    timing->output_bytes = output_bytes;
+    timing->d2h_bytes = d2h_bytes;
+    timing->includes_sync = device_.device() == DeviceType::Cuda;
+    timing->includes_h2d = false;
+    timing->includes_d2h = d2h_bytes > 0;
+  }
+  return result;
 }
 
 ObbBatch InferenceEngine::infer_obb(const ImageInput& image, const ObbRuntimeConfig& runtime,

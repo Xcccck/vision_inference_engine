@@ -62,7 +62,8 @@ TaskType task_type_from_string(std::string_view text) {
   if (text == "pose") return TaskType::Pose;
   if (text == "obb") return TaskType::Obb;
   if (text == "classification") return TaskType::Classification;
-  bad_token("task", text, "unknown, detection, segmentation, pose, obb, classification");
+  if (text == "semantic_segmentation") return TaskType::SemanticSegmentation;
+  bad_token("task", text, "unknown, detection, segmentation, pose, obb, classification, semantic_segmentation");
 }
 
 ModelFormat model_format_from_string(std::string_view text) {

@@ -340,6 +340,87 @@ ManifestValidation ManifestValidator::validate(const ModelManifest& manifest) co
     report.schema_issues.push_back(
         {"classification.class_names", "count does not match num_classes"});
   }
+
+  // ---- Semantic segmentation (§3.2/§5.3). Kept fully separate from the
+  // instance-segmentation block above; the two never describe the same model. ----
+  const bool semantic_protocol = manifest.decoder.protocol == "deeplabv3_semantic_seg_raw";
+  const bool semantic_task = manifest.task == TaskType::SemanticSegmentation;
+  if (semantic_task || semantic_protocol) {
+    if (semantic_protocol && !semantic_task) {
+      report.schema_issues.push_back(
+          {"task", "deeplabv3_semantic_seg_raw requires task semantic_segmentation"});
+    }
+    if (semantic_task && !semantic_protocol) {
+      report.schema_issues.push_back(
+          {"decoder.protocol", "task semantic_segmentation requires deeplabv3_semantic_seg_raw"});
+    }
+    require("semantic_segmentation.output_name", !manifest.semantic_segmentation.output_name.empty(),
+            "semantic segmentation output name is unresolved");
+    require("semantic_segmentation.channel_axis", manifest.semantic_segmentation.channel_axis.has_value(),
+            "semantic segmentation channel axis is unresolved");
+    require("semantic_segmentation.logits_semantics",
+            !manifest.semantic_segmentation.logits_semantics.empty(),
+            "semantic segmentation logits semantics is unresolved");
+    if (manifest.num_classes.has_value() && *manifest.num_classes <= 1) {
+      report.schema_issues.push_back({"num_classes", "semantic segmentation requires num_classes > 1"});
+    }
+    if (manifest.semantic_segmentation.channel_axis.has_value() &&
+        *manifest.semantic_segmentation.channel_axis != 1) {
+      report.schema_issues.push_back({"semantic_segmentation.channel_axis", "must be 1 (NCHW)"});
+    }
+    if (!manifest.semantic_segmentation.output_interpolation.empty() &&
+        manifest.semantic_segmentation.output_interpolation != "bilinear") {
+      report.schema_issues.push_back({"semantic_segmentation.output_interpolation", "must be bilinear"});
+    }
+    if (!manifest.semantic_segmentation.class_id_interpolation.empty() &&
+        manifest.semantic_segmentation.class_id_interpolation != "nearest") {
+      report.schema_issues.push_back(
+          {"semantic_segmentation.class_id_interpolation", "must be nearest"});
+    }
+    // An instance-segmentation configuration must not be reused to describe a
+    // semantic segmentation model.
+    if (!manifest.segmentation.prototype_name.empty() || manifest.segmentation.mask_channels.has_value()) {
+      report.schema_issues.push_back(
+          {"semantic_segmentation",
+           "instance segmentation configuration cannot describe semantic segmentation"});
+    }
+    if (!manifest.semantic_segmentation.output_name.empty()) {
+      const OutputDesc* named = nullptr;
+      for (const OutputDesc& output : manifest.outputs) {
+        if (output.name == manifest.semantic_segmentation.output_name) named = &output;
+      }
+      if (named == nullptr) {
+        report.schema_issues.push_back({"semantic_segmentation.output_name", "does not match an output"});
+      } else {
+        if (named->dtype != DataType::Unknown && named->dtype != DataType::Fp32) {
+          report.schema_issues.push_back({"semantic_segmentation.output_name",
+                                          "semantic segmentation logits must be fp32"});
+        }
+        if (!named->shape.empty() && is_concrete_shape(named->shape)) {
+          if (named->shape.size() != 4) {
+            report.schema_issues.push_back({"semantic_segmentation.output_name",
+                                            "semantic segmentation output must be rank 4 [N, C, H, W]"});
+          } else if (manifest.semantic_segmentation.channel_axis.has_value() &&
+                     manifest.num_classes.has_value()) {
+            const int axis = *manifest.semantic_segmentation.channel_axis;
+            if (axis >= 0 && axis < 4 &&
+                named->shape[static_cast<std::size_t>(axis)] != *manifest.num_classes) {
+              report.schema_issues.push_back({"semantic_segmentation.channel_axis",
+                                              "output channel length does not match num_classes"});
+            }
+          }
+        }
+      }
+    }
+  }
+  if (!semantic_task && !semantic_protocol &&
+      (!manifest.semantic_segmentation.output_name.empty() ||
+       manifest.semantic_segmentation.channel_axis.has_value() ||
+       !manifest.semantic_segmentation.logits_semantics.empty())) {
+    report.schema_issues.push_back(
+        {"semantic_segmentation", "semantic segmentation fields require task semantic_segmentation"});
+  }
+
   if (manifest.task == TaskType::Obb && manifest.decoder.protocol != "yolov8_obb_raw") {
     report.schema_issues.push_back({"decoder.protocol", "task obb requires yolov8_obb_raw"});
   }

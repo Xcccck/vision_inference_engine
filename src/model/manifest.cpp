@@ -54,6 +54,19 @@ bool classification_active(const ModelManifest& manifest) {
          !classification.class_names.empty();
 }
 
+bool is_semantic_logits_semantics(std::string_view text) { return text == "per_pixel_class_logits"; }
+
+bool is_semantic_output_interpolation(std::string_view text) { return text == "bilinear"; }
+
+bool is_semantic_class_id_interpolation(std::string_view text) { return text == "nearest"; }
+
+bool semantic_segmentation_active(const ModelManifest& manifest) {
+  const SemanticSegmentationDesc& semantic = manifest.semantic_segmentation;
+  return manifest.task == TaskType::SemanticSegmentation || !semantic.output_name.empty() ||
+         semantic.channel_axis.has_value() || !semantic.logits_semantics.empty() ||
+         !semantic.output_interpolation.empty() || !semantic.class_id_interpolation.empty();
+}
+
 bool is_obb_angle_unit(std::string_view text) { return text == "radian"; }
 
 bool is_obb_angle_range(std::string_view text) { return text == "[-pi/4,3pi/4]"; }
@@ -451,6 +464,16 @@ json manifest_json(const ModelManifest& manifest) {
         {"class_names",
          manifest.classification.class_names.empty() ? json(nullptr) : json(std::move(names))}};
   }
+  if (semantic_segmentation_active(manifest)) {
+    document["semantic_segmentation"] = json{
+        {"output_name", string_or_null(manifest.semantic_segmentation.output_name)},
+        {"channel_axis", manifest.semantic_segmentation.channel_axis
+                             ? json(*manifest.semantic_segmentation.channel_axis)
+                             : json(nullptr)},
+        {"logits_semantics", string_or_null(manifest.semantic_segmentation.logits_semantics)},
+        {"output_interpolation", string_or_null(manifest.semantic_segmentation.output_interpolation)},
+        {"class_id_interpolation", string_or_null(manifest.semantic_segmentation.class_id_interpolation)}};
+  }
   if (pose_active(manifest)) {
     document["pose"] = json{
         {"output_name", string_or_null(manifest.pose.output_name)},
@@ -585,6 +608,23 @@ void read_classification(const json& value, ClassificationDesc& classification) 
   }
 }
 
+void read_semantic_segmentation(const json& value, SemanticSegmentationDesc& semantic) {
+  if (!value.is_object()) schema_error("semantic_segmentation must be an object");
+  semantic.output_name = read_free_string(value, "output_name", false);
+  if (value.contains("channel_axis") && !value.at("channel_axis").is_null()) {
+    if (!value.at("channel_axis").is_number_integer()) schema_error("channel_axis must be an integer");
+    const int axis = value.at("channel_axis").get<int>();
+    if (axis < 0) schema_error("channel_axis must be >= 0");
+    semantic.channel_axis = axis;
+  }
+  semantic.logits_semantics = read_vocab(value, "logits_semantics", is_semantic_logits_semantics,
+                                         "per_pixel_class_logits");
+  semantic.output_interpolation = read_vocab(value, "output_interpolation",
+                                             is_semantic_output_interpolation, "bilinear");
+  semantic.class_id_interpolation = read_vocab(value, "class_id_interpolation",
+                                               is_semantic_class_id_interpolation, "nearest");
+}
+
 }  // namespace
 
 std::vector<std::string> manifest_field_paths(const ModelManifest& manifest) {
@@ -640,6 +680,12 @@ std::vector<std::string> manifest_field_paths(const ModelManifest& manifest) {
   if (classification_active(manifest)) {
     paths.insert(paths.end(), {"classification.output_name", "classification.class_axis",
                                "classification.score_type", "classification.class_names"});
+  }
+  if (semantic_segmentation_active(manifest)) {
+    paths.insert(paths.end(),
+                 {"semantic_segmentation.output_name", "semantic_segmentation.channel_axis",
+                  "semantic_segmentation.logits_semantics", "semantic_segmentation.output_interpolation",
+                  "semantic_segmentation.class_id_interpolation"});
   }
   if (obb_active(manifest)) {
     paths.insert(paths.end(), {"obb.output_name", "obb.channel_axis", "obb.angle_unit", "obb.angle_range",
@@ -732,6 +778,15 @@ bool field_is_set(const ModelManifest& manifest, std::string_view path) {
   if (path == "classification.class_axis") return manifest.classification.class_axis.has_value();
   if (path == "classification.score_type") return !manifest.classification.score_type.empty();
   if (path == "classification.class_names") return !manifest.classification.class_names.empty();
+  if (path == "semantic_segmentation.output_name") return !manifest.semantic_segmentation.output_name.empty();
+  if (path == "semantic_segmentation.channel_axis") return manifest.semantic_segmentation.channel_axis.has_value();
+  if (path == "semantic_segmentation.logits_semantics") return !manifest.semantic_segmentation.logits_semantics.empty();
+  if (path == "semantic_segmentation.output_interpolation") {
+    return !manifest.semantic_segmentation.output_interpolation.empty();
+  }
+  if (path == "semantic_segmentation.class_id_interpolation") {
+    return !manifest.semantic_segmentation.class_id_interpolation.empty();
+  }
   if (path == "pose.output_name") return !manifest.pose.output_name.empty();
   if (path == "pose.channel_axis") return manifest.pose.channel_axis.has_value();
   if (path == "pose.keypoint_count") return manifest.pose.keypoint_count.has_value();
@@ -838,6 +893,9 @@ ModelManifest ModelManifest::from_json_string(std::string_view json_text) {
     }
     if (document.contains("classification") && !document.at("classification").is_null()) {
       read_classification(document.at("classification"), manifest.classification);
+    }
+    if (document.contains("semantic_segmentation") && !document.at("semantic_segmentation").is_null()) {
+      read_semantic_segmentation(document.at("semantic_segmentation"), manifest.semantic_segmentation);
     }
     if (document.contains("obb") && !document.at("obb").is_null()) {
       read_obb(document.at("obb"), manifest.obb);

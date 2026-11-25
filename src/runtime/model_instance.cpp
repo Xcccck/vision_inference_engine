@@ -151,6 +151,15 @@ PoseBatch ModelInstance::infer_pose(const ImageInput& image, const PoseRuntimeCo
   return result;
 }
 
+SemanticSegmentationResult ModelInstance::infer_semantic_segmentation(const ImageInput& image,
+                                                                       SemanticSegmentationInferTiming* timing) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  InferenceGuard guard(metrics_, id_);
+  auto result = engine_.infer_semantic_segmentation(image, timing);
+  guard.set_success(true);
+  return result;
+}
+
 PreprocessResult ModelInstance::preprocess(const ImageInput& image) const {
   std::lock_guard<std::mutex> lock(mutex_);
   auto start = std::chrono::steady_clock::now();

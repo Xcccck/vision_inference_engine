@@ -50,6 +50,10 @@ enum class TaskType {
   Pose,
   Obb,
   Classification,
+  // Dense per-pixel semantic segmentation. Distinct from Segmentation, which
+  // is instance segmentation (per-object masks). The two never share a result
+  // type, decoder, or recognizer.
+  SemanticSegmentation,
 };
 
 enum class ModelFormat {
@@ -182,6 +186,8 @@ inline const char* to_string(TaskType task) {
       return "obb";
     case TaskType::Classification:
       return "classification";
+    case TaskType::SemanticSegmentation:
+      return "semantic_segmentation";
   }
   return "unknown";
 }

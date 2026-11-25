@@ -1,6 +1,7 @@
 #include "vie/recognizer/recognizer_registry.hpp"
 
 #include "vie/recognizer/classification_recognizer.hpp"
+#include "vie/recognizer/deeplabv3_semantic_segmentation_recognizer.hpp"
 #include "vie/recognizer/rtdetr_recognizer.hpp"
 #include "vie/recognizer/yolov8_detect_recognizer.hpp"
 #include "vie/recognizer/yolov8_obb_recognizer.hpp"
@@ -52,6 +53,7 @@ RecognitionResult ModelRecognizerRegistry::recognize(const ModelAnalysisReport& 
   bool saw_classification = false;
   bool saw_obb = false;
   bool saw_pose = false;
+  bool saw_semantic_segmentation = false;
   for (const RecognitionCandidate& candidate : matched) {
     if (candidate.architecture == "yolov8_detection") saw_detection = true;
     if (candidate.architecture == "yolov8_segmentation") saw_segmentation = true;
@@ -59,6 +61,7 @@ RecognitionResult ModelRecognizerRegistry::recognize(const ModelAnalysisReport& 
     if (candidate.architecture == "single_label_classification") saw_classification = true;
     if (candidate.architecture == "yolov8_obb") saw_obb = true;
     if (candidate.architecture == "yolov8_pose") saw_pose = true;
+    if (candidate.architecture == "deeplabv3_semantic_segmentation") saw_semantic_segmentation = true;
   }
   result.candidates = std::move(matched);
   if (saw_detection && saw_segmentation) {
@@ -87,6 +90,14 @@ RecognitionResult ModelRecognizerRegistry::recognize(const ModelAnalysisReport& 
     result.explanation = "YOLOv8 Pose and another task recognizer both accepted this graph";
     return result;
   }
+  // Dense semantic segmentation is its own task; it must never be co-selected
+  // with instance segmentation or any box / label head.
+  if (saw_semantic_segmentation &&
+      (saw_detection || saw_segmentation || saw_rtdetr || saw_obb || saw_pose || saw_classification)) {
+    result.status = RecognitionStatus::Ambiguous;
+    result.explanation = "semantic segmentation and another task recognizer both accepted this graph";
+    return result;
+  }
   if (tied > 1) {
     result.status = RecognitionStatus::Ambiguous;
     result.explanation =
@@ -106,6 +117,7 @@ ModelRecognizerRegistry default_recognizer_registry() {
   registry.add(std::make_unique<YoloV8SegRecognizer>());
   registry.add(std::make_unique<RtdetrRecognizer>());
   registry.add(std::make_unique<ClassificationRecognizer>());
+  registry.add(std::make_unique<Deeplabv3SemanticSegmentationRecognizer>());
   return registry;
 }
 

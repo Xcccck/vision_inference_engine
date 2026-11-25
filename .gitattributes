@@ -1,1 +1,2 @@
 testdata/onnx/rtdetr-l.onnx filter=lfs diff=lfs merge=lfs -text
+testdata/onnx/deeplabv3_mobilenet_v3_large_520_opset18.onnx filter=lfs diff=lfs merge=lfs -text

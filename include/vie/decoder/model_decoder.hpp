@@ -14,6 +14,8 @@ namespace vie {
 
 struct ClassificationBatch;
 struct ClassificationDecodeRequest;
+struct SemanticSegmentationBatch;
+struct SemanticSegmentationDecodeRequest;
 
 // Boxes are in the model's input coordinate space. The decoder does not run
 // NMS and does not map coordinates back to the original image.
@@ -79,6 +81,14 @@ class IModelDecoder {
   // for a keypoint decoder. Pose NMS in this phase is CPU-only.
   virtual PoseBatch decode_pose(const DecoderInput& input, const PoseDecodeConfig& config,
                                 const DeviceContext& device) const;
+
+  // Semantic segmentation path. The default refuses so a detection, instance
+  // segmentation, or classification decoder cannot be mistaken for a dense
+  // semantic-segmentation decoder. It is CPU-only in this phase; the engine
+  // performs an explicit D2H of the logits before calling this.
+  virtual SemanticSegmentationBatch decode_semantic_segmentation(
+      const DecoderInput& input, const SemanticSegmentationDecodeRequest& request,
+      const DeviceContext& device) const;
 };
 
 }  // namespace vie

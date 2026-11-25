@@ -115,6 +115,24 @@ struct ClassificationDesc {
   std::vector<std::string> class_names;
 };
 
+// Dense semantic segmentation head. This is separate from SegmentationDesc
+// (instance segmentation): it never carries prototypes, mask coefficients, or
+// objectness. num_classes lives on the manifest top level. The output is a
+// single Float32 [N, C, H, W] per-pixel class-logit tensor; the decoder runs
+// ArgMax on CPU after inverse-mapping to the original image coordinates.
+struct SemanticSegmentationDesc {
+  std::string output_name;
+  // Class/channel axis. Supported value is 1 (NCHW [N, C, H, W]).
+  std::optional<int> channel_axis;
+  // "per_pixel_class_logits". Empty is unresolved. Softmax is never run.
+  std::string logits_semantics;
+  // Interpolation used to bring low-resolution logits to the model-input grid.
+  // "bilinear" only in this phase (continuous values).
+  std::string output_interpolation;
+  // Interpolation used when resampling integer class ids. "nearest" only.
+  std::string class_id_interpolation;
+};
+
 struct NmsDesc {
   std::optional<bool> enabled;
   std::optional<float> confidence_threshold;
@@ -142,6 +160,7 @@ class ModelManifest {
   NmsDesc nms;
   SegmentationDesc segmentation;
   ClassificationDesc classification;
+  SemanticSegmentationDesc semantic_segmentation;
   ObbDesc obb;
   PoseDesc pose;
   std::map<std::string, FieldProvenance> provenance;

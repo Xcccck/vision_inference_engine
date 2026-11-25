@@ -114,6 +114,7 @@ add_library(vie
   src/decoder/classification_probabilities_decoder.cpp
   src/decoder/mock_decoder.cpp
   src/decoder/segmentation.cpp
+  src/decoder/semantic_segmentation.cpp
   src/decoder/detection_ops.cpp
   src/decoder/yolov8_cpu_decode.cpp
   src/decoder/yolov8_detect_decoder.cpp
@@ -134,6 +135,7 @@ add_library(vie
   src/recognizer/yolov8_seg_recognizer.cpp
   src/recognizer/rtdetr_recognizer.cpp
   src/recognizer/classification_recognizer.cpp
+  src/recognizer/deeplabv3_semantic_segmentation_recognizer.cpp
   src/recognizer/manifest_generator.cpp
   src/preprocess/preprocess.cpp
   src/preprocess/preprocess_cpu.cpp
@@ -227,6 +229,7 @@ if(VIE_BUILD_TESTS)
     tests/test_preprocess_resize_crop.cpp
     tests/test_decoder.cpp
     tests/test_segmentation.cpp
+    tests/test_semantic_segmentation.cpp
     tests/test_yolov8_seg.cpp
     tests/test_model_inspection.cpp
     tests/test_runtime.cpp
@@ -283,6 +286,12 @@ add_executable(vie_deploy_verify tools/diagnostics/model_deployment/vie_deploy_v
 target_link_libraries(vie_deploy_verify PRIVATE vie::vie)
 target_compile_options(vie_deploy_verify PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
+# Phase 9.4 real-model semantic-segmentation verifier: recognize -> manifest ->
+# preprocess/backend/decoder dump for the Python reference comparison.
+add_executable(vie_semantic_verify tools/diagnostics/semantic_segmentation/vie_semantic_verify.cpp)
+target_link_libraries(vie_semantic_verify PRIVATE vie::vie)
+target_compile_options(vie_semantic_verify PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
 add_executable(multi_model_runtime examples/multi_model_runtime.cpp)
 target_link_libraries(multi_model_runtime PRIVATE vie::vie)
 target_compile_options(multi_model_runtime PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -311,15 +320,15 @@ target_compile_definitions(multi_model_concurrency_benchmark PRIVATE VIE_SOURCE_
 
 if(VIE_ENABLE_ONNXRUNTIME)
   if(VIE_ENABLE_ONNXRUNTIME_CUDA)
-    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect vie_ort_profile_inspect vie_deploy_verify multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark batch_aggregator_benchmark multi_model_concurrency_benchmark
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect vie_ort_profile_inspect vie_deploy_verify vie_semantic_verify multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark batch_aggregator_benchmark multi_model_concurrency_benchmark
       APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_GPU_LIB_DIR}")
   else()
-    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect vie_ort_profile_inspect vie_deploy_verify multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark batch_aggregator_benchmark multi_model_concurrency_benchmark
+    set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect vie_ort_profile_inspect vie_deploy_verify vie_semantic_verify multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark batch_aggregator_benchmark multi_model_concurrency_benchmark
       APPEND PROPERTY BUILD_RPATH "${VIE_ONNXRUNTIME_LIB_DIR}")
   endif()
 endif()
 if(VIE_ENABLE_CUDA)
-  set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect vie_ort_profile_inspect vie_deploy_verify multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark batch_aggregator_benchmark multi_model_concurrency_benchmark
+  set_property(TARGET vie_analyze_onnx vie_recognize_onnx vie_model_inspect vie_ort_profile_inspect vie_deploy_verify vie_semantic_verify multi_model_runtime runtime_benchmark real_model_benchmark batch_benchmark batch_aggregator_benchmark multi_model_concurrency_benchmark
     APPEND PROPERTY BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
 endif()
 
