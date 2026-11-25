@@ -3,6 +3,7 @@
 #include "vie/core/error.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <exception>
 #include <utility>
@@ -112,6 +113,7 @@ void Runtime::launch_workers() {
 }
 
 void Runtime::shutdown() {
+  std::lock_guard<std::mutex> lock(shutdown_mutex_);
   if (!running_.load()) {
     return;
   }
@@ -159,6 +161,10 @@ std::future<DetectionResult> Runtime::submit(const std::string& model_id, ImageI
   request.image = image;
   request.model = model;
   request.submitted_at = std::chrono::steady_clock::now();
+
+  // Phase 9.2.2.2: Deep-copy CPU pixel data so caller can safely release
+  // their buffer immediately after submit() returns.
+  request.adopt_cpu_pixels();
 
   // Get the future before moving the request
   std::future<DetectionResult> future = request.promise.get_future();
@@ -237,11 +243,18 @@ void Runtime::aggregator_loop() {
 // Push a formed batch to the execution queue. Blocks if the queue is full
 // (backpressure). If the queue has been shut down, executes inline as fallback.
 void Runtime::dispatch_batch(BatchWorkItem batch) {
+  // Defensive: exec_queue_->shutdown() is only called after aggregator_thread_
+  // has exited, so the shutdown path should never fire here. Check before move
+  // to avoid the moved-from issue if the invariant is ever broken.
+  if (exec_queue_->is_shutdown()) {
+    execute_batch(batch);  // batch still intact (not yet moved)
+    return;
+  }
   if (!exec_queue_->push(std::move(batch))) {
-    // Execution queue shut down - execute inline to avoid losing requests.
-    // This can only happen during shutdown after the aggregator has been
-    // asked to stop but before exec_queue_ is shut down.
-    execute_batch(batch);
+    // Unreachable in current design: push() only returns false on shutdown.
+    // batch is moved-from here; promises will receive broken_promise.
+    // Log or assert in debug builds.
+    assert(false && "dispatch_batch: exec_queue push failed unexpectedly");
   }
 }
 

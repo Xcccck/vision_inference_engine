@@ -89,17 +89,17 @@ class DynamicBatchAggregatorTest : public ::testing::Test {
     return std::make_shared<MetricsCollector>();
   }
 
-  // Create a ModelConfig with a mock manifest (no actual model file needed)
+  // Create a ModelConfig with a mock backend (no actual model file needed)
   ModelConfig mock_model_config(const std::string& id = "mock") {
     ModelManifest manifest;
     manifest.model_name = id;
     manifest.model_family = "mock";
     manifest.num_classes = 80;
-    manifest.model_path = "";  // No actual file
+    manifest.model_path = "";  // No actual file needed for Mock backend
     manifest.task = TaskType::Detection;
-    manifest.model_format = ModelFormat::Onnx;
+    manifest.model_format = ModelFormat::Mock;
     manifest.input.name = "images";
-    manifest.input.shape = {1, 3, 640, 640};
+    manifest.input.shape = {1, 3, 64, 64};
     manifest.input.dtype = DataType::Fp32;
     manifest.input.layout = Layout::Nchw;
     manifest.input.color = "rgb";
@@ -114,7 +114,7 @@ class DynamicBatchAggregatorTest : public ::testing::Test {
     out.layout = Layout::Unknown;
     out.semantic = "predictions";
     manifest.outputs.push_back(out);
-    manifest.decoder.protocol = "yolov8_detect_raw";
+    manifest.decoder.protocol = "mock";
     manifest.decoder.box_format = "cxcywh";
     manifest.decoder.box_decode = "decoded_cxcywh";
     manifest.decoder.box_channels = 4;
@@ -131,7 +131,7 @@ class DynamicBatchAggregatorTest : public ::testing::Test {
     ModelConfig config;
     config.model_path = "";
     config.task = TaskType::Detection;
-    config.backend = BackendKind::OnnxRuntime;
+    config.backend = BackendKind::Mock;
     config.device = DeviceType::Cpu;
     config.device_id = 0;
     config.manifest = manifest;
@@ -166,7 +166,6 @@ TEST_F(DynamicBatchAggregatorTest, CudaForcesBatchSizeOne) {
 }
 
 TEST_F(DynamicBatchAggregatorTest, AddSingleRequestDoesNotFlush) {
-  GTEST_SKIP() << "ModelInstance requires a real model file; covered by integration tests";
   auto metrics = make_metrics();
   auto cfg = default_config();
   cfg.max_batch_size = 4;
@@ -185,7 +184,6 @@ TEST_F(DynamicBatchAggregatorTest, AddSingleRequestDoesNotFlush) {
 }
 
 TEST_F(DynamicBatchAggregatorTest, AddReachesMaxBatchSizeFlushes) {
-  GTEST_SKIP() << "ModelInstance requires a real model file; covered by integration tests";
   auto metrics = make_metrics();
   auto cfg = default_config();
   cfg.max_batch_size = 2;
@@ -218,7 +216,6 @@ TEST_F(DynamicBatchAggregatorTest, AddReachesMaxBatchSizeFlushes) {
 }
 
 TEST_F(DynamicBatchAggregatorTest, DifferentModelsCreateSeparateGroups) {
-  GTEST_SKIP() << "ModelInstance requires a real model file; covered by integration tests";
   auto metrics = make_metrics();
   auto cfg = default_config();
   cfg.max_batch_size = 4;
@@ -246,7 +243,6 @@ TEST_F(DynamicBatchAggregatorTest, DifferentModelsCreateSeparateGroups) {
 }
 
 TEST_F(DynamicBatchAggregatorTest, FlushExpiredRespectsDeadline) {
-  GTEST_SKIP() << "ModelInstance requires a real model file; covered by integration tests";
   auto metrics = make_metrics();
   auto cfg = default_config();
   cfg.max_batch_size = 10;  // Large batch so it won't fill
@@ -275,7 +271,6 @@ TEST_F(DynamicBatchAggregatorTest, FlushExpiredRespectsDeadline) {
 }
 
 TEST_F(DynamicBatchAggregatorTest, FlushAllReturnsAllGroups) {
-  GTEST_SKIP() << "ModelInstance requires a real model file; covered by integration tests";
   auto metrics = make_metrics();
   auto cfg = default_config();
   cfg.max_batch_size = 100;
@@ -319,7 +314,6 @@ TEST_F(DynamicBatchAggregatorTest, EarliestDeadlineReturnsMaxWhenEmpty) {
 }
 
 TEST_F(DynamicBatchAggregatorTest, EarliestDeadlineReturnsSoonestGroup) {
-  GTEST_SKIP() << "ModelInstance requires a real model file; covered by integration tests";
   auto metrics = make_metrics();
   auto cfg = default_config();
   cfg.max_batch_size = 100;
@@ -351,7 +345,6 @@ TEST_F(DynamicBatchAggregatorTest, EarliestDeadlineReturnsSoonestGroup) {
 }
 
 TEST_F(DynamicBatchAggregatorTest, BackpressureRejectsWhenFull) {
-  GTEST_SKIP() << "ModelInstance requires a real model file; covered by integration tests";
   auto metrics = make_metrics();
   auto cfg = default_config();
   cfg.max_batch_size = 100;

@@ -231,6 +231,7 @@ if(VIE_BUILD_TESTS)
     tests/test_async_runtime.cpp
     tests/test_dynamic_batch_aggregator.cpp
     tests/test_runtime_concurrency.cpp
+    tests/test_async_lifecycle_audit.cpp
   )
   target_link_libraries(vie_tests PRIVATE vie::vie GTest::gtest GTest::gtest_main)
   target_compile_options(vie_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)

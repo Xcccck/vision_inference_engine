@@ -121,6 +121,7 @@ class Runtime {
 
   std::atomic<bool> running_{false};
   std::atomic<RequestId> next_request_id_{1};
+  std::mutex shutdown_mutex_;  // Serializes concurrent shutdown() calls
 };
 
 }  // namespace vie

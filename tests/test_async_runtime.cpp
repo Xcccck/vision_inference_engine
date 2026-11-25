@@ -408,8 +408,22 @@ TEST_F(AsyncRuntimeTest, ConcurrentSubmitsFromMultipleThreads) {
     threads.emplace_back([&, t] {
       for (int r = 0; r < requests_per_thread; ++r) {
         try {
-          auto image = make_test_image();
+          // Each thread must use its own pixel buffer to avoid
+          // use-after-free when assign() reallocates.
+          std::vector<uint8_t> local_pixels(640 * 640 * 3, 128);
+          ImageInput image;
+          image.data = local_pixels.data();
+          image.width = 640;
+          image.height = 640;
+          image.channels = 3;
+          image.color = ColorOrder::Rgb;
+          image.layout = ImageLayout::Hwc;
+          image.dtype = DataType::Uint8;
+          image.device = DeviceType::Cpu;
+          image.device_id = 0;
           auto future = runtime.submit("yolov8n", image);
+          // local_pixels can safely go out of scope here because
+          // submit() deep-copies via adopt_cpu_pixels().
           DetectionResult result = future.get();
           if (result.original_width > 0) {
             success_count.fetch_add(1);
