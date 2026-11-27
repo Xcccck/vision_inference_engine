@@ -94,6 +94,7 @@ add_library(vie
   src/core/tensor_storage.cpp
   src/core/tensor.cpp
   src/core/cuda_memory.cpp
+  src/config/inference_config.cpp
   src/model/manifest.cpp
   src/model/manifest_validator.cpp
   src/model/model_inspection.cpp
@@ -220,6 +221,10 @@ if(VIE_BUILD_TESTS)
     tests/test_tensor.cpp
     tests/test_batch_inference.cpp
     tests/test_classification.cpp
+    tests/test_inference_config.cpp
+    tests/test_decoder_config_policy.cpp
+    tests/test_runtime_config.cpp
+    tests/test_inference_config_e2e.cpp
     tests/test_manifest.cpp
     tests/test_engine.cpp
     tests/test_engine_segmentation.cpp

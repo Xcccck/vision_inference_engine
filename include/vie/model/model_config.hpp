@@ -1,5 +1,6 @@
 #pragma once
 
+#include "vie/config/inference_config.hpp"
 #include "vie/model/manifest.hpp"
 
 #include <optional>
@@ -28,6 +29,10 @@ struct ModelConfig {
   // ModelInstance::end_profiling() after inference to flush and obtain the path.
   bool ort_enable_profiling = false;
   std::string ort_profile_prefix;
+  // Phase 12: model-level inference policy defaults. They sit between a usable
+  // manifest value and a per-request override. Empty means "inherit". A block
+  // that does not belong to the model's task is rejected at load().
+  InferenceOptions inference_options;
 };
 
 }  // namespace vie

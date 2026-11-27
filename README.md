@@ -189,6 +189,31 @@ std::cout << result.detections.size() << " boxes, "
 
 同一模型的并发调用会被内部 mutex 串行；要真正并行同一模型，请用不同 ID 加载多个实例。架构细节见 [docs/RUNTIME_ARCHITECTURE.md](docs/RUNTIME_ARCHITECTURE.md)。
 
+### 推理参数（Phase 12）
+
+后处理参数统一走类型化的 `InferenceOptions`，优先级为 **单次请求 > 模型默认 > Manifest 可用值 > 框架默认值**（confidence 0.25 / IoU 0.45 / max_detections 300 / pre-NMS 4096 / classification top-k `min(5, num_classes)`）：
+
+```cpp
+vie::InferenceOptions options;
+options.detection.confidence_threshold = 0.4f;   // 只覆盖想改的字段
+options.detection.max_detections = 50;
+const vie::DetectionBatch batch = engine.infer(image, options);  // 原 infer(image) 不变
+
+// 模型级默认：介于 Manifest 和请求之间
+vie::ModelConfig config;
+config.inference_options.detection.confidence_threshold = 0.3f;
+
+// 异步提交在 submit() 返回前固定配置快照；之后改 options 不影响已排队请求
+std::future<vie::DetectionResult> fut = runtime.submit("det", image, options);
+```
+
+- 只支持当前 Decoder 真正具备的参数：RT-DETR 只有 confidence / max_detections（YOLO NMS 参数会抛 `Unsupported`），Classification 只有 `top_k`，语义分割没有可配置后处理参数，Pose 没有关键点分数阈值。
+- 未设置字段逐层继承；NaN/Inf、越界阈值、非法数量、与任务不匹配的参数块直接抛 `VieError`，不会静默修正或忽略。
+- 动态 Batch 只聚合“同一模型 + 相同有效配置（fingerprint）”的请求，不同阈值不会被合并。
+- Manifest 中 `unresolved` / `inferred` 的值不参与默认值解析；框架默认值不会写回 Manifest。
+
+参数矩阵、默认值来源与同步/异步快照语义见 [docs/RUNTIME_ARCHITECTURE.md](docs/RUNTIME_ARCHITECTURE.md#inference-configuration-phase-12)。
+
 ## 命令行工具
 
 | 工具 | 用途 |
@@ -204,13 +229,13 @@ std::cout << result.detections.size() << " boxes, "
 ## 测试
 
 ```bash
-ctest --test-dir build-ort --output-on-failure          # CPU + ORT：384 个用例
-ctest --test-dir build-ort-gpu --output-on-failure      # CUDA + ORT：450 个用例
+ctest --test-dir build-ort --output-on-failure          # CPU + ORT：428 个用例
+ctest --test-dir build-ort-gpu --output-on-failure      # CUDA + ORT：493 个用例（491 通过，2 个已知计时用例在 CUDA EP 下跳过）
 ```
 
-缺 fixture 时真实模型用例走 `VIE_REQUIRE_MODEL` 跳过而不是失败，所以新 clone 直接 `ctest` 也是全绿 —— 但那意味着约 73 个用例根本没跑。要验证真实模型链路，先执行 `python3 tools/export_test_models.py`，跳过数应归零。
+缺 fixture 时真实模型用例走 `VIE_REQUIRE_MODEL` 跳过而不是失败，所以新 clone 直接 `ctest` 也是全绿 —— 但那意味着约 78 个用例根本没跑。要验证真实模型链路，先执行 `python3 tools/export_test_models.py`，跳过数应归零。
 
-41 个测试源文件覆盖 Tensor / Manifest / Analyzer / Recognizer / Decoder / Preprocess / Runtime / OpenCV 适配。sanitizer 构建：
+45 个测试源文件覆盖 Tensor / Manifest / Analyzer / Recognizer / Decoder / Preprocess / Runtime / OpenCV 适配。sanitizer 构建：
 
 ```bash
 cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DVIE_ENABLE_ONNXRUNTIME=ON \
@@ -242,7 +267,7 @@ target_link_libraries(your_app PRIVATE vie::vie)   # include 目录与 VIE_HAS_*
 
 - 不做图像文件解码（imread / JPG / PNG）；OpenCV 仅是可选的 `cv::Mat` → `ImageInput` 适配层（`VIE_ENABLE_OPENCV=ON`），解码与采集仍由调用方完成。
 - TensorRT / PyTorch 解析未实现。
-- NMS 阈值、Top-K、单类/多类选择不自动确定，全部来自 Manifest 或当次 runtime config。
+- 推理参数由统一的 `InferenceOptions` / `ModelConfig::inference_options` / Manifest 解析（Phase 12）；不是所有 Decoder 都有全部参数：RT-DETR 没有 NMS 参数，语义分割没有可配置后处理参数，Pose 没有关键点分数阈值。
 - 单个 `InferenceEngine` 非线程安全；重叠调用是数据竞争，库不会自动排队。
 - 异步 `submit()` 只接受 CPU 输入；batch > 1 仅 CPU 上的 `yolov8_detect_raw` 支持，其余任务与 CUDA 返回 `Unsupported`。
 - Classification / OBB / Pose / Semantic Segmentation 的解码在 CPU，CUDA 只加速前向并计入 `d2h_bytes`。

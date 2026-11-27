@@ -115,6 +115,52 @@ DetectionBatch ModelInstance::infer_batch_async(const std::vector<ImageInput>& i
   return result;
 }
 
+// Phase 12: same staging/mutex path as above, but the effective policy is the
+// already-resolved snapshot carried by the request.
+DetectionBatch ModelInstance::infer_async(const ImageInput& image, const ResolvedInferenceConfig& config,
+                                          DetectionInferTiming* timing) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  InferenceGuard guard(metrics_, id_);
+  const DeviceContext& dev = engine_.device();
+  if (dev.device() == DeviceType::Cuda && image.device == DeviceType::Cpu) {
+    CudaInputBuffer staged = CudaInputBuffer::stage(image, dev);
+    auto result = engine_.infer_resolved(staged.image(), config, timing);
+    guard.set_success(true);
+    return result;
+  }
+  auto result = engine_.infer_resolved(image, config, timing);
+  guard.set_success(true);
+  return result;
+}
+
+DetectionBatch ModelInstance::infer_batch_async(const std::vector<ImageInput>& images,
+                                                const ResolvedInferenceConfig& config,
+                                                DetectionInferTiming* timing) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  InferenceGuard guard(metrics_, id_);
+  const DeviceContext& dev = engine_.device();
+  if (dev.device() == DeviceType::Cuda) {
+    std::vector<CudaInputBuffer> buffers;
+    buffers.reserve(images.size());
+    std::vector<ImageInput> staged_images;
+    staged_images.reserve(images.size());
+    for (const auto& img : images) {
+      if (img.device == DeviceType::Cpu) {
+        buffers.push_back(CudaInputBuffer::stage(img, dev));
+        staged_images.push_back(buffers.back().image());
+      } else {
+        staged_images.push_back(img);
+      }
+    }
+    auto result = engine_.infer_batch_resolved(staged_images, config, timing);
+    guard.set_success(true);
+    return result;
+  }
+  auto result = engine_.infer_batch_resolved(images, config, timing);
+  guard.set_success(true);
+  return result;
+}
+
 SegmentationBatch ModelInstance::infer_segmentation(const ImageInput& image,
                                                      const SegmentationRuntimeConfig& runtime,
                                                      SegmentationInferTiming* timing) {

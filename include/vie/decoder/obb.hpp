@@ -79,6 +79,13 @@ struct ObbCandidate {
 
 void validate_obb_decode_config(const ObbDecodeConfig& config);
 
+// Phase 12: build the decoder policy from the effective config resolved for
+// this request. This is the only place that maps ResolvedObbConfig onto
+// ObbDecodeConfig, so a CPU and a future CUDA OBB decoder receive the same
+// semantics. Rejects a config resolved for a different task or protocol.
+ObbDecodeConfig obb_decode_config_from_resolved(const ModelManifest& manifest,
+                                               const ResolvedInferenceConfig& resolved);
+
 // Polygon intersection of the two rotated rectangles. Rejects non-finite
 // values and non-positive width or height. The value is the true intersection
 // area over the union area, not an axis-aligned approximation and not ProbIoU.

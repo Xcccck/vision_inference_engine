@@ -1,5 +1,6 @@
 #pragma once
 
+#include "vie/config/inference_config.hpp"
 #include "vie/core/device_context.hpp"
 #include "vie/core/tensor.hpp"
 #include "vie/preprocess/preprocess.hpp"
@@ -162,6 +163,15 @@ bool map_box_to_original(BoundingBox& box, const GeometryTransform& geometry);
 std::vector<int> greedy_nms(const std::vector<NmsCandidate>& sorted, float iou_threshold,
                             bool class_aware, int max_detections);
 
+// Legacy strict path: every NMS and class-selection field must be resolvable
+// from the manifest, otherwise it throws UnresolvedField.
 DecoderConfig decoder_config_from_manifest(const ModelManifest& manifest);
+
+// Effective-policy path used by the unified inference configuration. Structural
+// fields (output name, box decode, channels, class count) still come from the
+// manifest; thresholds, NMS toggles and top-k come from `resolved`. Throws when
+// the manifest task/protocol does not match the resolved config.
+DecoderConfig decoder_config_from_resolved(const ModelManifest& manifest,
+                                           const ResolvedInferenceConfig& resolved);
 
 }  // namespace vie

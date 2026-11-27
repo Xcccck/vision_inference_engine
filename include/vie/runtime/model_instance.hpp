@@ -42,6 +42,14 @@ class ModelInstance {
 
   // Thread-safe inference methods (serialize concurrent calls)
   DetectionBatch infer(const ImageInput& image, DetectionInferTiming* timing = nullptr);
+
+  // Phase 12: resolve request > model default > usable manifest value >
+  // framework default for this instance. Immutable snapshot; safe to call from
+  // any thread because the engine's manifest and model defaults never change
+  // after load().
+  ResolvedInferenceConfig resolve_inference_config(const InferenceOptions& request = {}) const {
+    return engine_.resolve_inference_config(request);
+  }
   // Phase 9.1: Batch inference. Serializes on the same mutex as infer().
   // A Batch>1 call is not concurrent-safe within one instance; parallelism
   // across batches requires multiple ModelInstances. Only task detection
@@ -63,6 +71,15 @@ class ModelInstance {
   // staging. These methods do not relax the submit-time CUDA ImageInput ban.
   DetectionBatch infer_async(const ImageInput& image, DetectionInferTiming* timing = nullptr);
   DetectionBatch infer_batch_async(const std::vector<ImageInput>& images,
+                                   DetectionInferTiming* timing = nullptr);
+  // Phase 12: run an already-resolved effective config. Same staging and mutex
+  // semantics as the overloads above; Runtime uses these so a queued request
+  // runs the snapshot taken at submit time, not whatever the caller's options
+  // object contains when a worker eventually picks it up.
+  DetectionBatch infer_async(const ImageInput& image, const ResolvedInferenceConfig& config,
+                             DetectionInferTiming* timing = nullptr);
+  DetectionBatch infer_batch_async(const std::vector<ImageInput>& images,
+                                   const ResolvedInferenceConfig& config,
                                    DetectionInferTiming* timing = nullptr);
   SegmentationBatch infer_segmentation(const ImageInput& image, const SegmentationRuntimeConfig& runtime,
                                        SegmentationInferTiming* timing = nullptr);

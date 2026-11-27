@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <type_traits>
 
 namespace vie {
 
@@ -180,6 +181,15 @@ class InferenceEngine {
 
   const ModelManifest& manifest() const;
   const DeviceContext& device() const noexcept { return device_; }
+  // Model-level defaults captured at load(). Empty when the model was loaded
+  // without ModelConfig::inference_options.
+  const InferenceOptions& model_inference_options() const noexcept { return model_options_; }
+
+  // Phase 12: resolve request > model default > usable manifest value >
+  // framework default for a loaded engine. The result is an immutable snapshot:
+  // mutating `request` afterwards cannot affect it. Throws InvalidArgument for
+  // an invalid value or a block that does not belong to this engine's task.
+  ResolvedInferenceConfig resolve_inference_config(const InferenceOptions& request = {}) const;
 
   BackendOutput execute(const BackendRequest& request);
   // Image entry point. Uses the image's own color and layout as the source
@@ -190,7 +200,25 @@ class InferenceEngine {
   // execute() does not call this and does not require those fields.
   // A segmentation, classification, OBB, or pose manifest throws Unsupported.
   // This never returns masks, class labels, oriented boxes, or keypoints.
+  //
+  // Phase 12: the no-options overload resolves the framework defaults. The
+  // InferenceOptions overload layers a per-call policy on top of the model
+  // defaults and the manifest. The ResolvedInferenceConfig overload runs an
+  // already-resolved snapshot (used by Runtime::submit()); it rejects a config
+  // whose task/protocol does not match this engine.
   DetectionBatch infer(const ImageInput& image, DetectionInferTiming* timing = nullptr);
+  // Phase 12 per-call policy. This is a template so that an existing
+  // `infer(image, {})` still resolves to the timing pointer instead of becoming
+  // ambiguous with the options overload.
+  template <typename T, typename = std::enable_if_t<std::is_same_v<std::decay_t<T>, InferenceOptions>>>
+  DetectionBatch infer(const ImageInput& image, T&& options, DetectionInferTiming* timing = nullptr) {
+    return infer_resolved(image, resolve_inference_config(options), timing);
+  }
+  // Runs an already-resolved snapshot (used by Runtime::submit()), rejecting a
+  // config whose task/protocol does not match this engine. Public so a caller
+  // can inspect or log the effective config before running it.
+  DetectionBatch infer_resolved(const ImageInput& image, const ResolvedInferenceConfig& resolved,
+                                DetectionInferTiming* timing = nullptr);
   // Phase 9.1: Batch detection. Preprocesses N images into a single
   // [N, 3, H, W] (or NHWC) Tensor, runs one Backend execute() call, then
   // decodes the [N, ...] output with N independent GeometryTransform and NMS
@@ -201,24 +229,61 @@ class InferenceEngine {
   // order. The single-image infer() API is unchanged.
   DetectionBatch infer_batch(const std::vector<ImageInput>& images,
                              DetectionInferTiming* timing = nullptr);
+  template <typename T, typename = std::enable_if_t<std::is_same_v<std::decay_t<T>, InferenceOptions>>>
+  DetectionBatch infer_batch(const std::vector<ImageInput>& images, T&& options,
+                             DetectionInferTiming* timing = nullptr) {
+    return infer_batch_resolved(images, resolve_inference_config(options), timing);
+  }
+  DetectionBatch infer_batch_resolved(const std::vector<ImageInput>& images,
+                                      const ResolvedInferenceConfig& resolved,
+                                      DetectionInferTiming* timing = nullptr);
   // Preprocess, execute, then decode_segmentation. runtime is the only source
   // of thresholds, NMS, retina_masks, and the mask budget. timing may be null.
   // A detection manifest throws Unsupported. Mask storage outlives this engine.
   SegmentationBatch infer_segmentation(const ImageInput& image, const SegmentationRuntimeConfig& runtime,
                                        SegmentationInferTiming* timing = nullptr);
+  // Phase 12: same decode pass, but thresholds/NMS/mask policy come from the
+  // unified resolver (request > model > manifest > framework default) instead
+  // of a hand-filled SegmentationRuntimeConfig. Mask shape fields that remain
+  // unresolved after all layers still throw UnresolvedField: this overload does
+  // not invent a mask budget.
+  template <typename T, typename = std::enable_if_t<std::is_same_v<std::decay_t<T>, InferenceOptions>>>
+  SegmentationBatch infer_segmentation(const ImageInput& image, T&& options,
+                                       SegmentationInferTiming* timing = nullptr) {
+    return infer_segmentation_options(image, options, timing);
+  }
   // Preprocess, execute, then decode_classification. Only task classification
   // with classification_logits_raw or classification_probabilities_raw is
   // accepted. A CUDA output tensor
   // is copied to CPU here; the decoder then runs Top-K on that CPU tensor.
   ClassificationBatch infer_classification(const ImageInput& image, const ClassificationRuntimeConfig& runtime,
                                            ClassificationInferTiming* timing = nullptr);
+  // Phase 12: top_k resolves request > model > framework default (5, capped by
+  // num_classes). The manifest has no classification top_k field.
+  template <typename T, typename = std::enable_if_t<std::is_same_v<std::decay_t<T>, InferenceOptions>>>
+  ClassificationBatch infer_classification(const ImageInput& image, T&& options,
+                                           ClassificationInferTiming* timing = nullptr) {
+    return infer_classification_options(image, options, timing);
+  }
   // Preprocess, execute, explicit D2H when the output is on CUDA, then the CPU
   // OBB decoder and rotated NMS. Only task obb with yolov8_obb_raw is accepted.
   ObbBatch infer_obb(const ImageInput& image, const ObbRuntimeConfig& runtime, ObbInferTiming* timing = nullptr);
+  // Phase 12: rotated-box IoU/NMS policy from the unified resolver. The class
+  // selection is best_class, matching the decoder's single-class output.
+  template <typename T, typename = std::enable_if_t<std::is_same_v<std::decay_t<T>, InferenceOptions>>>
+  ObbBatch infer_obb(const ImageInput& image, T&& options, ObbInferTiming* timing = nullptr) {
+    return infer_obb_options(image, options, timing);
+  }
   // Preprocess, execute, explicit D2H when the output is on CUDA, then the CPU
   // pose decoder and person-box NMS. Only task pose with yolov8_pose_raw is
   // accepted. Keypoints are inverse-mapped on their own, not from the box.
   PoseBatch infer_pose(const ImageInput& image, const PoseRuntimeConfig& runtime, PoseInferTiming* timing = nullptr);
+  // Phase 12: person-box conf/IoU/NMS policy from the unified resolver. There
+  // is still no keypoint-score filter.
+  template <typename T, typename = std::enable_if_t<std::is_same_v<std::decay_t<T>, InferenceOptions>>>
+  PoseBatch infer_pose(const ImageInput& image, T&& options, PoseInferTiming* timing = nullptr) {
+    return infer_pose_options(image, options, timing);
+  }
   // Preprocess, execute, explicit D2H when the output is on CUDA, then the CPU
   // semantic segmentation decoder (ArgMax over the class axis with inverse
   // coordinate recovery to the original image). Only task semantic_segmentation
@@ -240,10 +305,22 @@ class InferenceEngine {
   DecoderRegistry& decoders() noexcept { return decoders_; }
 
  private:
+  // Non-template implementations of the InferenceOptions overloads. They live
+  // out of line so the public templates stay header-only and thin.
+  SegmentationBatch infer_segmentation_options(const ImageInput& image, const InferenceOptions& options,
+                                               SegmentationInferTiming* timing);
+  ClassificationBatch infer_classification_options(const ImageInput& image, const InferenceOptions& options,
+                                                   ClassificationInferTiming* timing);
+  ObbBatch infer_obb_options(const ImageInput& image, const InferenceOptions& options,
+                             ObbInferTiming* timing);
+  PoseBatch infer_pose_options(const ImageInput& image, const InferenceOptions& options,
+                               PoseInferTiming* timing);
+
   DeviceContext device_;
   BackendRegistry backends_;
   DecoderRegistry decoders_;
   ModelManifest manifest_{};
+  InferenceOptions model_options_{};
   std::unique_ptr<IInferenceBackend> backend_;
   std::unique_ptr<IModelDecoder> decoder_;
   bool loaded_ = false;

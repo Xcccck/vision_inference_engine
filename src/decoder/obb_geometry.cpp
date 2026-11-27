@@ -224,6 +224,33 @@ void validate_obb_decode_config(const ObbDecodeConfig& config) {
   }
 }
 
+ObbDecodeConfig obb_decode_config_from_resolved(const ModelManifest& manifest,
+                                               const ResolvedInferenceConfig& resolved) {
+  if (resolved.task != TaskType::Obb || manifest.task != TaskType::Obb) {
+    throw VieError(ErrorCode::InvalidArgument,
+                   "obb_decode_config_from_resolved requires an obb manifest and config");
+  }
+  if (resolved.protocol.empty() || resolved.protocol != manifest.decoder.protocol) {
+    throw VieError(ErrorCode::InvalidArgument,
+                   "resolved inference config protocol does not match the manifest");
+  }
+  const ResolvedObbConfig& policy = resolved.require_obb();
+  ObbDecodeConfig config;
+  config.output_name = manifest.obb.output_name;
+  config.channel_axis = manifest.obb.channel_axis.value_or(-1);
+  config.num_classes = manifest.num_classes.value_or(0);
+  // The OBB decoder keeps one class per candidate; the mask-free OBB output
+  // has no multi-label policy.
+  config.class_selection = ClassSelection::BestClass;
+  config.confidence_threshold = policy.confidence_threshold.value;
+  config.nms_enabled = policy.nms_enabled;
+  config.class_aware = !policy.class_agnostic_nms.value;
+  config.iou_threshold = policy.iou_threshold.value;
+  config.max_detections = policy.max_detections.value;
+  config.pre_nms_top_k = policy.pre_nms_top_k.value;
+  return config;
+}
+
 float rotated_intersection_over_union(const OrientedBox& left, const OrientedBox& right) {
   require_box(left, "rotated box");
   require_box(right, "rotated box");

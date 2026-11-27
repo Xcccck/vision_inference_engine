@@ -34,15 +34,17 @@ std::size_t DynamicBatchAggregator::effective_max_batch_size(bool is_cuda) const
 }
 
 DynamicBatchAggregator::PendingGroup*
-DynamicBatchAggregator::find_or_create_group(const std::shared_ptr<ModelInstance>& model) {
+DynamicBatchAggregator::find_or_create_group(const std::shared_ptr<ModelInstance>& model,
+                                             const std::string& config_key) {
   // Check total pending count against limit
   if (pending_count() >= config_.max_pending_requests) {
     return nullptr;  // Backpressure: too many pending requests
   }
 
-  // Look for an existing group with the same ModelInstance
+  // Look for an existing group with the same ModelInstance and effective
+  // config. Same model + different policy must stay in separate batches.
   for (auto& group : groups_) {
-    if (group.model.get() == model.get()) {
+    if (group.model.get() == model.get() && group.config_key == config_key) {
       return &group;
     }
   }
@@ -51,12 +53,13 @@ DynamicBatchAggregator::find_or_create_group(const std::shared_ptr<ModelInstance
   groups_.push_back(PendingGroup{});
   auto& group = groups_.back();
   group.model = model;
+  group.config_key = config_key;
   group.deadline = std::chrono::steady_clock::now() + config_.max_wait_time;
   return &group;
 }
 
 std::optional<BatchWorkItem> DynamicBatchAggregator::add(InferenceRequest request) {
-  auto* group = find_or_create_group(request.model);
+  auto* group = find_or_create_group(request.model, request.config_key);
   if (!group) {
     // Backpressure: cannot accept more pending requests.
     // This should not normally happen because the RequestQueue is already bounded,

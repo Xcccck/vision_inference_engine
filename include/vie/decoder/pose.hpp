@@ -92,6 +92,12 @@ struct PoseCandidate {
 
 void validate_pose_decode_config(const PoseDecodeConfig& config);
 
+// Phase 12: build the decoder policy from the effective config resolved for
+// this request. This is the only place that maps ResolvedPoseConfig onto
+// PoseDecodeConfig; the current pose decoder is CPU only.
+PoseDecodeConfig pose_decode_config_from_resolved(const ModelManifest& manifest,
+                                                 const ResolvedInferenceConfig& resolved);
+
 // Inverse of GeometryTransform for one point. scale_x and scale_y are applied
 // separately, including when they differ. The point is not clipped.
 void map_keypoint_to_original(float model_x, float model_y, const GeometryTransform& geometry, float& original_x,

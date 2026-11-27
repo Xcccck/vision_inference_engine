@@ -1,5 +1,6 @@
 #pragma once
 
+#include "vie/config/inference_config.hpp"
 #include "vie/decoder/detection.hpp"
 #include "vie/preprocess/image_input.hpp"
 
@@ -40,6 +41,13 @@ struct InferenceRequest {
   ImageInput image;
   std::vector<std::uint8_t> owned_pixels;  // Deep copy for CPU Borrowed images
   std::shared_ptr<ModelInstance> model;    // Resolved at submit time
+  // Phase 12: effective inference policy, resolved and frozen at submit time.
+  // Empty (task Unknown) for requests built outside Runtime::submit(), which
+  // keep the legacy engine path. config_key is config.fingerprint() and is the
+  // second grouping key used by the batch aggregator so requests with different
+  // policies never share a batch.
+  ResolvedInferenceConfig config;
+  std::string config_key;
   std::chrono::steady_clock::time_point submitted_at;
   std::promise<DetectionResult> promise;
 

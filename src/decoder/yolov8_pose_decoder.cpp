@@ -86,6 +86,35 @@ void validate_pose_decode_config(const PoseDecodeConfig& config) {
   }
 }
 
+PoseDecodeConfig pose_decode_config_from_resolved(const ModelManifest& manifest,
+                                                 const ResolvedInferenceConfig& resolved) {
+  if (resolved.task != TaskType::Pose || manifest.task != TaskType::Pose) {
+    throw VieError(ErrorCode::InvalidArgument,
+                   "pose_decode_config_from_resolved requires a pose manifest and config");
+  }
+  if (resolved.protocol.empty() || resolved.protocol != manifest.decoder.protocol) {
+    throw VieError(ErrorCode::InvalidArgument,
+                   "resolved inference config protocol does not match the manifest");
+  }
+  const ResolvedPoseConfig& policy = resolved.require_pose();
+  PoseDecodeConfig config;
+  config.output_name = manifest.pose.output_name;
+  config.channel_axis = manifest.pose.channel_axis.value_or(-1);
+  config.num_classes = manifest.num_classes.value_or(0);
+  config.keypoint_count = manifest.pose.keypoint_count.value_or(0);
+  config.keypoint_dimensions = manifest.pose.keypoint_dimensions.value_or(0);
+  // The current pose decoder keeps one class per candidate (person) and has no
+  // keypoint-score filter, so only the person-box policy is mapped here.
+  config.class_selection = ClassSelection::BestClass;
+  config.confidence_threshold = policy.confidence_threshold.value;
+  config.nms_enabled = policy.nms_enabled;
+  config.class_aware = !policy.class_agnostic_nms.value;
+  config.iou_threshold = policy.iou_threshold.value;
+  config.max_detections = policy.max_detections.value;
+  config.pre_nms_top_k = policy.pre_nms_top_k.value;
+  return config;
+}
+
 void map_keypoint_to_original(float model_x, float model_y, const GeometryTransform& geometry, float& original_x,
                               float& original_y, bool& inside_image) {
   if (!std::isfinite(model_x) || !std::isfinite(model_y)) {

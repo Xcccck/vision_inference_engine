@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace vie {
@@ -24,7 +25,9 @@ struct BatchWorkItem {
 };
 
 // Dynamically aggregates individual inference requests into batches.
-// Groups requests by ModelInstance identity and device compatibility.
+// Groups requests by ModelInstance identity and effective inference config
+// (ResolvedInferenceConfig::fingerprint()), so two requests with different
+// thresholds never share a batch even when they target the same model.
 // Flushes a batch when:
 //   - max_batch_size is reached (immediate flush),
 //   - max_wait_time elapses since the oldest request in the group (timeout flush),
@@ -68,16 +71,19 @@ class DynamicBatchAggregator {
   const BatchAggregationConfig& config() const noexcept { return config_; }
 
  private:
-  // One pending batch group, keyed by ModelInstance identity.
+  // One pending batch group, keyed by ModelInstance identity and effective
+  // inference config fingerprint.
   struct PendingGroup {
     std::shared_ptr<ModelInstance> model;
+    std::string config_key;
     std::vector<InferenceRequest> requests;
     std::chrono::steady_clock::time_point deadline;  // When to flush at latest
   };
 
-  // Find or create a group for the given model instance.
+  // Find or create a group for the given model instance and effective config.
   // Returns nullptr if adding would exceed max_pending_requests.
-  PendingGroup* find_or_create_group(const std::shared_ptr<ModelInstance>& model);
+  PendingGroup* find_or_create_group(const std::shared_ptr<ModelInstance>& model,
+                                     const std::string& config_key);
 
   // Pop a group out of the pending map (for flush).
   BatchWorkItem extract_group(PendingGroup& group);

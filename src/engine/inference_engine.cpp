@@ -301,9 +301,24 @@ void InferenceEngine::load(const ModelConfig& config) {
                    "manifest schema is invalid: " + format_issues(report.schema_issues));
   }
   if (!report.runnable()) {
-    throw VieError(ErrorCode::UnresolvedField, "critical fields are unresolved: " +
-                                                   format_issues(report.unresolved_critical));
+    // Phase 12: the NMS thresholds are policy parameters with framework
+    // defaults. A manifest that enables NMS without pinning them may still
+    // load; resolve_inference_config() supplies 0.25 / 0.45. Every other
+    // critical field keeps its strict check.
+    std::vector<SchemaIssue> blocking;
+    for (const SchemaIssue& issue : report.unresolved_critical) {
+      if (issue.path == "nms.confidence_threshold" || issue.path == "nms.iou_threshold") continue;
+      blocking.push_back(issue);
+    }
+    if (!blocking.empty()) {
+      throw VieError(ErrorCode::UnresolvedField,
+                     "critical fields are unresolved: " + format_issues(blocking));
+    }
   }
+  // Reject a model-level option block for another task, an invalid value, or a
+  // resolved effective value the decoder cannot honor. This fails at load
+  // instead of on the first inference.
+  ::vie::resolve_inference_config(manifest.task, manifest, config.inference_options, InferenceOptions{});
 
   const BackendKind kind = resolve_backend(config.backend, manifest.model_format, config.device,
                                           backends_.contains(BackendKind::OnnxRuntime),
@@ -356,6 +371,7 @@ void InferenceEngine::load(const ModelConfig& config) {
 
   device_ = DeviceContext(config.device, config.device_id);
   manifest_ = std::move(manifest);
+  model_options_ = config.inference_options;
   backend_ = std::move(backend);
   decoder_ = std::move(decoder);
   loaded_ = true;
@@ -366,6 +382,13 @@ const ModelManifest& InferenceEngine::manifest() const {
     throw VieError(ErrorCode::InvalidArgument, "engine is not loaded");
   }
   return manifest_;
+}
+
+ResolvedInferenceConfig InferenceEngine::resolve_inference_config(const InferenceOptions& request) const {
+  if (!loaded_) {
+    throw VieError(ErrorCode::InvalidArgument, "engine is not loaded");
+  }
+  return ::vie::resolve_inference_config(manifest_.task, manifest_, model_options_, request);
 }
 
 BackendOutput InferenceEngine::execute(const BackendRequest& request) {
@@ -386,8 +409,17 @@ PreprocessResult InferenceEngine::preprocess(const ImageInput& image) const {
 }
 
 DetectionBatch InferenceEngine::infer(const ImageInput& image, DetectionInferTiming* timing) {
+  return infer_resolved(image, resolve_inference_config(InferenceOptions{}), timing);
+}
+
+DetectionBatch InferenceEngine::infer_resolved(const ImageInput& image, const ResolvedInferenceConfig& resolved,
+                                               DetectionInferTiming* timing) {
   if (!loaded_) {
     throw VieError(ErrorCode::InvalidArgument, "engine is not loaded");
+  }
+  if (resolved.task != manifest_.task || resolved.protocol != manifest_.decoder.protocol) {
+    throw VieError(ErrorCode::InvalidArgument,
+                   "resolved inference config does not belong to this engine");
   }
   if (manifest_.task == TaskType::Segmentation) {
     throw VieError(ErrorCode::Unsupported,
@@ -424,7 +456,7 @@ DetectionBatch InferenceEngine::infer(const ImageInput& image, DetectionInferTim
   decoded.geometry = prepared.geometry;
   const auto decode_start = std::chrono::steady_clock::now();
   DetectionBatch batch =
-      decoder_->decode_batch(decoded, decoder_config_from_manifest(manifest_), device_);
+      decoder_->decode_batch(decoded, decoder_config_from_resolved(manifest_, resolved), device_);
   if (timing != nullptr) {
     timing->preprocess_ms = preprocess_ms;
     timing->execute_ms = execute_ms;
@@ -444,8 +476,18 @@ DetectionBatch InferenceEngine::infer(const ImageInput& image, DetectionInferTim
 // back to looping infer().
 DetectionBatch InferenceEngine::infer_batch(const std::vector<ImageInput>& images,
                                             DetectionInferTiming* timing) {
+  return infer_batch_resolved(images, resolve_inference_config(InferenceOptions{}), timing);
+}
+
+DetectionBatch InferenceEngine::infer_batch_resolved(const std::vector<ImageInput>& images,
+                                                     const ResolvedInferenceConfig& resolved,
+                                                     DetectionInferTiming* timing) {
   if (!loaded_) {
     throw VieError(ErrorCode::InvalidArgument, "engine is not loaded");
+  }
+  if (resolved.task != manifest_.task || resolved.protocol != manifest_.decoder.protocol) {
+    throw VieError(ErrorCode::InvalidArgument,
+                   "resolved inference config does not belong to this engine");
   }
   if (images.empty()) {
     throw VieError(ErrorCode::InvalidArgument, "infer_batch requires at least one image");
@@ -503,7 +545,7 @@ DetectionBatch InferenceEngine::infer_batch(const std::vector<ImageInput>& image
 
   const auto decode_start = std::chrono::steady_clock::now();
   DetectionBatch batch =
-      decoder_->decode_batch(decoded, decoder_config_from_manifest(manifest_), device_);
+      decoder_->decode_batch(decoded, decoder_config_from_resolved(manifest_, resolved), device_);
   if (batch.results.size() != images.size()) {
     throw VieError(ErrorCode::Internal,
                    "decoder returned " + std::to_string(batch.results.size()) +
@@ -579,6 +621,44 @@ SegmentationBatch InferenceEngine::infer_segmentation(const ImageInput& image,
     timing->includes_mask_d2h = false;
   }
   return batch;
+}
+
+SegmentationBatch InferenceEngine::infer_segmentation_options(const ImageInput& image,
+                                                              const InferenceOptions& options,
+                                                              SegmentationInferTiming* timing) {
+  const ResolvedInferenceConfig resolved = resolve_inference_config(options);
+  if (resolved.task != TaskType::Segmentation) {
+    throw VieError(ErrorCode::Unsupported, "infer_segmentation() requires task segmentation");
+  }
+  const ResolvedSegmentationConfig& policy = resolved.require_segmentation();
+  SegmentationRuntimeConfig runtime;
+  runtime.confidence_threshold = policy.confidence_threshold.value;
+  runtime.iou_threshold = policy.iou_threshold.value;
+  // The YOLOv8 seg decoder keeps one class per candidate; segmentation has no
+  // multi-label option because the mask carries the class decision.
+  runtime.class_selection = ClassSelection::BestClass;
+  runtime.class_aware_nms = !policy.class_agnostic_nms.value;
+  runtime.pre_nms_top_k = policy.pre_nms_top_k.value;
+  runtime.max_detections = policy.max_detections.value;
+  runtime.nms_enabled = policy.nms_enabled;
+  if (policy.retina_masks.has_value()) runtime.retina_masks = policy.retina_masks->value;
+  if (policy.binary_mask_gt_zero.has_value()) {
+    runtime.binary_mask_gt_zero = policy.binary_mask_gt_zero->value;
+  }
+  if (policy.max_mask_bytes.has_value()) runtime.max_mask_bytes = policy.max_mask_bytes->value;
+  return infer_segmentation(image, runtime, timing);
+}
+
+ClassificationBatch InferenceEngine::infer_classification_options(const ImageInput& image,
+                                                                   const InferenceOptions& options,
+                                                                   ClassificationInferTiming* timing) {
+  const ResolvedInferenceConfig resolved = resolve_inference_config(options);
+  if (resolved.task != TaskType::Classification) {
+    throw VieError(ErrorCode::Unsupported, "infer_classification() requires task classification");
+  }
+  ClassificationRuntimeConfig runtime;
+  runtime.top_k = resolved.require_classification().top_k.value;
+  return infer_classification(image, runtime, timing);
 }
 
 ClassificationBatch InferenceEngine::infer_classification(const ImageInput& image,
@@ -742,6 +822,24 @@ SemanticSegmentationResult InferenceEngine::infer_semantic_segmentation(const Im
   return result;
 }
 
+ObbBatch InferenceEngine::infer_obb_options(const ImageInput& image, const InferenceOptions& options,
+                                         ObbInferTiming* timing) {
+  const ResolvedInferenceConfig resolved = resolve_inference_config(options);
+  if (resolved.task != TaskType::Obb) {
+    throw VieError(ErrorCode::Unsupported, "infer_obb() requires task obb");
+  }
+  const ObbDecodeConfig config = obb_decode_config_from_resolved(manifest_, resolved);
+  ObbRuntimeConfig runtime;
+  runtime.confidence_threshold = config.confidence_threshold;
+  runtime.iou_threshold = config.iou_threshold;
+  runtime.class_selection = config.class_selection;
+  runtime.class_aware = config.class_aware;
+  runtime.pre_nms_top_k = config.pre_nms_top_k;
+  runtime.max_detections = config.max_detections;
+  runtime.nms_enabled = config.nms_enabled;
+  return infer_obb(image, runtime, timing);
+}
+
 ObbBatch InferenceEngine::infer_obb(const ImageInput& image, const ObbRuntimeConfig& runtime,
                                   ObbInferTiming* timing) {
   if (!loaded_ || backend_ == nullptr || decoder_ == nullptr) {
@@ -818,6 +916,24 @@ ObbBatch InferenceEngine::infer_obb(const ImageInput& image, const ObbRuntimeCon
     timing->includes_d2h = d2h_bytes > 0;
   }
   return batch;
+}
+
+PoseBatch InferenceEngine::infer_pose_options(const ImageInput& image, const InferenceOptions& options,
+                                            PoseInferTiming* timing) {
+  const ResolvedInferenceConfig resolved = resolve_inference_config(options);
+  if (resolved.task != TaskType::Pose) {
+    throw VieError(ErrorCode::Unsupported, "infer_pose() requires task pose");
+  }
+  const PoseDecodeConfig config = pose_decode_config_from_resolved(manifest_, resolved);
+  PoseRuntimeConfig runtime;
+  runtime.confidence_threshold = config.confidence_threshold;
+  runtime.iou_threshold = config.iou_threshold;
+  runtime.class_selection = config.class_selection;
+  runtime.class_aware = config.class_aware;
+  runtime.pre_nms_top_k = config.pre_nms_top_k;
+  runtime.max_detections = config.max_detections;
+  runtime.nms_enabled = config.nms_enabled;
+  return infer_pose(image, runtime, timing);
 }
 
 PoseBatch InferenceEngine::infer_pose(const ImageInput& image, const PoseRuntimeConfig& runtime,

@@ -1,5 +1,6 @@
 #include "vie/decoder/detection.hpp"
 
+#include "vie/config/inference_config.hpp"
 #include "vie/decoder/rtdetr_decoder.hpp"
 
 #include <algorithm>
@@ -187,53 +188,15 @@ std::vector<int> greedy_nms(const std::vector<NmsCandidate>& sorted, float iou_t
   return kept;
 }
 
-DecoderConfig rtdetr_decoder_config(const ModelManifest& manifest) {
-  require(manifest.decoder.box_decode == "decoded_normalized_cxcywh",
-          "decoder.box_decode is not decoded_normalized_cxcywh");
-  require(manifest.decoder.box_format == "cxcywh_normalized",
-          "decoder.box_format is not cxcywh_normalized");
-  require(manifest.decoder.scores_are_probabilities.has_value(),
-          "decoder.scores_are_probabilities is unresolved");
-  require(manifest.decoder.box_channels.has_value(), "decoder.box_channels is unresolved");
-  require(manifest.decoder.channel_axis.has_value(), "decoder.channel_axis is unresolved");
-  require(manifest.decoder.num_queries.has_value(), "decoder.num_queries is unresolved");
-  require(manifest.num_classes.has_value(), "num_classes is unresolved");
-  const OutputDesc* prediction = nullptr;
-  for (const OutputDesc& output : manifest.outputs) {
-    if (output.semantic == "predictions") prediction = &output;
-  }
-  require(prediction != nullptr && !prediction->name.empty(), "outputs semantic predictions is unresolved");
-  DecoderConfig config;
-  config.output_name = prediction->name;
-  config.channel_axis = *manifest.decoder.channel_axis;
-  config.box_channels = *manifest.decoder.box_channels;
-  config.num_classes = *manifest.num_classes;
-  config.num_queries = manifest.decoder.num_queries;
-  config.box_decode = BoxDecode::DecodedNormalizedCxcywh;
-  config.scores_are_probabilities = manifest.decoder.scores_are_probabilities;
-  if (manifest.decoder.class_selection.empty()) {
-    throw VieError(ErrorCode::UnresolvedField, "decoder.class_selection is unresolved");
-  }
-  if (manifest.decoder.class_selection == "best_class") {
-    config.class_selection = ClassSelection::BestClass;
-  } else if (manifest.decoder.class_selection == "all_above_threshold") {
-    config.class_selection = ClassSelection::AllAboveThreshold;
-  } else {
-    throw VieError(ErrorCode::InvalidArgument, "decoder.class_selection is not a known value");
-  }
-  config.confidence_threshold = manifest.nms.confidence_threshold;
-  config.nms_enabled = manifest.nms.enabled;
-  config.max_detections = manifest.nms.max_detections;
-  validate_rtdetr_decoder_config(config);
-  return config;
-}
+namespace {
 
-DecoderConfig decoder_config_from_manifest(const ModelManifest& manifest) {
-  if (manifest.decoder.protocol == "rtdetr_detection_raw") return rtdetr_decoder_config(manifest);
+// Structural YOLOv8 fields only: no NMS/IoU/top-k policy and no class-selection
+// requirement. decoder_config_from_manifest() preserves the legacy strict
+// contract; decoder_config_from_resolved() overlays the effective policy.
+DecoderConfig yolo_structural_config(const ModelManifest& manifest) {
   require(!manifest.decoder.box_decode.empty(), "decoder.box_decode is unresolved");
   require(manifest.decoder.scores_are_probabilities.has_value(),
           "decoder.scores_are_probabilities is unresolved");
-  require(!manifest.decoder.class_selection.empty(), "decoder.class_selection is unresolved");
   require(manifest.decoder.box_channels.has_value(), "decoder.box_channels is unresolved");
   require(manifest.decoder.channel_axis.has_value(), "decoder.channel_axis is unresolved");
   require(manifest.num_classes.has_value(), "num_classes is unresolved");
@@ -260,15 +223,110 @@ DecoderConfig decoder_config_from_manifest(const ModelManifest& manifest) {
     config.class_selection = ClassSelection::BestClass;
   } else if (manifest.decoder.class_selection == "all_above_threshold") {
     config.class_selection = ClassSelection::AllAboveThreshold;
-  } else {
+  } else if (!manifest.decoder.class_selection.empty()) {
     throw VieError(ErrorCode::InvalidArgument, "decoder.class_selection is not a known value");
   }
+  return config;
+}
+
+DecoderConfig rtdetr_structural_config(const ModelManifest& manifest) {
+  require(manifest.decoder.box_decode == "decoded_normalized_cxcywh",
+          "decoder.box_decode is not decoded_normalized_cxcywh");
+  require(manifest.decoder.box_format == "cxcywh_normalized",
+          "decoder.box_format is not cxcywh_normalized");
+  require(manifest.decoder.scores_are_probabilities.has_value(),
+          "decoder.scores_are_probabilities is unresolved");
+  require(manifest.decoder.box_channels.has_value(), "decoder.box_channels is unresolved");
+  require(manifest.decoder.channel_axis.has_value(), "decoder.channel_axis is unresolved");
+  require(manifest.decoder.num_queries.has_value(), "decoder.num_queries is unresolved");
+  require(manifest.num_classes.has_value(), "num_classes is unresolved");
+  const OutputDesc* prediction = nullptr;
+  for (const OutputDesc& output : manifest.outputs) {
+    if (output.semantic == "predictions") prediction = &output;
+  }
+  require(prediction != nullptr && !prediction->name.empty(),
+          "outputs semantic predictions is unresolved");
+  DecoderConfig config;
+  config.output_name = prediction->name;
+  config.channel_axis = *manifest.decoder.channel_axis;
+  config.box_channels = *manifest.decoder.box_channels;
+  config.num_classes = *manifest.num_classes;
+  config.num_queries = manifest.decoder.num_queries;
+  config.box_decode = BoxDecode::DecodedNormalizedCxcywh;
+  config.scores_are_probabilities = manifest.decoder.scores_are_probabilities;
+  return config;
+}
+
+ClassSelection class_selection_from_manifest(const ModelManifest& manifest) {
+  if (manifest.decoder.class_selection.empty()) {
+    throw VieError(ErrorCode::UnresolvedField, "decoder.class_selection is unresolved");
+  }
+  if (manifest.decoder.class_selection == "best_class") return ClassSelection::BestClass;
+  if (manifest.decoder.class_selection == "all_above_threshold") {
+    return ClassSelection::AllAboveThreshold;
+  }
+  throw VieError(ErrorCode::InvalidArgument, "decoder.class_selection is not a known value");
+}
+
+}  // namespace
+
+DecoderConfig rtdetr_decoder_config(const ModelManifest& manifest) {
+  DecoderConfig config = rtdetr_structural_config(manifest);
+  config.class_selection = class_selection_from_manifest(manifest);
+  config.confidence_threshold = manifest.nms.confidence_threshold;
+  config.nms_enabled = manifest.nms.enabled;
+  config.max_detections = manifest.nms.max_detections;
+  validate_rtdetr_decoder_config(config);
+  return config;
+}
+
+DecoderConfig decoder_config_from_manifest(const ModelManifest& manifest) {
+  if (manifest.decoder.protocol == "rtdetr_detection_raw") return rtdetr_decoder_config(manifest);
+  DecoderConfig config = yolo_structural_config(manifest);
+  config.class_selection = class_selection_from_manifest(manifest);
   config.confidence_threshold = manifest.nms.confidence_threshold;
   config.nms_enabled = manifest.nms.enabled;
   config.class_aware_nms = manifest.nms.class_aware;
   config.iou_threshold = manifest.nms.iou_threshold;
   config.max_detections = manifest.nms.max_detections;
   config.pre_nms_top_k = manifest.nms.pre_nms_top_k;
+  if (config.box_decode == BoxDecode::DecodedCxcywh && manifest.decoder.box_format != "cxcywh") {
+    throw VieError(ErrorCode::UnresolvedField, "decoder.box_format is not cxcywh for decoded boxes");
+  }
+  validate_decoder_config(config);
+  return config;
+}
+
+DecoderConfig decoder_config_from_resolved(const ModelManifest& manifest,
+                                           const ResolvedInferenceConfig& resolved) {
+  if (resolved.task != TaskType::Detection || manifest.task != TaskType::Detection) {
+    throw VieError(ErrorCode::InvalidArgument,
+                   "decoder_config_from_resolved requires a detection manifest and config");
+  }
+  if (resolved.protocol.empty() || resolved.protocol != manifest.decoder.protocol) {
+    throw VieError(ErrorCode::InvalidArgument,
+                   "resolved inference config protocol does not match the manifest");
+  }
+  const ResolvedDetectionConfig& policy = resolved.require_detection();
+  if (manifest.decoder.protocol == "rtdetr_detection_raw") {
+    DecoderConfig config = rtdetr_structural_config(manifest);
+    config.class_selection =
+        policy.multi_label.value ? ClassSelection::AllAboveThreshold : ClassSelection::BestClass;
+    config.confidence_threshold = policy.confidence_threshold.value;
+    config.nms_enabled = policy.nms_enabled;
+    config.max_detections = policy.max_detections.value;
+    validate_rtdetr_decoder_config(config);
+    return config;
+  }
+  DecoderConfig config = yolo_structural_config(manifest);
+  config.class_selection =
+      policy.multi_label.value ? ClassSelection::AllAboveThreshold : ClassSelection::BestClass;
+  config.confidence_threshold = policy.confidence_threshold.value;
+  config.nms_enabled = policy.nms_enabled;
+  config.class_aware_nms = !policy.class_agnostic_nms.value;
+  config.iou_threshold = policy.iou_threshold.value;
+  config.max_detections = policy.max_detections.value;
+  config.pre_nms_top_k = policy.pre_nms_top_k.value;
   if (config.box_decode == BoxDecode::DecodedCxcywh && manifest.decoder.box_format != "cxcywh") {
     throw VieError(ErrorCode::UnresolvedField, "decoder.box_format is not cxcywh for decoded boxes");
   }

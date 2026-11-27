@@ -317,7 +317,7 @@ Thread-safe bounded queue for async inference requests. Supports graceful shutdo
 Automatically groups compatible single-image requests into batches for `infer_batch()` execution.
 
 **Features**:
-- Groups requests by `ModelInstance` pointer identity (same model = same group)
+- Groups requests by `ModelInstance` pointer identity **and** the effective inference config fingerprint (`ResolvedInferenceConfig::fingerprint()`, Phase 12). Two requests with different thresholds never share a batch, even for the same model.
 - Flush on batch full (`max_batch_size` reached)
 - Flush on timeout (`max_wait_time` elapsed since first request in group)
 - Flush on shutdown (all pending groups drained)
@@ -988,6 +988,72 @@ not silently proxied:
 `<prefix>_input.f32 / _logits.f32 / _classids.i32 / manifest.json`),
 `reference_infer.py` (torchvision reference + numeric deltas JSON report),
 `visualize_result.py` (class-map PNG + overlay + histogram).
+
+### Inference Configuration (Phase 12)
+
+**Location**: `include/vie/config/inference_config.hpp`, `src/config/inference_config.cpp`
+
+One typed policy object per task, resolved once into an immutable snapshot before any decoder runs. The resolver is independent of the decoders: every decoder receives the same `ResolvedInferenceConfig`-derived `DecoderConfig`, so no decoder carries its own defaults for request-scoped policy.
+
+#### Layers and priority
+
+| Layer | Carrier | Meaning |
+|---|---|---|
+| Per-request | `InferenceOptions` passed to `infer()`, `infer_batch()`, `infer_segmentation()`, `infer_classification()`, `infer_obb()`, `infer_pose()`, `Runtime::submit()` | explicit override for one call |
+| Model | `ModelConfig::inference_options` captured at `load()` | defaults for one loaded model |
+| Manifest | `nms.*`, `segmentation.*`, `decoder.class_selection` | model/user configuration that is actually usable |
+| Framework | `kFramework*` constants in `inference_config.hpp` | last-resort fallback |
+
+Priority: **request > model default > usable manifest value > framework default**. A parameter left unset at every layer takes the framework default; the effective value and its `ParameterSource` are both available on the resolved config.
+
+#### Manifest usability
+
+- `Certainty::Unresolved` and `Certainty::Inferred` values never participate: an inferred "typical YOLO threshold" is not a model fact and cannot become a default.
+- A set value without a provenance entry counts as user-supplied (`ParameterSource::Manifest`).
+- Framework defaults are never written back into the manifest and are never tagged as model observations.
+- `decoder.class_selection` is a structural manifest fact: `all_above_threshold` resolves `multi_label=true`, `best_class` resolves `multi_label=false`.
+
+#### Framework defaults
+
+| Parameter | Default |
+|---|---|
+| `confidence_threshold` | `0.25` |
+| `iou_threshold` | `0.45` |
+| `max_detections` | `300` (upper bound `100000`) |
+| `pre_nms_top_k` | `4096` (upper bound `4096`) |
+| classification `top_k` | `min(5, num_classes)` |
+| segmentation `retina_masks` / `binary_mask_gt_zero` / `max_mask_bytes` | no framework default; must come from the model, manifest, or request (`UnresolvedField` otherwise) |
+
+#### Validation and task applicability
+
+- Thresholds must be finite and in `[0, 1]`; `0` and `1` are legal boundaries. NaN, Inf and out-of-range values throw `InvalidArgument`.
+- Counts must be `>= 1` and within their stated upper bounds; negatives, zero and overflow throw `InvalidArgument`.
+- A non-empty block for a task other than the loaded model's task throws `InvalidArgument` instead of being ignored. Semantic segmentation accepts no policy block at all.
+- RT-DETR rejects `iou_threshold`, `pre_nms_top_k`, `class_agnostic_nms` and `multi_label=true` with `Unsupported`; its structural `nms_enabled` is always `false`.
+- Invalid values are rejected, never silently clamped to a default.
+
+#### Per-task parameter matrix
+
+| Task | Supported policy fields |
+|---|---|
+| Detection (YOLOv8, CPU/CUDA decoder) | `confidence_threshold`, `iou_threshold`, `max_detections`, `pre_nms_top_k`, `class_agnostic_nms`, `multi_label` |
+| Detection (RT-DETR, CPU/CUDA decoder) | `confidence_threshold`, `max_detections`, `multi_label` (only `false`) |
+| Instance segmentation | `confidence_threshold`, `iou_threshold`, `max_detections`, `pre_nms_top_k`, `class_agnostic_nms`, `retina_masks`, `binary_mask_gt_zero`, `max_mask_bytes` |
+| Classification | `top_k` (bounded by `num_classes`; no confidence filter in the current decoder) |
+| OBB | `confidence_threshold`, rotated-box `iou_threshold`, `max_detections`, `pre_nms_top_k`, `class_agnostic_nms` (class selection is `best_class`) |
+| Pose | `confidence_threshold`, person-box `iou_threshold`, `max_detections`, `pre_nms_top_k`, `class_agnostic_nms` (no keypoint-score threshold exists) |
+| Semantic segmentation | none (ArgMax only) |
+
+#### Snapshot semantics and batch isolation
+
+- Synchronous `infer*()` resolves the config at entry and runs that snapshot for the whole call.
+- `Runtime::submit()` resolves **at submit time** and stores the snapshot in `InferenceRequest`; workers run the stored snapshot. Mutating the caller's `InferenceOptions` after `submit()` returns cannot affect the queued request. `ModelInstance` and its engine are never mutated by a request.
+- The dynamic batch aggregator groups by `(ModelInstance identity, config.fingerprint())`. Requests with different effective configs form different groups even on the same model, so a batch never mixes policies; `Runtime::execute_batch()` re-checks the invariant defensively. Different-config requests are not merged to raise the batch hit rate.
+- `fingerprint()` encodes task, protocol and every resolved policy value, so config equality is value equality, not object identity.
+
+#### CPU/CUDA consistency
+
+Both CPU and CUDA decoders consume the same resolved `DecoderConfig` built from the snapshot; neither keeps a private default set. The CPU/CUDA parity test feeds identical tensors and the same config to the CPU and CUDA decode paths and asserts equal counts/classes and confidence/coordinate equality within an explicit tolerance (confidence `1e-5`, coordinates `1e-4`).
 
 ### RuntimeConfig
 

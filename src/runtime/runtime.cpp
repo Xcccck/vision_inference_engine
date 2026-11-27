@@ -147,6 +147,11 @@ void Runtime::shutdown() {
 }
 
 std::future<DetectionResult> Runtime::submit(const std::string& model_id, ImageInput image) {
+  return submit(model_id, std::move(image), InferenceOptions{});
+}
+
+std::future<DetectionResult> Runtime::submit(const std::string& model_id, ImageInput image,
+                                             const InferenceOptions& options) {
   // Check if runtime is running
   if (!running_.load()) {
     throw VieError(ErrorCode::RuntimeNotStarted, "Runtime is not running");
@@ -185,12 +190,19 @@ std::future<DetectionResult> Runtime::submit(const std::string& model_id, ImageI
   }
   resource_mgr_->register_resource(resource);
 
+  // Phase 12: resolve and freeze the effective inference config before the
+  // request is queued. A caller that mutates `options` after submit() returns
+  // can no longer affect this request.
+  const ResolvedInferenceConfig effective = model->resolve_inference_config(options);
+
   // Create the request with pre-resolved model reference
   InferenceRequest request;
   request.id = next_request_id_.fetch_add(1);
   request.model_id = model_id;
   request.image = image;
   request.model = model;
+  request.config = effective;
+  request.config_key = effective.fingerprint();
   request.submitted_at = std::chrono::steady_clock::now();
 
   // Phase 9.2.2.2/11.1: Deep-copy CPU pixel data so the caller can safely
@@ -335,6 +347,21 @@ void Runtime::execute_batch(BatchWorkItem& batch) {
       images.push_back(req.image);
     }
 
+    // Phase 12: every request in a batch carries the config resolved at submit
+    // time. The aggregator only groups equal fingerprints, so this is a
+    // defensive check, not the primary isolation mechanism.
+    const ResolvedInferenceConfig* effective = nullptr;
+    if (!batch.requests.empty() && batch.requests.front().config.task != TaskType::Unknown) {
+      const std::string& key = batch.requests.front().config_key;
+      for (const auto& req : batch.requests) {
+        if (req.config_key != key) {
+          throw VieError(ErrorCode::Internal,
+                         "batch contains requests with different effective inference configs");
+        }
+      }
+      effective = &batch.requests.front().config;
+    }
+
     // Execute inference: use the async staging boundary. batch_size==1 goes
     // through infer_async() (compatible with fixed-batch models and, for CUDA
     // instances, performs the Runtime-owned CPU->CUDA H2D staging); batch_size>1
@@ -342,10 +369,12 @@ void Runtime::execute_batch(BatchWorkItem& batch) {
     // forced to size 1 upstream). CPU models take the unchanged synchronous
     // path inside these methods.
     if (batch_size == 1) {
-      result = batch.model->infer_async(images[0]);
+      result = effective != nullptr ? batch.model->infer_async(images[0], *effective)
+                                    : batch.model->infer_async(images[0]);
       metrics_->record_single_infer();
     } else {
-      result = batch.model->infer_batch_async(images);
+      result = effective != nullptr ? batch.model->infer_batch_async(images, *effective)
+                                    : batch.model->infer_batch_async(images);
     }
 
     // Validate result count matches batch size

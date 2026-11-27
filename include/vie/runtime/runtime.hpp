@@ -94,6 +94,14 @@ class Runtime {
   // synchronous CUDA inference.
   std::future<DetectionResult> submit(const std::string& model_id, ImageInput image);
 
+  // Phase 12: per-request inference policy. The effective configuration
+  // (request > model default > usable manifest value > framework default) is
+  // resolved and frozen at submit time. Mutating `options` after this call
+  // cannot affect the queued request. Requests whose effective configs differ
+  // are never aggregated into the same dynamic batch.
+  std::future<DetectionResult> submit(const std::string& model_id, ImageInput image,
+                                      const InferenceOptions& options);
+
   // Start the runtime (launch inference workers). Called automatically in constructor.
   void start();
 
