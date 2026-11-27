@@ -1216,9 +1216,9 @@ entry, `cudaStreamSynchronize` on that stream for the three control-word reads a
 the final D2H, never `cudaDeviceSynchronize`; RAII `DeviceBuffer`/event pairs keep
 temporaries alive; every launch checks `cudaGetLastError`; `Tensor::data()` is
 never called on a CUDA tensor. `d2h_bytes` counts only the compact payload
-(`kept * 28 + kept * keypoints * 16`); the 8-byte fault word and the three 4-byte
-counters are control transfers and are not counted, consistent with the other
-CUDA decoders. `decode_ms` is wall-clock on CUDA (launch + sync included);
+(`kept * 28 + kept * keypoints * 16`); the two 8-byte fault words (filter and map)
+and the three 4-byte counters are control transfers and are not counted, consistent
+with the other CUDA decoders. `decode_ms` is wall-clock on CUDA (launch + sync included);
 `validate_ms` covers filter + sort, `pose_decode_ms` covers map + compact, `nms_ms`
 covers NMS/prefix, and `d2h_ms` covers pack + the two payload copies.
 
