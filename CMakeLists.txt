@@ -86,16 +86,6 @@ if(VIE_ENABLE_CUDA AND VIE_ENABLE_ONNXRUNTIME AND NOT VIE_ONNXRUNTIME_GPU_ROOT S
   endif()
 endif()
 
-if(VIE_ENABLE_OPENCV)
-  find_package(OpenCV QUIET COMPONENTS core imgproc imgcodecs)
-  if(NOT OpenCV_FOUND)
-    message(WARNING "VIE_ENABLE_OPENCV is ON but OpenCV was not found. OpenCV stays disabled.")
-  else()
-    message(WARNING "OpenCV was found, but this version of VIE does not link it into vie_core. OpenCV stays disabled.")
-  endif()
-  set(VIE_ENABLE_OPENCV OFF CACHE BOOL "Enable OpenCV" FORCE)
-endif()
-
 find_package(nlohmann_json 3.2.0 REQUIRED)
 
 add_library(vie
@@ -193,6 +183,24 @@ if(VIE_ENABLE_ONNXRUNTIME)
   endif()
 endif()
 
+if(VIE_ENABLE_OPENCV)
+  # Optional cv::Mat -> ImageInput adapter. Only the core module is needed; VIE
+  # does not decode, read files or process colors here. When this option is OFF
+  # the core library has no OpenCV include path, no link dependency and no
+  # VIE_HAS_OPENCV define, so include/vie/opencv/image_input.hpp compiles away.
+  find_package(OpenCV QUIET COMPONENTS core)
+  if(NOT OpenCV_FOUND)
+    message(WARNING "VIE_ENABLE_OPENCV is ON but OpenCV was not found. The cv::Mat adapter stays disabled.")
+    set(VIE_ENABLE_OPENCV OFF CACHE BOOL "Enable the optional cv::Mat input adapter" FORCE)
+  else()
+    message(STATUS "OpenCV ${OpenCV_VERSION}: cv::Mat input adapter enabled")
+    target_sources(vie PRIVATE src/opencv/image_input.cpp)
+    target_include_directories(vie PUBLIC ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(vie PUBLIC ${OpenCV_LIBS})
+    target_compile_definitions(vie PUBLIC VIE_HAS_OPENCV=1)
+  endif()
+endif()
+
 target_compile_features(vie PUBLIC cxx_std_17)
 
 target_compile_options(vie PRIVATE
@@ -244,6 +252,9 @@ if(VIE_BUILD_TESTS)
   target_link_libraries(vie_tests PRIVATE vie::vie GTest::gtest GTest::gtest_main)
   target_compile_options(vie_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
   target_compile_definitions(vie_tests PRIVATE VIE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+  if(VIE_ENABLE_OPENCV)
+    target_sources(vie_tests PRIVATE tests/test_opencv_input.cpp)
+  endif()
   if(VIE_ENABLE_ONNXRUNTIME)
     target_sources(vie_tests PRIVATE tests/test_onnxruntime_backend.cpp)
     if(VIE_ENABLE_ONNXRUNTIME_CUDA)

@@ -97,6 +97,12 @@ cmake -S . -B build-ort-gpu -DVIE_ENABLE_ONNXRUNTIME=ON -DVIE_ENABLE_CUDA=ON \
       -DVIE_ONNXRUNTIME_GPU_ROOT=/opt/onnxruntime-linux-x64-gpu-1.20.1 \
       -DCMAKE_CUDA_ARCHITECTURES=89
 cmake --build build-ort-gpu -j
+
+# 4) 可选：cv::Mat → ImageInput 适配（可在上面任意构建上追加开关）
+cmake -S . -B build-opencv -DVIE_ENABLE_ONNXRUNTIME=ON \
+      -DVIE_ONNXRUNTIME_ROOT=/opt/onnxruntime-linux-x64-1.20.1 \
+      -DVIE_ENABLE_OPENCV=ON
+cmake --build build-opencv -j
 ```
 
 | 选项 | 默认 | 说明 |
@@ -106,7 +112,8 @@ cmake --build build-ort-gpu -j
 | `VIE_ONNXRUNTIME_ROOT` | `""` | CPU 包前缀；未设置时回退环境变量 `ONNXRUNTIME_ROOT` |
 | `VIE_ONNXRUNTIME_GPU_ROOT` | `""` | 仅 `CUDA` 与 `ONNXRUNTIME` 同时打开且路径非空时生效 |
 | `VIE_BUILD_TESTS` | `ON` | 需要 GoogleTest；上面的命令都默认打开 |
-| `VIE_ENABLE_TENSORRT` / `VIE_ENABLE_OPENCV` | `OFF` | 占位选项，开启也会被强制回 `OFF` |
+| `VIE_ENABLE_TENSORRT` | `OFF` | 占位选项，开启也会被强制回 `OFF` |
+| `VIE_ENABLE_OPENCV` | `OFF` | 打开后编译可选的 `cv::Mat` → `ImageInput` 适配；核心库仍不含 OpenCV 头 |
 
 同一个进程只链接一份 `libonnxruntime.so.1`：指定 GPU 包时 CPU Backend 也用它，但仍然只注册 CPU Execution Provider。
 
@@ -143,6 +150,22 @@ for (const vie::Detection& det : batch.results.front().detections) {
 ```
 
 现成的 JSON Manifest 例子：[tools/diagnostics/model_deployment/yolov8n.manifest.json](tools/diagnostics/model_deployment/yolov8n.manifest.json)，用 `ModelManifest::load_file()` 读入。
+
+已经用 OpenCV 或其他工具解码好图像时，可以直接接入（需 `-DVIE_ENABLE_OPENCV=ON`）：
+
+```cpp
+#include <vie/opencv/image_input.hpp>   // 不在 vie/vie.hpp 里，OpenCV 是可选依赖
+#include <opencv2/core.hpp>
+
+cv::Mat bgr = ...;  // 调用方自己 imread / 采集；VIE 不做 JPG/PNG 解码
+const vie::ImageInput view = vie::from_cv_mat(bgr);  // 默认 BGR；ROI 用真实 step 作 stride
+const vie::DetectionBatch out = engine.infer(view);
+
+// 异步提交：submit() 内部已深拷贝 CPU 像素，返回后即可释放 bgr
+std::future<vie::DetectionResult> fut = runtime.submit("det", vie::from_cv_mat(bgr));
+```
+
+适配只接受 `CV_8UC1`（Gray）、`CV_8UC3`（默认 BGR，可显式传 `ColorOrder::Rgb`）、`CV_32FC1`、`CV_32FC3`；`CV_8UC4`/16 位等直接抛 `Unsupported`，不静默丢 alpha 或换深度。同步 `infer()` 是借用语义，`cv::Mat` 必须活到调用返回。
 
 多模型 + 异步提交：
 
@@ -185,7 +208,7 @@ ctest --test-dir build-ort-gpu --output-on-failure      # CUDA + ORT：432 个�
 
 缺 fixture 时真实模型用例走 `VIE_REQUIRE_MODEL` 跳过而不是失败，所以新 clone 直接 `ctest` 也是全绿 —— 但那意味着约 73 个用例根本没跑。要验证真实模型链路，先执行 `python3 tools/export_test_models.py`，跳过数应归零。
 
-39 个测试源文件覆盖 Tensor / Manifest / Analyzer / Recognizer / Decoder / Preprocess / Runtime。sanitizer 构建：
+40 个测试源文件覆盖 Tensor / Manifest / Analyzer / Recognizer / Decoder / Preprocess / Runtime / OpenCV 适配。sanitizer 构建：
 
 ```bash
 cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DVIE_ENABLE_ONNXRUNTIME=ON \
@@ -215,7 +238,7 @@ target_link_libraries(your_app PRIVATE vie::vie)   # include 目录与 VIE_HAS_*
 
 ## 已知限制
 
-- 不做图像文件解码，OpenCV 路径未接通。
+- 不做图像文件解码（imread / JPG / PNG）；OpenCV 仅是可选的 `cv::Mat` → `ImageInput` 适配层（`VIE_ENABLE_OPENCV=ON`），解码与采集仍由调用方完成。
 - TensorRT / PyTorch 解析未实现。
 - NMS 阈值、Top-K、单类/多类选择不自动确定，全部来自 Manifest 或当次 runtime config。
 - 单个 `InferenceEngine` 非线程安全；重叠调用是数据竞争，库不会自动排队。
