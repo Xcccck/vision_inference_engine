@@ -250,6 +250,7 @@ TEST(OnnxRuntimeCudaBackend, RepeatsExecutesAndKeepsOutputAfterDestruction) {
 }
 
 TEST(OnnxRuntimeCudaBackend, RejectsBadInputsAndUnavailableDevices) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   const std::string path =
       write_model("reject.onnx", identity_model({static_dim(4)}, "images", "predictions"));
   vie::OnnxRuntimeCudaBackend backend;
@@ -380,6 +381,7 @@ TEST(OnnxRuntimeCudaBackend, EngineSelectsCudaAndDoesNotFallBack) {
 }
 
 TEST(OnnxRuntimeCudaBackend, RunsYoloV8nOnCuda) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   const std::string path = vie_fixture("testdata/onnx/yolov8n.onnx");
   vie::OnnxRuntimeCudaBackend backend;
   backend.set_intra_op_threads(4);
@@ -420,6 +422,7 @@ TEST(OnnxRuntimeCudaBackend, RunsYoloV8nOnCuda) {
 }
 
 TEST(OnnxRuntimeCudaBackend, ComparesYoloV8nCpuAndCuda) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   const std::string path = vie_fixture("testdata/onnx/yolov8n.onnx");
   constexpr int kWarmup = 10;
   constexpr int kRuns = 100;

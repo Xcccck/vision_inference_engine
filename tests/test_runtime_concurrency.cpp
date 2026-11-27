@@ -223,6 +223,7 @@ TEST_F(BatchExecutionQueueTest, GracefulShutdownDrainsQueuedBatches) {
 class MultiModelConcurrencyTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
     model_path_ = vie_fixture("testdata/onnx/yolov8n.onnx");
   }
 

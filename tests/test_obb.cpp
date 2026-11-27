@@ -366,6 +366,7 @@ TEST(YoloV8ObbDecoder, FiltersNmsAndRejectsIllegalTensors) {
 }
 
 TEST(YoloV8ObbRecognizer, AcceptsTheProvenHeadAndRejectsLookalikes) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   const vie::ModelAnalysisReport report = analyze_graph(obb_graph(0.25f, false));
   bool saw_quarter = false;
   for (const vie::FloatConstant& constant : report.float_constants) {

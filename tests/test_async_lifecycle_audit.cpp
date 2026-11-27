@@ -534,6 +534,7 @@ ImageInput make_small_image(std::vector<uint8_t>& buf, int w = 64, int h = 64) {
 }  // namespace
 
 TEST(RuntimeConcurrencySemanticsTest, DifferentModelsHaveOverlappingExecution) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
 #if defined(VIE_HAS_ONNXRUNTIME_CUDA)
   GTEST_SKIP() << "Timing-based proof invalid with GPU EP (single CUDA stream serializes inference)";
 #endif
@@ -604,6 +605,7 @@ TEST(RuntimeConcurrencySemanticsTest, DifferentModelsHaveOverlappingExecution) {
 }
 
 TEST(RuntimeConcurrencySemanticsTest, AcceptedRequestCountMatchesCompleted) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   // After shutdown, accepted == completed + failed (nothing pending).
   RuntimeConfig config = default_test_config();
   config.request_queue_capacity = 100;
@@ -632,6 +634,7 @@ TEST(RuntimeConcurrencySemanticsTest, AcceptedRequestCountMatchesCompleted) {
 }
 
 TEST(RuntimeConcurrencySemanticsTest, ConcurrentShutdownSafe) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   RuntimeConfig config = default_test_config();
   Runtime runtime(config);
   runtime.models().load("model", make_ort_test_config());
@@ -658,6 +661,7 @@ TEST(RuntimeConcurrencySemanticsTest, ConcurrentShutdownSafe) {
 }
 
 TEST(RuntimeConcurrencySemanticsTest, SubmitRacingWithShutdown) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   // Multiple submit threads racing with one shutdown thread.
   // Invariant: every submit either throws OR its future eventually completes.
   RuntimeConfig config = default_test_config();

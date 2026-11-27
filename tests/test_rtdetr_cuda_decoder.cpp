@@ -647,6 +647,7 @@ float box_iou(const vie::BoundingBox& a, const vie::BoundingBox& b) {
 }  // namespace
 
 TEST(RtdetrCudaE2E, StrictCudaEpDecodesOnDeviceAndRecordsThresholds) {
+  VIE_REQUIRE_MODEL("testdata/onnx/rtdetr-l.onnx");
   vie::ModelManifest manifest = runtime_manifest();
   std::vector<std::uint8_t> pixels;
   const vie::ImageInput image = load_ppm(vie_fixture("testdata/images/bus.ppm"), pixels);

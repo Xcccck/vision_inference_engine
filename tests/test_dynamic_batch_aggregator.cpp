@@ -429,6 +429,7 @@ TEST(RequestQueueBatchTest, WaitPopUntilWakesOnShutdown) {
 class BatchRuntimeIntegrationTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx", "testdata/onnx_dynamic/yolov8n_batch.onnx");
     batch_model_path_ = vie_fixture("testdata/onnx_dynamic/yolov8n_batch.onnx");
     fixed_model_path_ = vie_fixture("testdata/onnx/yolov8n.onnx");
   }

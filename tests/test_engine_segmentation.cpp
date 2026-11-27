@@ -307,6 +307,7 @@ TEST(EngineSegmentation, ConflictingManifestShapeIsRejected) {
 
 #if defined(VIE_HAS_ONNXRUNTIME)
 TEST(EngineSegmentation, CpuEndToEndMatchesDirectPipeline) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx");
   const std::string path = vie_fixture("testdata/onnx/yolov8n-seg.onnx");
   vie::ModelConfig config;
   config.manifest = recognized_segmentation_manifest(path);
@@ -396,6 +397,7 @@ TEST(EngineSegmentation, CpuEndToEndMatchesDirectPipeline) {
 }
 
 TEST(EngineSegmentationBenchmark, CpuRealImage) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx");
   const std::string path = vie_fixture("testdata/onnx/yolov8n-seg.onnx");
   vie::ModelConfig config;
   config.manifest = recognized_segmentation_manifest(path);
@@ -445,6 +447,7 @@ TEST(EngineSegmentationBenchmark, CpuRealImage) {
 
 #if defined(VIE_HAS_ONNXRUNTIME_CUDA)
 TEST(EngineSegmentation, CudaEndToEndKeepsMasksOnDevice) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx");
   const std::string path = vie_fixture("testdata/onnx/yolov8n-seg.onnx");
   const LoadedImage bus = load_bus();
   vie::ModelConfig cpu_config;
@@ -558,6 +561,7 @@ TEST(EngineSegmentation, CudaEndToEndKeepsMasksOnDevice) {
 }
 
 TEST(EngineSegmentationBenchmark, CudaRealImage) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx");
   const std::string path = vie_fixture("testdata/onnx/yolov8n-seg.onnx");
   const LoadedImage bus = load_bus();
   std::uint8_t* device_pixels = nullptr;

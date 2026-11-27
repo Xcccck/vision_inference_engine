@@ -617,6 +617,7 @@ TEST(OnnxAnalyzer, ExternalPathsStayInsideTheModelDirectory) {
 }
 
 TEST(OnnxAnalyzer, ParsesThirdPartyYoloV8Export) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   const std::filesystem::path path = vie_fixture("testdata/onnx/yolov8n.onnx");
   ASSERT_EQ(std::filesystem::file_size(path), 12834838u);
   vie::OnnxAnalyzer analyzer;

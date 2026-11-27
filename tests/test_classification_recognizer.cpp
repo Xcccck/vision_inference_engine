@@ -363,6 +363,8 @@ TEST(ClassificationRecognizer, AnotherTaskWithMoreEvidenceStaysAmbiguous) {
 }
 
 TEST(ClassificationRecognizer, ExistingDetectorsStaySelected) {
+  VIE_REQUIRE_MODEL("testdata/onnx/rtdetr-l.onnx", "testdata/onnx/yolov8n-seg.onnx",
+                    "testdata/onnx/yolov8n.onnx");
   const auto check = [](const char* path, const char* recognizer) {
     const vie::ModelAnalysisReport report = vie::OnnxAnalyzer{}.analyze_file(vie_fixture(path));
     const vie::RecognitionResult result = vie::default_recognizer_registry().recognize(report);

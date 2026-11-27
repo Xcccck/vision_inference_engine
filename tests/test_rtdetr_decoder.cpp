@@ -387,6 +387,7 @@ TEST(RtdetrDecoder, RejectsNonFiniteScoresAndDisabledNmsIsRequired) {
 }
 
 TEST(RtdetrDecoder, GeneratedManifestStaysSymbolicAndRuntimeProfileIsSeparate) {
+  VIE_REQUIRE_MODEL("testdata/onnx/rtdetr-l.onnx");
   const vie::ModelManifest generated = generated_manifest();
   EXPECT_EQ(generated.outputs[0].shape, (std::vector<std::int64_t>{-1, -1, -1}));
   EXPECT_EQ(generated.find_provenance("outputs.0.shape")->certainty, vie::Certainty::Observed);
@@ -429,6 +430,7 @@ TEST(RtdetrDecoder, GeneratedManifestStaysSymbolicAndRuntimeProfileIsSeparate) {
 #if defined(VIE_HAS_ONNXRUNTIME)
 
 TEST(RtdetrCpu, BusMatchesOfficialPredictAndSeparatesPreprocessFromDecode) {
+  VIE_REQUIRE_MODEL("testdata/onnx/rtdetr-l.onnx");
   const std::string weight = "/tmp/rtdetr_export/rtdetr-l.pt";
   std::ifstream weight_file(weight, std::ios::binary);
   ASSERT_TRUE(weight_file) << "official comparison needs " << weight;
@@ -504,6 +506,7 @@ TEST(RtdetrCpu, BusMatchesOfficialPredictAndSeparatesPreprocessFromDecode) {
 }
 
 TEST(RtdetrCpu, BenchmarkLoadPreprocessExecuteDecode) {
+  VIE_REQUIRE_MODEL("testdata/onnx/rtdetr-l.onnx");
   const vie::ModelManifest runtime = runtime_manifest(generated_manifest());
   vie::ModelConfig model_config;
   model_config.model_path = vie_fixture("testdata/onnx/rtdetr-l.onnx");

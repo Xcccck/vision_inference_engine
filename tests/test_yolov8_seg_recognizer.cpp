@@ -124,6 +124,7 @@ vie::RecognitionResult recognize(const vie::ModelAnalysisReport& report) {
 }  // namespace
 
 TEST(YoloV8Seg, RealExportIsRecognizedFromGraphNotFilename) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx");
   const std::string path = vie_fixture("testdata/onnx/yolov8n-seg.onnx");
   std::ifstream input(path, std::ios::binary);
   ASSERT_TRUE(input);
@@ -229,6 +230,7 @@ TEST(YoloV8Seg, RealExportIsRecognizedFromGraphNotFilename) {
 }
 
 TEST(YoloV8Seg, DetectionModelStaysDetection) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   const std::string path = vie_fixture("testdata/onnx/yolov8n.onnx");
   std::ifstream input(path, std::ios::binary);
   ASSERT_TRUE(input);

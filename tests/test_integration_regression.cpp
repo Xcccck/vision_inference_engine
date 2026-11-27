@@ -138,6 +138,7 @@ vie::ModelConfig segmentation_config() {
 }  // namespace
 
 TEST(Integration, RegistryKeepsDetectionAndRejectsSameShapeIdentity) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx", "testdata/onnx/yolov8n.onnx");
   const vie::RecognitionResult detection =
       vie::default_recognizer_registry().recognize(vie::OnnxAnalyzer{}.analyze_file(
           vie_fixture("testdata/onnx/yolov8n.onnx")));
@@ -181,6 +182,7 @@ TEST(Integration, RegistryKeepsDetectionAndRejectsSameShapeIdentity) {
 }
 
 TEST(Integration, FailedLoadDoesNotInventADeviceOrReplaceASession) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   vie::InferenceEngine engine;
   EXPECT_FALSE(engine.loaded());
   EXPECT_EQ(engine.device().device(), vie::DeviceType::Cpu);
@@ -227,6 +229,7 @@ TEST(Integration, FailedLoadDoesNotInventADeviceOrReplaceASession) {
 
 #if defined(VIE_HAS_ONNXRUNTIME)
 TEST(Integration, CrossTasksStayOnTheirOwnProtocols) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx", "testdata/onnx/yolov8n.onnx");
   std::vector<std::uint8_t> pixels;
   const vie::ImageInput image = load_bus(pixels);
   vie::InferenceEngine detector;
@@ -251,6 +254,7 @@ TEST(Integration, CrossTasksStayOnTheirOwnProtocols) {
 }
 
 TEST(Integration, RuntimeConfigDoesNotLeakOrReadTheManifest) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx", "testdata/onnx/yolov8n.onnx");
   std::vector<std::uint8_t> pixels;
   const vie::ImageInput image = load_bus(pixels);
   vie::InferenceEngine engine;
@@ -304,6 +308,7 @@ TEST(Integration, RuntimeConfigDoesNotLeakOrReadTheManifest) {
 }
 
 TEST(Integration, ResultsOutliveTheEngineAndTheBackendTensors) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx", "testdata/onnx/yolov8n.onnx");
   std::vector<std::uint8_t> pixels;
   const vie::ImageInput image = load_bus(pixels);
   vie::DetectionBatch detected;
@@ -335,6 +340,7 @@ TEST(Integration, ResultsOutliveTheEngineAndTheBackendTensors) {
 
 #if defined(NDEBUG) && !defined(VIE_HAS_ONNXRUNTIME_CUDA)
 TEST(IntegrationBenchmark, CpuDetectionAndSegmentation) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx", "testdata/onnx/yolov8n.onnx");
   std::vector<std::uint8_t> pixels;
   const vie::ImageInput image = load_bus(pixels);
   auto bench = [&](const char* label, auto&& run) {
@@ -435,6 +441,7 @@ TEST(IntegrationBenchmark, CpuDetectionAndSegmentation) {
 
 #if defined(VIE_HAS_ONNXRUNTIME_CUDA)
 TEST(Integration, CudaBackendSelectionAndMaskLifetime) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx", "testdata/onnx/yolov8n.onnx");
   std::vector<std::uint8_t> pixels;
   const vie::ImageInput cpu_image = load_bus(pixels);
   vie::ModelConfig detection = detection_config(0.25f);
@@ -531,6 +538,7 @@ TEST(Integration, CudaBackendSelectionAndMaskLifetime) {
 
 #if defined(NDEBUG)
 TEST(IntegrationBenchmark, CudaSegmentation) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx");
   std::vector<std::uint8_t> pixels;
   const vie::ImageInput cpu_image = load_bus(pixels);
   std::uint8_t* device_pixels = nullptr;

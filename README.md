@@ -183,7 +183,7 @@ ctest --test-dir build-ort --output-on-failure          # CPU + ORT：366 个用
 ctest --test-dir build-ort-gpu --output-on-failure      # CUDA + ORT：432 个用例
 ```
 
-跑之前先 `python3 tools/export_test_models.py` 确认四个 Ultralytics 系 fixture 已就位，否则真实模型用例会失败；只有合成模型的用例不受影响。
+缺 fixture 时真实模型用例走 `VIE_REQUIRE_MODEL` 跳过而不是失败，所以新 clone 直接 `ctest` 也是全绿 —— 但那意味着约 73 个用例根本没跑。要验证真实模型链路，先执行 `python3 tools/export_test_models.py`，跳过数应归零。
 
 39 个测试源文件覆盖 Tensor / Manifest / Analyzer / Recognizer / Decoder / Preprocess / Runtime。sanitizer 构建：
 

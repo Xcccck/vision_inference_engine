@@ -430,7 +430,10 @@ TEST(ExecutionResourceManagerTest, BackpressureCapsTotalStaged) {
 
 class ExecutionSchedulingRuntimeTest : public ::testing::Test {
  protected:
-  void SetUp() override { model_path_ = vie_fixture("testdata/onnx/yolov8n.onnx"); }
+  void SetUp() override {
+    VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
+    model_path_ = vie_fixture("testdata/onnx/yolov8n.onnx");
+  }
 
   ModelConfig model_config(BackendKind backend = BackendKind::OnnxRuntime,
                            DeviceType device = DeviceType::Cpu, int device_id = 0) {

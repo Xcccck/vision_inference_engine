@@ -66,6 +66,7 @@ vie::ModelAnalysisReport analyze_head(bool box_log, bool class_sigmoid, bool wit
 }  // namespace
 
 TEST(RtdetrRecognizer, RealExportIsRecognizedWithoutClaimingAStaticOutput) {
+  VIE_REQUIRE_MODEL("testdata/onnx/rtdetr-l.onnx");
   const std::string path = vie_fixture("testdata/onnx/rtdetr-l.onnx");
   const vie::ModelAnalysisReport report = vie::OnnxAnalyzer{}.analyze_file(path);
   EXPECT_TRUE(report.warnings.empty());
@@ -183,6 +184,7 @@ TEST(RtdetrRecognizer, RealExportIsRecognizedWithoutClaimingAStaticOutput) {
 }
 
 TEST(RtdetrRecognizer, YoloDetectionIsNotRtdetrAndKeepsItsManifest) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   const vie::ModelAnalysisReport report = vie::OnnxAnalyzer{}.analyze_file(vie_fixture("testdata/onnx/yolov8n.onnx"));
   EXPECT_FALSE(vie::RtdetrRecognizer{}.consider(report).has_value());
   const vie::RecognitionResult result = vie::default_recognizer_registry().recognize(report);
@@ -202,6 +204,7 @@ TEST(RtdetrRecognizer, YoloDetectionIsNotRtdetrAndKeepsItsManifest) {
 }
 
 TEST(RtdetrRecognizer, YoloSegmentationIsNotRtdetrAndKeepsItsManifest) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx");
   const vie::ModelAnalysisReport report =
       vie::OnnxAnalyzer{}.analyze_file(vie_fixture("testdata/onnx/yolov8n-seg.onnx"));
   EXPECT_FALSE(vie::RtdetrRecognizer{}.consider(report).has_value());

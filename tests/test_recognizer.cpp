@@ -117,6 +117,7 @@ TEST(RecognizerRegistry, HigherEvidenceCountWinsWithoutAScore) {
 }
 
 TEST(YoloV8Detect, RealExportIsRecognizedAndManifestStaysPartial) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   const std::string path = vie_fixture("testdata/onnx/yolov8n.onnx");
   std::ifstream input(path, std::ios::binary);
   ASSERT_TRUE(input);

@@ -349,7 +349,7 @@ if(VIE_MISSING_TEST_MODELS)
   message(WARNING
     "Test models are missing: ${VIE_MISSING_TEST_MODELS}. "
     "Run 'python3 tools/export_test_models.py' before ctest; the real-model "
-    "tests and tools need these files.")
+    "tests skip and the sample tools fail without these files.")
 endif()
 
 message(STATUS "VIE ${PROJECT_VERSION}")

@@ -299,6 +299,7 @@ TEST(YoloV8DecoderCpu, ManifestDoesNotInventNmsAndTensorExecuteStillWorks) {
 
 #if defined(VIE_HAS_ONNXRUNTIME)
 TEST(YoloV8DecoderCpu, RealModelPipelineUsesExplicitTestConfig) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   const std::string path = vie_fixture("testdata/onnx/yolov8n.onnx");
   const vie::ModelAnalysisReport report = vie::OnnxAnalyzer{}.analyze_file(path);
   const vie::RecognitionResult recognition = vie::default_recognizer_registry().recognize(report);

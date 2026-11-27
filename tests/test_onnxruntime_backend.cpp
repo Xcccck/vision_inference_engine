@@ -441,6 +441,7 @@ TEST(OnnxRuntimeBackend, EngineExecutesOnnxWithoutPreprocessing) {
 }
 
 TEST(OnnxRuntimeBackend, RunsYoloV8nCpuAndRecordsTiming) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   const std::string path = vie_fixture("testdata/onnx/yolov8n.onnx");
   vie::OnnxRuntimeBackend backend;
   backend.set_intra_op_threads(4);

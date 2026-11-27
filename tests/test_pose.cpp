@@ -605,6 +605,7 @@ TEST(YoloV8PoseDecoder, LayoutsNmsPoliciesAndEmptyCandidates) {
 }
 
 TEST(YoloV8PoseRecognizer, AcceptsTheProvenHeadAndRejectsLookalikes) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
   const vie::ModelAnalysisReport report = analyze_graph(pose_graph(true, false, false, 12));
   const vie::RecognitionResult result = vie::default_recognizer_registry().recognize(report);
   EXPECT_EQ(result.status, vie::RecognitionStatus::Recognized) << result.explanation;

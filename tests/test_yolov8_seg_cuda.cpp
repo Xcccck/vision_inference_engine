@@ -269,6 +269,7 @@ TEST(YoloV8SegCuda, RejectsBadDeviceNanAndBudgetAndKeepsMaskAfterInputDies) {
 
 #if defined(VIE_HAS_ONNXRUNTIME)
 TEST(YoloV8SegCuda, RealCpuEpOutputsDriveCudaDecoder) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n-seg.onnx");
   const std::string path = vie_fixture("testdata/onnx/yolov8n-seg.onnx");
   vie::PreprocessConfig prep;
   prep.resize_mode = vie::ResizeMode::Letterbox;
