@@ -105,23 +105,24 @@ ONNX Analyzer 可以解析动态维度（symbolic dimensions），但当前 Prep
 ## 6. 严格 CUDA EP 支持
 
 CUDA EP 使用 ORT CUDA Backend 执行模型前向。Detection / Instance Segmentation /
-RT-DETR / Classification / Semantic Segmentation / Pose 在 CUDA 上有真正的后处理
-（Phase 13 补齐分类 Top-K 与语义分割 ArgMax，Phase 14 补齐 Pose 关键点解码与人体框 NMS）；
-OBB 仍只在 CPU 上后处理。
+RT-DETR / Classification / Semantic Segmentation / Pose / OBB 在 CUDA 上有真正的后处理
+（Phase 13 补齐分类 Top-K 与语义分割 ArgMax，Phase 14 补齐 Pose 关键点解码与人体框 NMS，
+Phase 15 补齐 OBB 旋转框解码、Polygon IoU 与 Rotated NMS）。
 
 | 任务 | CUDA EP | 说明 |
 |---|---|---|
 | Detection | 支持 | 前向 CUDA + CUDA Decoder |
 | Segmentation | 支持 | 前向 CUDA + CUDA Decoder |
-| OBB | 支持 | 前向 CUDA，解码 CPU |
+| OBB | 支持 | 前向 CUDA + CUDA Decoder，GPU 完成过滤、排序、逆映射、Polygon IoU 与 Rotated NMS，仅回传保留框 |
 | Pose | 支持 | 前向 CUDA + CUDA Decoder，GPU 完成筛选、关键点解码与人体框 NMS，仅回传保留结果 |
 | RT-DETR | 支持 | 前向 CUDA + CUDA Decoder |
 | Classification | 支持 | 前向 CUDA + CUDA Top-K，仅回传 `top_k * 8` 字节 |
 | Semantic Segmentation | 支持 | 前向 CUDA + CUDA ArgMax，仅回传 `width * height * 4` 字节的类别图 |
 
 Pose 的 `d2h_bytes` 只统计最终保留结果的紧凑 payload：每个保留人体 28 字节（框、分数、
-类别、anchor），每个关键点 16 字节（x、y、置信度、是否在图像内）。控制字与错误诊断数据
-（fault、候选计数）不计入，与其它 CUDA Decoder 的口径一致。
+类别、anchor），每个关键点 16 字节（x、y、置信度、是否在图像内）。OBB 每个保留框 32 字节
+（框、分数、类别、anchor）。控制字与错误诊断数据（fault、候选计数、IoU 调用数）不计入，
+与其它 CUDA Decoder 的口径一致。
 
 CUDA EP 禁止 CPU fallback。如果 CUDA 初始化失败，Engine 返回错误，不自动切换到 CPU。
 

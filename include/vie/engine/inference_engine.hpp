@@ -101,6 +101,8 @@ struct ObbInferTiming {
   double execute_ms = 0;
   double d2h_ms = 0;
   double validate_ms = 0;
+  double sort_ms = 0;
+  double map_ms = 0;
   double nms_ms = 0;
   double decode_ms = 0;
   double total_ms = 0;
@@ -108,6 +110,7 @@ struct ObbInferTiming {
   std::size_t d2h_bytes = 0;
   int candidates_before_nms = 0;
   int results_after_nms = 0;
+  long long iou_calls = 0;
   bool includes_sync = false;
   bool includes_h2d = false;
   bool includes_d2h = false;
@@ -272,8 +275,10 @@ class InferenceEngine {
                                            ClassificationInferTiming* timing = nullptr) {
     return infer_classification_options(image, options, timing);
   }
-  // Preprocess, execute, explicit D2H when the output is on CUDA, then the CPU
-  // OBB decoder and rotated NMS. Only task obb with yolov8_obb_raw is accepted.
+  // Preprocess, execute, then the OBB decoder on the engine device: CPU reads
+  // the host tensor, CUDA runs candidate validation, the score sort, the
+  // GeometryTransform map, Polygon IoU, and rotated NMS in kernels and copies
+  // only the kept objects. Only task obb with yolov8_obb_raw is accepted.
   ObbBatch infer_obb(const ImageInput& image, const ObbRuntimeConfig& runtime, ObbInferTiming* timing = nullptr);
   // Phase 12: rotated-box IoU/NMS policy from the unified resolver. The class
   // selection is best_class, matching the decoder's single-class output.

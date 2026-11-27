@@ -1160,10 +1160,10 @@ geometry, ties, non-finite coordinates, contracts, dispatcher, timing) run only
 when `VIE_ENABLE_CUDA=ON`; `tests/test_cuda_decoder_e2e.cpp` adds the three real
 model lanes. CUDA OFF builds never compile the CUDA branches.
 
-**Scope.** At the end of Phase 13, Pose and OBB kept CPU decoders. Phase 14 adds the Pose
-CUDA decoder described below; OBB keeps its CPU polygon NMS. There is no CUDA batch path
-(the batch aggregator still rejects CUDA batch > 1), no model-specific logic, and no
-implicit CPU fallback.
+**Scope.** Phase 13 delivered the Classification and Semantic Segmentation lanes. Phase 14
+adds the Pose CUDA decoder and Phase 15 the OBB CUDA decoder, both described below; every
+decoder now has a CUDA lane. There is no CUDA batch path (the batch aggregator still
+rejects CUDA batch > 1), no model-specific logic, and no implicit CPU fallback.
 
 ### Pose CUDA Decoder (Phase 14)
 
@@ -1253,6 +1253,135 @@ tensor/request contracts, Phase 12 policy parity, timing record);
 (A: CUDA/ORT off, B: ORT CPU, C: OpenCV + ORT CPU, D: ORT CUDA, E: OpenCV +
 CUDA) pass, ASan passes 372/372, and compute-sanitizer reports 0 errors for the
 Pose CUDA cases. CUDA OFF builds never compile the `.cu` lane.
+
+### OBB CUDA Decoder (Phase 15)
+
+Phase 15 adds the OBB GPU post-processing lane. `ObbDispatchDecoder` routes by
+`DeviceContext::device()`: CPU keeps `YoloV8ObbDecoder`, CUDA goes to
+`ObbCudaDecoder`. The CUDA path never calls the CPU decoder (and never the CPU
+polygon geometry), and a CUDA failure never retries on the CPU. The public API,
+manifest schema 1.0 and the Phase 12 config chain are unchanged.
+
+**Contract.** The decoded tensor must be rank-3 FP32, contiguous, device-matched
+and batch 1 (`[1, C, P]` for `channel_axis=1`, `[1, P, C]` for `channel_axis=2`),
+with `C == 4 + num_classes + 1`. The first four channels are the already-decoded
+`cx, cy, w, h` in model-input space; the last channel is the angle in radians on
+the image coordinate system (y down), valid on `[-pi/4, 3pi/4)` with the CPU's
+1e-3 slack, and `(w, h, angle)` is equivalent to `(h, w, angle + pi/2)`. Neither
+lane re-normalizes angles; the range is only validated. Batch > 1, non-FP32,
+non-contiguous tensors, wrong channel counts, a missing output/geometry and an
+empty tensor are rejected with `InvalidArgument` before any kernel runs (the
+CPU lane reports the same code and text). Explicit upper bounds (classes ≤ 1000,
+channels < 65536, predictions ≤ 1e6, candidates ≤ 1e6, `predictions * channels`
+≤ `INT_MAX`, `pre_nms_top_k` ≤ 4096) prevent silent allocation overflow.
+
+**Kernel pipeline.** `filter_kernel` runs one thread per anchor and reads fields
+in the exact CPU order: the five box channels first (`cx, cy, w, h, angle`; a
+non-finite value is a fault even when the anchor's score is below the
+threshold), then the class scores with the CPU clamp/range rule, then `BestClass`
+picks the highest score with the smallest class id and only a surviving
+candidate has its `width/height/angle` validated; `AllAbove` validates each hit
+as soon as it is taken. Faults are packed into one 64-bit word
+(`prediction << 32 | rank << 20 | kind << 16 | channel`) where `rank` follows
+the CPU read order, so the earliest faulty anchor and field reproduce the CPU
+message. Candidates are sorted by `score desc, anchor asc, class asc` with a
+Thrust sort explicitly bound to the decoder stream and truncated to
+`pre_nms_top_k`. A parallel `map_kernel` performs the double-precision inverse
+`GeometryTransform` (isotropic scales keep the angle and divide the sizes by the
+mean scale; anisotropic scales run the CPU's minimum-area fit with its
+area/`|angle|`/angle tie-break, the 1e-3 corner slack and degenerate-box drop);
+a single-thread `compact_kernel` preserves the CPU candidate order.
+`nms_kernel` / `select_prefix_kernel` produce the kept indices and `pack_kernel`
+gathers the final 32-byte records; only that payload is copied back.
+
+**Polygon IoU parity.** The device helpers mirror `obb_geometry.cpp` line by
+line: `corners_of`, the signed-area based CCW ordering, `polygon_area` on
+absolute coordinates, `line_hit` (parallel edges return the endpoint, `t`
+clamped to `[0, 1]`), and the Sutherland–Hodgman `clip_convex` (`>= -1e-9` is
+inside, crossing order is identical, duplicate cleanup at 1e-18 including the
+wrap-around pair). The intersection area is clamped to both box areas, union is
+`left + right - intersection`, and the ratio is clamped to `[0, 1]`. All
+geometry runs in device double with `-fmad=false`, so the 41-case geometry
+suite (separation, overlap, containment, edge/vertex tangency, parallel and
+collinear edges, near-parallel, tiny intersections, angle-boundary pairs,
+width/height swaps, 1e7 coordinates, 1e-3 boxes, 45-degree squares) reports
+**0 absolute error on every pair**; when both lanes consume the same real-model
+raw tensor, the 20 kept boxes are bitwise identical. Degenerate or non-finite
+mapped boxes throw the same `InvalidArgument` messages as the CPU lane.
+
+**Rotated NMS.** One block of 128 threads runs the same greedy scan as the CPU
+(`suppressed` flags live in dynamic shared memory): the scan order is the
+sorted candidate order, `IoU >= iou_threshold` suppresses, class filtering
+happens before the IoU so class-aware and class-agnostic behave exactly like the
+CPU, the scan stops as soon as `max_detections` boxes are kept, and with NMS
+disabled the prefix of `min(max_detections, candidates_before_nms)` is kept.
+Because the sort key, boundary comparison and scan order match, the kept set and
+its order are identical to the CPU on the same raw tensor. `iou_calls` is
+accumulated on the device and matches the CPU count (3,609 for the real model).
+
+**Config.** Both lanes consume the same Phase 12 `ObbDecodeConfig` produced by
+`obb_decode_config_from_resolved()` (priority
+RequestOverride > ModelConfig > Manifest > FrameworkDefault); the CUDA decoder
+keeps no private defaults. `tests/test_obb_cuda_decoder.cpp::RunsTheResolvedPhase12Policy`
+feeds one resolved config to both lanes and asserts identical selection/NMS
+behavior; the `DecoderConfigPolicy` and Runtime/fingerprint suites still pass.
+
+**Stream and lifetime.** The lane follows the Phase 13/14 conventions: legacy
+default stream (`nullptr`, the stream ORT CUDA EP uses here),
+`cudaSetDevice(device_id)` at entry, `cudaStreamSynchronize` on that stream for
+every control-word read and after each timed stage, never `cudaDeviceSynchronize`;
+RAII `DeviceBuffer`/event pairs keep temporaries alive; every launch checks
+`cudaGetLastError`; Thrust runs under `thrust::cuda::par.on(stream)`; a CUDA
+tensor's `Tensor::data()` is never called. `d2h_bytes` counts only the compact
+payload (`kept * 32`); the two 8-byte fault words (filter and map), the three
+4-byte counters and the 8-byte `iou_calls` word are control transfers and are
+not counted. `decode_ms` is wall-clock in the engine; `validate_ms` covers the
+filter kernel, `sort_ms` the Thrust sort, `map_ms` map + compact, `nms_ms`
+NMS/prefix, and `d2h_ms` pack + the payload copy.
+
+**Measured timings.** RTX 4080 Laptop, Release, CUDA 12.6, ORT 1.20.1 CUDA EP.
+Synthetic decoder bench, 2048x1600 output space, 2 warmups + 5 samples, wall-clock
+includes launch and sync:
+
+| Candidates | CPU decoder | CUDA wall | validate | sort | map | NMS | D2H | `d2h_bytes` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 (4 classes) | 0.208 ms | 1.92 ms | 0.054 ms | 0.134 ms | 0.031 ms | 0.607 ms | 0.246 ms | 2,048 |
+| 1,024 (8 classes) | 2.72 ms | 5.88 ms | 0.007 ms | 0.111 ms | 0.268 ms | 4.39 ms | 0.182 ms | 3,200 |
+| 4,096 (15 classes, 3,328 before NMS) | 4.24 ms | 6.76 ms | 0.010 ms | 0.180 ms | 1.15 ms | 4.12 ms | 0.186 ms | 3,200 |
+
+The CUDA lane is slower than the CPU decoder for these candidate counts. At 64
+candidates launch and synchronization dominate; at 1,024+ the single-block
+serial NMS dominates because every pair runs the full double-precision polygon
+clip, and RTX 4080 Laptop FP64 throughput is 1/64 of FP32 while the block uses
+one SM. Thrust also allocates temporaries per call. The timings are reported as
+measured; no AABB early-out was added because it would change which pairs reach
+the clip and break bitwise parity with the CPU.
+
+Real `yolov8n-obb.onnx` E2E (`tests/test_obb.cpp::StrictCudaMatchesCpu`,
+1024x1024, 20 channels / 15 classes, 21,504 anchors, 20 kept, 3 warmups + 10
+samples, strict CUDA EP with
+`cuda_cpu_ep_fallback=false`): CPU total 170.78 ms (preprocess 45.43, execute
+114.97, decode 6.74 = validate 5.23 + NMS 1.51); CUDA total 11.87 ms
+(preprocess 1.16, execute 7.75, decode wall ~3.0 = validate 0.016 + sort 1.29 +
+map 0.09 + NMS 0.67 + D2H 0.15), `d2h_bytes` 640 vs output 1,720,320. The two
+EPs keep 20 boxes each and all 20 share an anchor (the CPU filter passes 200
+candidates, the CUDA filter 199); raw EP logits differ by at
+most 0.6346 px (box), 1.19e-6 (score) and 0.00279 rad (angle), which is why the
+E2E comparison uses explicit tolerances. When both decoders consume the same raw
+tensor (`SameRawTensorDecodesTheSameOnCpuAndCuda`), all 20 objects match
+bitwise (`max_object_delta` 0).
+
+**Tests and builds.** `tests/test_obb_cuda_decoder.cpp` contains 9 GPU-only cases
+(single/multiple/empty detections, axis 1 and 2, geometry modes, class
+policies, ties and the exact IoU boundary, Top-K and max-detection truncation,
+NMS disabled, CPU-identical illegal-value messages, tensor/request contracts,
+Phase 12 policy parity, timing record) and the 41-case CPU/CUDA IoU comparison;
+`tests/test_obb.cpp` adds the strict-CUDA real-model E2E and the same-raw-tensor
+parity lane. All five builds (A: CUDA/ORT off, B: ORT CPU, C: OpenCV + ORT CPU,
+D: ORT CUDA, E: OpenCV + CUDA) pass, ASan passes 372/372 for the CPU-only build
+and the 50 OBB/config cases under ORT CPU ASan, and compute-sanitizer reports 0
+errors for the OBB CUDA cases and the real-model E2E. CUDA OFF builds never
+compile the `.cu` lane.
 
 ### RuntimeConfig
 

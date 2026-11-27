@@ -3,6 +3,7 @@
 
 #include "vie/analyzer/onnx_analyzer.hpp"
 #include "vie/decoder/obb.hpp"
+#include "vie/decoder/obb_cuda_decoder.hpp"
 #include "vie/decoder/yolov8_obb_decoder.hpp"
 #include "vie/engine/inference_engine.hpp"
 #include "vie/model/manifest_validator.hpp"
@@ -22,6 +23,7 @@
 #include <string>
 #include <vector>
 #if defined(VIE_HAS_ONNXRUNTIME_CUDA)
+#include "vie/backend/onnxruntime_cuda_backend.hpp"
 #include <cuda_runtime.h>
 #endif
 
@@ -708,6 +710,8 @@ TEST(YoloV8ObbReal, StrictCudaMatchesCpu) {
   vie::ModelConfig cuda_config = cpu_config;
   cuda_config.backend = vie::BackendKind::OnnxRuntimeCuda;
   cuda_config.device = vie::DeviceType::Cuda;
+  ASSERT_FALSE(cuda_config.cuda_cpu_ep_fallback);
+  EXPECT_FALSE(vie::OnnxRuntimeCudaBackend{}.cpu_ep_fallback());
   vie::InferenceEngine cuda_engine;
   cuda_engine.load(cuda_config);
   constexpr int kWarmup = 3;
@@ -717,6 +721,8 @@ TEST(YoloV8ObbReal, StrictCudaMatchesCpu) {
   std::vector<double> execute_ms;
   std::vector<double> d2h_ms;
   std::vector<double> validate_ms;
+  std::vector<double> sort_ms;
+  std::vector<double> map_ms;
   std::vector<double> nms_ms;
   std::vector<double> total_ms;
   vie::ObbBatch cuda_batch;
@@ -727,13 +733,24 @@ TEST(YoloV8ObbReal, StrictCudaMatchesCpu) {
     execute_ms.push_back(timing.execute_ms);
     d2h_ms.push_back(timing.d2h_ms);
     validate_ms.push_back(timing.validate_ms);
+    sort_ms.push_back(timing.sort_ms);
+    map_ms.push_back(timing.map_ms);
     nms_ms.push_back(timing.nms_ms);
     total_ms.push_back(timing.total_ms);
   }
-  EXPECT_EQ(timing.d2h_bytes, static_cast<std::size_t>(20 * 21504 * 4));
+  // Phase 15: the raw [1,20,21504] tensor stays on the device; only the kept
+  // OBB objects (32 bytes each) are copied back.
+  const std::size_t kept = cuda_batch.results[0].objects.size();
+  EXPECT_EQ(timing.results_after_nms, static_cast<int>(kept));
+  EXPECT_EQ(timing.d2h_bytes, kept * 32u);
+  EXPECT_GT(timing.d2h_bytes, 0u);
+  EXPECT_LT(timing.d2h_bytes, timing.output_bytes);
   EXPECT_TRUE(timing.includes_d2h);
-  EXPECT_EQ(cuda_batch.results[0].execution_device, vie::DeviceType::Cpu);
+  EXPECT_GT(timing.iou_calls, 0);
+  EXPECT_EQ(cuda_batch.results[0].execution_device, vie::DeviceType::Cuda);
+  EXPECT_EQ(cuda_batch.results[0].execution_device_id, 0);
   EXPECT_EQ(cuda_batch.results[0].d2h_bytes, timing.d2h_bytes);
+  EXPECT_EQ(cuda_batch.results[0].iou_calls, timing.iou_calls);
 
   vie::BackendRequest cpu_request;
   cpu_request.inputs.emplace(cpu_engine.manifest().input.name, cpu_engine.preprocess(image).output);
@@ -794,7 +811,8 @@ TEST(YoloV8ObbReal, StrictCudaMatchesCpu) {
          << timing.candidates_before_nms << " kept " << timing.results_after_nms << " cpu_kept "
          << cpu_batch.results[0].objects.size() << " shared_anchors " << shared << " raw_max_abs " << max_abs
          << " raw_max_box " << max_box << " raw_max_score " << max_score << " raw_max_angle " << max_angle
-         << " output_bytes " << timing.output_bytes << " d2h_bytes " << timing.d2h_bytes << "\n";
+         << " output_bytes " << timing.output_bytes << " d2h_bytes " << timing.d2h_bytes << " iou_calls "
+         << timing.iou_calls << "\n";
   record << "preprocess mean " << mean_of(preprocess_ms) << " p50 " << percentile(preprocess_ms, 0.50) << " p95 "
          << percentile(preprocess_ms, 0.95) << "\n";
   record << "execute mean " << mean_of(execute_ms) << " p50 " << percentile(execute_ms, 0.50) << " p95 "
@@ -803,10 +821,126 @@ TEST(YoloV8ObbReal, StrictCudaMatchesCpu) {
          << percentile(d2h_ms, 0.95) << "\n";
   record << "validate mean " << mean_of(validate_ms) << " p50 " << percentile(validate_ms, 0.50) << " p95 "
          << percentile(validate_ms, 0.95) << "\n";
+  record << "sort mean " << mean_of(sort_ms) << " p50 " << percentile(sort_ms, 0.50) << " p95 "
+         << percentile(sort_ms, 0.95) << "\n";
+  record << "map mean " << mean_of(map_ms) << " p50 " << percentile(map_ms, 0.50) << " p95 "
+         << percentile(map_ms, 0.95) << "\n";
   record << "nms mean " << mean_of(nms_ms) << " p50 " << percentile(nms_ms, 0.50) << " p95 "
          << percentile(nms_ms, 0.95) << "\n";
   record << "total mean " << mean_of(total_ms) << " p50 " << percentile(total_ms, 0.50) << " p95 "
          << percentile(total_ms, 0.95) << "\n";
+  cudaFree(device_pixels);
+}
+
+// Phase 15 A: feed the same raw tensor to both decoders. The Execution Provider
+// numerics are taken out of the picture here, so every discrete field must match
+// and every float field must be the same single-precision value. The source is a
+// CUDA EP run copied to the host once; that host copy is what the CPU decoder
+// reads, so any difference would be a decoder difference.
+TEST(YoloV8ObbReal, SameRawTensorDecodesTheSameOnCpuAndCuda) {
+  if (!reference_ready()) {
+    GTEST_SKIP() << "run tools/export_yolov8n_obb.py";
+  }
+  vie::ModelManifest manifest = recognized_manifest();
+  std::vector<std::uint8_t> pixels;
+  const vie::ImageInput image = pattern_image(pixels);
+  void* device_pixels = nullptr;
+  ASSERT_EQ(cudaMalloc(&device_pixels, pixels.size()), cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(device_pixels, pixels.data(), pixels.size(), cudaMemcpyHostToDevice), cudaSuccess);
+  vie::ImageInput gpu_image = image;
+  gpu_image.data = device_pixels;
+  gpu_image.device = vie::DeviceType::Cuda;
+
+  vie::ModelConfig cuda_config;
+  cuda_config.model_path = kRealModel;
+  cuda_config.manifest = manifest;
+  cuda_config.backend = vie::BackendKind::OnnxRuntimeCuda;
+  cuda_config.device = vie::DeviceType::Cuda;
+  ASSERT_FALSE(cuda_config.cuda_cpu_ep_fallback);
+  EXPECT_FALSE(vie::OnnxRuntimeCudaBackend{}.cpu_ep_fallback());
+  vie::InferenceEngine cuda_engine;
+  cuda_engine.load(cuda_config);
+  const vie::PreprocessResult prepared = cuda_engine.preprocess(gpu_image);
+  vie::BackendRequest cuda_request;
+  cuda_request.inputs.emplace(manifest.input.name, prepared.output);
+  const vie::BackendOutput cuda_output = cuda_engine.execute(cuda_request);
+  const vie::Tensor& cuda_tensor = cuda_output.tensors.at("output0").tensor;
+  ASSERT_TRUE(cuda_tensor.is_cuda());
+  const vie::Tensor host_tensor = cuda_tensor.to(vie::DeviceContext(vie::DeviceType::Cpu, 0));
+  ASSERT_TRUE(host_tensor.is_cpu());
+  ASSERT_EQ(host_tensor.shape(), cuda_tensor.shape());
+
+  const vie::ObbRuntimeConfig runtime = reference_runtime();
+  vie::ObbDecodeConfig config;
+  config.output_name = manifest.obb.output_name;
+  config.channel_axis = manifest.obb.channel_axis.value_or(-1);
+  config.num_classes = manifest.num_classes.value_or(0);
+  config.class_selection = runtime.class_selection;
+  config.confidence_threshold = runtime.confidence_threshold;
+  config.nms_enabled = runtime.nms_enabled;
+  config.class_aware = runtime.class_aware;
+  config.iou_threshold = runtime.iou_threshold;
+  config.max_detections = runtime.max_detections;
+  config.pre_nms_top_k = runtime.pre_nms_top_k;
+
+  vie::DecoderInput cpu_input;
+  cpu_input.geometry = prepared.geometry;
+  cpu_input.outputs.emplace(config.output_name, host_tensor);
+  const vie::ObbBatch cpu_batch = vie::YoloV8ObbDecoder{}.decode_obb(cpu_input, config, vie::DeviceContext{});
+  vie::DecoderInput cuda_input;
+  cuda_input.geometry = prepared.geometry;
+  cuda_input.outputs.emplace(config.output_name, cuda_tensor);
+  const vie::ObbBatch cuda_batch =
+      vie::ObbCudaDecoder{}.decode_obb(cuda_input, config, vie::DeviceContext(vie::DeviceType::Cuda, 0));
+
+  ASSERT_EQ(cpu_batch.results.size(), 1u);
+  ASSERT_EQ(cuda_batch.results.size(), 1u);
+  const vie::ObbResult& cpu_result = cpu_batch.results[0];
+  const vie::ObbResult& cuda_result = cuda_batch.results[0];
+  EXPECT_EQ(cuda_result.execution_device, vie::DeviceType::Cuda);
+  EXPECT_EQ(cpu_result.candidates_after_filter, cuda_result.candidates_after_filter);
+  EXPECT_EQ(cpu_result.candidates_before_nms, cuda_result.candidates_before_nms);
+  ASSERT_EQ(cpu_result.objects.size(), cuda_result.objects.size());
+  EXPECT_GT(cpu_result.objects.size(), 0u);
+  EXPECT_EQ(cuda_result.d2h_bytes, cuda_result.objects.size() * 32u);
+  EXPECT_LT(cuda_result.d2h_bytes, cuda_result.output_bytes);
+  for (std::size_t index = 0; index < cpu_result.objects.size(); ++index) {
+    const vie::ObbObject& want = cpu_result.objects[index];
+    const vie::ObbObject& got = cuda_result.objects[index];
+    EXPECT_EQ(got.class_id, want.class_id) << index;
+    EXPECT_EQ(got.anchor_index, want.anchor_index) << index;
+    EXPECT_FLOAT_EQ(got.score, want.score) << index;
+    EXPECT_FLOAT_EQ(got.box.cx, want.box.cx) << index;
+    EXPECT_FLOAT_EQ(got.box.cy, want.box.cy) << index;
+    EXPECT_FLOAT_EQ(got.box.width, want.box.width) << index;
+    EXPECT_FLOAT_EQ(got.box.height, want.box.height) << index;
+    EXPECT_FLOAT_EQ(got.box.angle, want.box.angle) << index;
+  }
+
+  std::ofstream record("/tmp/vie_phase15_same_tensor.txt");
+  record << "anchors 21504 classes 15 candidates " << cuda_result.candidates_after_filter << " before_nms "
+         << cuda_result.candidates_before_nms << " kept " << cuda_result.objects.size() << " iou_calls "
+         << cuda_result.iou_calls << " d2h_bytes " << cuda_result.d2h_bytes << " output_bytes "
+         << cuda_result.output_bytes << " validate_ms " << cuda_result.validate_ms << " sort_ms "
+         << cuda_result.sort_ms << " map_ms " << cuda_result.map_ms << " nms_ms " << cuda_result.nms_ms
+         << " d2h_ms " << cuda_result.d2h_ms << "\n";
+  double max_delta = 0;
+  for (std::size_t index = 0; index < cpu_result.objects.size(); ++index) {
+    const vie::ObbObject& want = cpu_result.objects[index];
+    const vie::ObbObject& got = cuda_result.objects[index];
+    max_delta = std::max({max_delta, std::fabs(static_cast<double>(got.box.cx) - want.box.cx),
+                          std::fabs(static_cast<double>(got.box.cy) - want.box.cy),
+                          std::fabs(static_cast<double>(got.box.width) - want.box.width),
+                          std::fabs(static_cast<double>(got.box.height) - want.box.height),
+                          std::fabs(static_cast<double>(got.box.angle) - want.box.angle)});
+  }
+  record << "bitwise_equal " << (max_delta == 0.0 ? 1 : 0) << " max_object_delta " << max_delta << "\n";
+  for (std::size_t index = 0; index < cuda_result.objects.size(); ++index) {
+    const vie::ObbObject& got = cuda_result.objects[index];
+    record << index << " class " << got.class_id << " anchor " << got.anchor_index << " score " << got.score
+           << " cx " << got.box.cx << " cy " << got.box.cy << " w " << got.box.width << " h " << got.box.height
+           << " angle " << got.box.angle << "\n";
+  }
   cudaFree(device_pixels);
 }
 #endif

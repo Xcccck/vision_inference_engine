@@ -73,12 +73,14 @@ class IModelDecoder {
                                                     const DeviceContext& device) const;
 
   // OBB path. The default refuses so a detection decoder cannot be mistaken
-  // for an oriented-box decoder. Rotated NMS in this phase is CPU-only.
+  // for an oriented-box decoder. The engine dispatches on the device: CPU runs
+  // YoloV8ObbDecoder, CUDA runs ObbCudaDecoder.
   virtual ObbBatch decode_obb(const DecoderInput& input, const ObbDecodeConfig& config,
                               const DeviceContext& device) const;
 
   // Pose path. The default refuses so a detection decoder cannot be mistaken
-  // for a keypoint decoder. Pose NMS in this phase is CPU-only.
+  // for a keypoint decoder. The engine dispatches on the device: CPU runs
+  // YoloV8PoseDecoder, CUDA runs PoseCudaDecoder.
   virtual PoseBatch decode_pose(const DecoderInput& input, const PoseDecodeConfig& config,
                                 const DeviceContext& device) const;
 

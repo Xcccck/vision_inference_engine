@@ -45,13 +45,15 @@
 | Detection | `infer()`，`infer_batch()`（仅 CPU 上的 `yolov8_detect_raw`） | YOLOv8n、RT-DETR-L | CPU kernel + CUDA kernel |
 | Instance Segmentation | `infer_segmentation()` | YOLOv8n-seg | CPU kernel + CUDA kernel |
 | Semantic Segmentation | `infer_semantic_segmentation()` | DeepLabV3-MobileNetV3-Large（torchvision 权重） | CPU kernel + CUDA kernel（GPU ArgMax） |
-| Oriented Box | `infer_obb()` | YOLOv8n-obb | CPU（旋转多边形 NMS） |
+| Oriented Box | `infer_obb()` | YOLOv8n-obb | CPU kernel + CUDA kernel（旋转多边形 IoU + Rotated NMS） |
 | Pose | `infer_pose()` | YOLOv8n-pose | CPU kernel + CUDA kernel（GPU 关键点解码 + 人体框 NMS；关键点个数来自 Manifest） |
 | Classification | `infer_classification()` | ResNet18 / MobileNetV2 / MobileNetV3-Small / EfficientNet-B0（随机初始化导出） | CPU Top-K + CUDA Top-K |
 
 字段级细节、错误码和新模型适配流程见 [docs/MODEL_COMPATIBILITY.md](docs/MODEL_COMPATIBILITY.md)。
 
 Phase 14 实测（RTX 4080 Laptop、Release、YOLOv8n-pose 640×640）：CUDA 端到端 10.22 ms（CPU EP 62.63 ms），解码墙钟 1.93 ms（CPU 4.94 ms），只回传保留结果 6,000 字节（完整输出 1,881,600 字节）。
+
+Phase 15 实测（RTX 4080 Laptop、Release、YOLOv8n-obb 1024×1024，15 类、20 通道、21,504 anchors，3 次预热 + 10 次采样）：CUDA 端到端 11.87 ms（CPU EP 170.78 ms），解码墙钟约 3.0 ms（CPU 6.74 ms = validate 5.23 + NMS 1.51），`d2h_bytes` 640（完整输出 1,720,320）。同一份 raw Tensor 喂两边的 Decoder，20 个保留框的类别、anchor、分数与 `cx/cy/w/h/angle` 全部逐位相同。
 
 ## 开发环境
 
@@ -232,7 +234,7 @@ std::future<vie::DetectionResult> fut = runtime.submit("det", image, options);
 
 ```bash
 ctest --test-dir build-ort --output-on-failure          # CPU + ORT：433 个用例
-ctest --test-dir build-ort-gpu --output-on-failure      # CUDA + ORT：528 个用例（524 通过；2 个并发用例在 CUDA 构建下跳过，2 个 Yolov8BatchCuda 用例显式禁用；含 Phase 13/14 真实模型 CUDA Decoder E2E）
+ctest --test-dir build-ort-gpu --output-on-failure      # CUDA + ORT：537 个用例（535 通过；2 个并发用例在 CUDA 构建下跳过，2 个 Yolov8BatchCuda 用例显式禁用； 含 Phase 13/14/15 真实模型 CUDA Decoder E2E）
 ```
 
 缺 fixture 时真实模型用例走 `VIE_REQUIRE_MODEL` 跳过而不是失败，所以新 clone 直接 `ctest` 也是全绿 —— 但那意味着约 78 个用例根本没跑。要验证真实模型链路，先执行 `python3 tools/export_test_models.py`，跳过数应归零。
@@ -272,7 +274,7 @@ target_link_libraries(your_app PRIVATE vie::vie)   # include 目录与 VIE_HAS_*
 - 推理参数由统一的 `InferenceOptions` / `ModelConfig::inference_options` / Manifest 解析（Phase 12）；不是所有 Decoder 都有全部参数：RT-DETR 没有 NMS 参数，语义分割没有可配置后处理参数，Pose 没有关键点分数阈值。
 - 单个 `InferenceEngine` 非线程安全；重叠调用是数据竞争，库不会自动排队。
 - 异步 `submit()` 只接受 CPU 输入；batch > 1 仅 CPU 上的 `yolov8_detect_raw` 支持，其余任务与 CUDA 返回 `Unsupported`。
-- Classification / Semantic Segmentation / Detection / Instance Segmentation / RT-DETR / Pose 有 CPU 与 CUDA 两条解码路径；只有 OBB 仍为 CPU 解码，CUDA 只加速前向并计入 `d2h_bytes`。
+- Classification / Semantic Segmentation / Detection / Instance Segmentation / RT-DETR / Pose / OBB 都有 CPU 与 CUDA 两条解码路径。OBB CUDA Decoder 只接受 rank-3 FP32、连续、batch = 1 的 `[1, C, P]`（`channel_axis=1`）或 `[1, P, C]`（`channel_axis=2`），坐标视为已解码的模型输入空间值，角度按 `[-π/4, 3π/4]` 弧度校验；`d2h_bytes` 只统计保留框的紧凑 payload（`kept * 32`），控制字不计入。
 - Pose CUDA Decoder 只接受 rank-3 FP32、连续、batch = 1 的 `[1, C, P]`（`channel_axis=1`）或 `[1, P, C]`（`channel_axis=2`），坐标视为已解码的模型输入空间值并按 `GeometryTransform` 逆映射回原图；不支持 batch > 1、非 FP32、非连续 Tensor 与模型内置 NMS。`d2h_bytes` 只统计最终保留结果的紧凑 payload（`kept * 28 + kept * keypoints * 16`），控制字与诊断数据不计入。
 - 多人跟踪、ReID、动作识别未实现。
 

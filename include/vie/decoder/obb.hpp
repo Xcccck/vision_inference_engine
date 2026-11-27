@@ -36,7 +36,9 @@ struct ObbResult {
   int image_width = 0;
   int image_height = 0;
   int num_classes = 0;
-  // The device that ran rotated NMS. This phase always uses the CPU.
+  // The device that ran field decode, the map, Polygon IoU, and rotated NMS.
+  // A CPU request uses DeviceType::Cpu; a CUDA request uses DeviceType::Cuda
+  // and only the kept objects are copied back.
   DeviceType execution_device = DeviceType::Cpu;
   int execution_device_id = 0;
   std::string protocol;
@@ -46,10 +48,19 @@ struct ObbResult {
   double execute_ms = 0;
   double d2h_ms = 0;
   double validate_ms = 0;
+  // CUDA only: the deterministic score sort and the corner map in front of
+  // NMS. The CPU decoder keeps both inside its decode_ms component sum and
+  // leaves these zero.
+  double sort_ms = 0;
+  double map_ms = 0;
   double nms_ms = 0;
   double decode_ms = 0;
   int candidates_after_filter = 0;
   int candidates_before_nms = 0;
+  // CUDA only: Polygon IoU evaluations the greedy NMS performed, which is the
+  // number of candidate pairs that passed the class filter. The CPU decoder
+  // leaves it zero.
+  long long iou_calls = 0;
 };
 
 struct ObbBatch {

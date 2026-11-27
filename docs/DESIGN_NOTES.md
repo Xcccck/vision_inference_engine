@@ -79,7 +79,7 @@ Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`inte
 ## 已接通的路径
 
 - 模型格式：ONNX。Mock 只用于管线测试。
-- 任务：YOLOv8 Detection 和 Ultralytics RT-DETR Detection（都走 `infer`），YOLOv8 Segmentation（`infer_segmentation`），语义分割（`infer_semantic_segmentation`），YOLOv8-OBB（`infer_obb`），YOLOv8-Pose（`infer_pose`），以及单标签分类（`infer_classification`）。Decoder 按 Manifest 里的 protocol 选择，不按模型家族分支。RT-DETR、分类、语义分割和 Pose 在 CPU 和 CUDA 上各有一个 Decoder，按设备选择。只有 OBB 的旋转 NMS 仍只在 CPU 上。
+- 任务：YOLOv8 Detection 和 Ultralytics RT-DETR Detection（都走 `infer`），YOLOv8 Segmentation（`infer_segmentation`），语义分割（`infer_semantic_segmentation`），YOLOv8-OBB（`infer_obb`），YOLOv8-Pose（`infer_pose`），以及单标签分类（`infer_classification`）。Decoder 按 Manifest 里的 protocol 选择，不按模型家族分支。RT-DETR、分类、语义分割、Pose 和 OBB 在 CPU 和 CUDA 上各有一个 Decoder，按设备选择，CUDA 路径不退回 CPU。
 - Backend：构建打开 ONNX Runtime 时有 CPU EP；同时打开 CUDA 和 GPU 包时另有 CUDA EP。CUDA EP 默认禁止 CPU fallback。
 - 预处理和解码：CPU 始终可用；CUDA 只在 `VIE_ENABLE_CUDA` 时编译。
 
@@ -90,7 +90,7 @@ Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`inte
 - 图像文件解码
 - 运行时 Softmax 和多标签。模型自己输出的概率走 `classification_probabilities_raw`，解码时不再做 Softmax
 - resize 模式 `crop`
-- 多人跟踪、ReID、动作识别，以及 OBB 的 CUDA Decoder 和 CUDA 旋转 NMS
+- 多人跟踪、ReID、动作识别
 - 并发推理。`load`、`infer`、`infer_segmentation`、`infer_classification`、`infer_obb` 和 `infer_pose` 共用同一个 session，没有锁。重叠调用是数据竞争，库不会把它们串成队列。
 
 `device()` 只描述最近一次成功的 `load`。第一次 `load` 失败时 `loaded()` 仍为 false，`device()` 仍是默认的 CPU 上下文，这不是一次 CPU 推理。再次 `load` 失败不会拆掉已经成功的 session。
@@ -148,7 +148,9 @@ vie::ClassificationBatch ranked = classifier.infer_classification(image, labels)
 
 `yolov8_seg_raw` 有 CPU 和 CUDA 解码。它按名称读取 `output0` 和 prototype，复用检测的置信度过滤、坐标映射和 NMS，并保留 prediction index 以收集 mask 系数。重建是 `M = a · P`，不再做 Sigmoid；二值规则必须显式写成 `M > 0`。`retina_masks=false` 时 mask 是模型输入尺寸，`true` 时是原图尺寸。CUDA 路径把 mask 留在 CUDA Tensor 上，失败时不会退回 CPU。Kernel 使用默认 stream，不是 `DeviceContext` 自己的 stream。缺 `retina_masks`、NMS 或 mask 内存预算时返回 `UnresolvedField`。`InferenceEngine::infer_segmentation()` 走这条路径；`infer()` 遇到分割 Manifest 返回 `Unsupported`。TensorRT 还没有实现。
 
-`yolov8_obb_raw` 读取已经解码好的 `cx, cy, width, height, class probabilities, angle`。角度是弧度，范围 `[-pi/4, 3pi/4]`，宽边方向是 `(cos, sin)`。`infer_obb()` 用调用者给出的置信度、IoU 和 Top-K 做旋转矩形的多边形 NMS，再把框映射回原图。各向同性缩放保持角度；各向异性缩放先反映射四个顶点，再拟合最小面积矩形。顶点离开原图的框会被丢掉，不会裁成可见碎片。CUDA EP 把整份输出拷回 CPU 后使用同一个 Decoder，这次拷贝计入 `d2h_bytes`。`infer()` 遇到 OBB Manifest 返回 `Unsupported`。
+`yolov8_obb_raw` 读取已经解码好的 `cx, cy, width, height, class probabilities, angle`。角度是弧度，范围 `[-pi/4, 3pi/4]`，宽边方向是 `(cos, sin)`；`(width, height, angle)` 与 `(height, width, angle + pi/2)` 是同一个框，Decoder 不与 CPU 以外的区间做归一化。`infer_obb()` 用调用者给出的置信度、IoU 和 Top-K 做旋转矩形的多边形 NMS，再把框映射回原图。各向同性缩放保持角度；各向异性缩放先反映射四个顶点，再拟合最小面积矩形。顶点离开原图的框会被丢掉，不会裁成可见碎片。CPU 与 CUDA 共用同一份 `ObbDecodeConfig`（Phase 12 的 `obb_decode_config_from_resolved`），`ObbDispatchDecoder` 只按设备分派；`infer()` 遇到 OBB Manifest 返回 `Unsupported`。
+
+CUDA Decoder（Phase 15）在设备上完成候选校验、类别选择、置信度过滤、`score desc → anchor asc → class asc` 排序、`pre_nms_top_k` 截断、`GeometryTransform` 逆映射、Polygon IoU 和 Rotated NMS，只把保留框的 32 字节记录拷回。它按 CPU 的读序读取五个框通道和类别分数：非有限值、越界概率、保留框的非正宽高或越界角度都抛与 CPU 相同的 `InvalidArgument` 消息，最早 anchor 由 fault 的 `(prediction, rank)` 编码决定。几何计算全部用设备 double，`-fmad=false` 禁止乘加融合，因此同一份 raw Tensor 的 IoU 与 CPU 逐位相同。Polygon IoU 是 Sutherland–Hodgman 凸裁剪（`>= -1e-9` 判内，平行边返回端点，末端清理 1e-18 内重复点），交面积除以并面积后再 clamp 到 `[0, 1]`；NMS 是单 Block 串行贪心，`IoU >= threshold` 抑制，class 过滤在 IoU 之前，达到 `max_detections` 后不再保留；候选数上限 1,000,000、`pre_nms_top_k` 上限 4096，batch > 1 与非 FP32/非连续/CPU Tensor 明确拒绝。`d2h_bytes` 只含 `kept * 32`；控制字（fault、计数、IoU 调用数）不计入。
 
 ```cpp
 vie::ObbRuntimeConfig obb_runtime;
