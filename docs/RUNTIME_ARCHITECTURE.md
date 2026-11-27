@@ -1160,9 +1160,99 @@ geometry, ties, non-finite coordinates, contracts, dispatcher, timing) run only
 when `VIE_ENABLE_CUDA=ON`; `tests/test_cuda_decoder_e2e.cpp` adds the three real
 model lanes. CUDA OFF builds never compile the CUDA branches.
 
-**Scope.** Pose and OBB keep CPU decoders; there is no CUDA batch path (the
-batch aggregator still rejects CUDA batch > 1), no model-specific logic, and no
+**Scope.** At the end of Phase 13, Pose and OBB kept CPU decoders. Phase 14 adds the Pose
+CUDA decoder described below; OBB keeps its CPU polygon NMS. There is no CUDA batch path
+(the batch aggregator still rejects CUDA batch > 1), no model-specific logic, and no
 implicit CPU fallback.
+
+### Pose CUDA Decoder (Phase 14)
+
+Phase 14 adds the Pose GPU post-processing lane. `PoseDispatchDecoder` routes by
+`DeviceContext::device()`: CPU keeps `YoloV8PoseDecoder`, CUDA goes to
+`PoseCudaDecoder`. The CUDA path never calls the CPU decoder, and a CUDA failure
+never retries on the CPU. The public API, manifest schema 1.0 and the Phase 12
+config chain are unchanged.
+
+**Contract.** The decoded tensor must be rank-3 FP32, contiguous, device-matched
+and batch 1 (`[1, C, P]` for `channel_axis=1`, `[1, P, C]` for `channel_axis=2`),
+with `C == 4 + num_classes + keypoint_count * 3`. The first four channels are
+already-decoded `cx, cy, w, h` in model-input space, followed by class scores and
+`(x, y, confidence)` triplets. Batch > 1, non-FP32, non-contiguous tensors, wrong
+channel counts and missing outputs/geometry are rejected before any kernel runs;
+the non-contiguous case now reports `InvalidArgument`, matching the CPU decoder.
+Explicit upper bounds (predictions ≤ 1e6, candidates ≤ 1e6, keypoints ≤ 10000,
+keypoint buffer ≤ 256 MiB) prevent silent allocation overflow.
+
+**Kernel pipeline.** `filter_decode_kernel` runs one thread per anchor and reads
+fields in the exact CPU order: all class scores first (non-finite and probability
+range faults are recorded with a 64-bit `atomicMin` key), then Select/AllAbove
+filtering with the CPU tie-break (highest score, then smallest class id), then
+`cx/cy/w/h` (non-positive size is a fault), then every keypoint. Anchors that
+produce no candidate never touch their box/keypoint channels, so a NaN there is
+ignored exactly as on the CPU. Candidates are sorted by
+`score desc, anchor asc, class asc` (Thrust `sort`, deterministically) and
+truncated to `pre_nms_top_k`. A parallel `map_kernel` performs the double-precision
+inverse `GeometryTransform`, clamps boxes to `[0, W] x [0, H]`, drops degenerate
+boxes, keeps keypoints unclamped with the 1e-3 `inside_image` slack and clamps
+keypoint confidence; a single-thread `compact_kernel` preserves the CPU candidate
+order. `nms_kernel` is class-aware exactly when the resolved config says so,
+uses the CPU float IoU (`IoU >= iou_threshold` suppresses, union ≤ 0 or non-finite
+returns 0), and stops at `max_detections`; when NMS is disabled the prefix of
+`min(max_detections, candidates)` is kept. `pack_kernel` gathers the final compact
+objects and keypoints; only that payload is copied back. Fault messages are
+reconstructed from the GPU fault word and match the CPU text byte-for-byte.
+
+**Config.** Both lanes consume the same Phase 12 `PoseDecodeConfig` produced by
+`pose_decode_config_from_resolved()` (priority
+RequestOverride > ModelConfig > Manifest > FrameworkDefault); the CUDA decoder
+keeps no private defaults. `tests/test_pose_cuda_decoder.cpp::RunsTheResolvedPhase12Policy`
+feeds one resolved config to both lanes and asserts identical NMS/selection
+behavior; the existing `DecoderConfigPolicy.PoseResolvedConfigMapsEveryPolicyField`
+and Runtime/fingerprint suites still pass.
+
+**Stream and lifetime.** The lane follows the Phase 13 conventions: legacy default
+stream (`nullptr`, the stream ORT CUDA EP uses here), `cudaSetDevice(device_id)` at
+entry, `cudaStreamSynchronize` on that stream for the three control-word reads and
+the final D2H, never `cudaDeviceSynchronize`; RAII `DeviceBuffer`/event pairs keep
+temporaries alive; every launch checks `cudaGetLastError`; `Tensor::data()` is
+never called on a CUDA tensor. `d2h_bytes` counts only the compact payload
+(`kept * 28 + kept * keypoints * 16`); the 8-byte fault word and the three 4-byte
+counters are control transfers and are not counted, consistent with the other
+CUDA decoders. `decode_ms` is wall-clock on CUDA (launch + sync included);
+`validate_ms` covers filter + sort, `pose_decode_ms` covers map + compact, `nms_ms`
+covers NMS/prefix, and `d2h_ms` covers pack + the two payload copies.
+
+**Measured timings.** RTX 4080 Laptop, Release, CUDA 12.6, ORT 1.20.1 CUDA EP.
+Synthetic decoder bench: 8400 anchors, 17 keypoints, 640x480 input, output tensor
+1,881,600 bytes, 2 warmups + 5 samples, wall-clock includes launch and sync.
+
+| Candidates | CPU decoder | CUDA wall | validate | pose_decode | NMS | D2H | `d2h_bytes` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 0.056 ms | 2.21 ms | 0.404 ms | 0.036 ms | 0.071 ms | 0.185 ms | 2,400 |
+| 120 | 0.135 ms | 1.89 ms | 0.097 ms | 0.255 ms | 0.076 ms | 0.218 ms | 36,000 |
+| 600 | 0.682 ms | 3.62 ms | 0.170 ms | 1.169 ms | 0.455 ms | 0.278 ms | 180,000 |
+
+The CUDA lane is slower than the CPU decoder for these candidate counts because
+launch and the control-word reads dominate; it pays off in the end-to-end path.
+
+Real `yolov8n-pose.onnx` E2E (`tests/test_pose.cpp::StrictCudaMatchesCpu`,
+640x640, 8400 anchors, 300 pre-NMS candidates, 20 kept, 17 keypoints, 3 warmups +
+10 samples, strict CUDA EP with `cuda_cpu_ep_fallback=false`): CPU total
+62.63 ms (preprocess 13.32, execute 42.67, decode 4.94 = validate 4.75 +
+pose_decode 0.127 + NMS 0.060); CUDA total 10.22 ms (preprocess 0.85, execute 7.43,
+decode wall 1.93 = validate 0.315 + pose_decode 0.625 + NMS 0.114 + D2H 0.169),
+`d2h_bytes` 6,000 vs output 1,881,600. All 20 CPU detections share an anchor with
+the CUDA result; raw EP logits differ by at most 0.6225 px (box), 6.96e-4 (score)
+and 0.4023 (keypoint), which is why the E2E comparison uses explicit tolerances.
+
+**Tests and builds.** `tests/test_pose_cuda_decoder.cpp` contains 9 GPU-only cases
+(single/multiple/empty detections, axis 1 and 2, 17 keypoints, class policies,
+ties and the exact IoU boundary, dropped anchors, CPU-identical fault messages,
+tensor/request contracts, Phase 12 policy parity, timing record);
+`tests/test_pose.cpp` adds the strict-CUDA real-model E2E. All five builds
+(A: CUDA/ORT off, B: ORT CPU, C: OpenCV + ORT CPU, D: ORT CUDA, E: OpenCV +
+CUDA) pass, ASan passes 372/372, and compute-sanitizer reports 0 errors for the
+Pose CUDA cases. CUDA OFF builds never compile the `.cu` lane.
 
 ### RuntimeConfig
 

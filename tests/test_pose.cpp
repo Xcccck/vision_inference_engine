@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 #if defined(VIE_HAS_ONNXRUNTIME_CUDA)
+#include "vie/backend/onnxruntime_cuda_backend.hpp"
 #include <cuda_runtime.h>
 #endif
 
@@ -1043,6 +1044,7 @@ TEST(YoloV8PoseReal, CpuTimingUsesRepeatedSamples) {
   std::vector<double> validate_ms;
   std::vector<double> pose_decode_ms;
   std::vector<double> nms_ms;
+  std::vector<double> decode_ms;
   std::vector<double> total_ms;
   int candidates = 0;
   int kept = 0;
@@ -1055,6 +1057,7 @@ TEST(YoloV8PoseReal, CpuTimingUsesRepeatedSamples) {
     validate_ms.push_back(timing.validate_ms);
     pose_decode_ms.push_back(timing.pose_decode_ms);
     nms_ms.push_back(timing.nms_ms);
+    decode_ms.push_back(timing.decode_ms);
     total_ms.push_back(timing.total_ms);
     candidates = timing.candidates_before_nms;
     kept = timing.results_after_nms;
@@ -1077,6 +1080,8 @@ TEST(YoloV8PoseReal, CpuTimingUsesRepeatedSamples) {
          << percentile(pose_decode_ms, 0.95) << "\n";
   record << "nms mean " << mean_of(nms_ms) << " p50 " << percentile(nms_ms, 0.50) << " p95 "
          << percentile(nms_ms, 0.95) << "\n";
+  record << "decode mean " << mean_of(decode_ms) << " p50 " << percentile(decode_ms, 0.50) << " p95 "
+         << percentile(decode_ms, 0.95) << "\n";
   record << "total mean " << mean_of(total_ms) << " p50 " << percentile(total_ms, 0.50) << " p95 "
          << percentile(total_ms, 0.95) << "\n";
   EXPECT_GT(mean_of(execute_ms), 0.0);
@@ -1111,6 +1116,8 @@ TEST(YoloV8PoseReal, StrictCudaMatchesCpu) {
   vie::ModelConfig cuda_config = cpu_config;
   cuda_config.backend = vie::BackendKind::OnnxRuntimeCuda;
   cuda_config.device = vie::DeviceType::Cuda;
+  ASSERT_FALSE(cuda_config.cuda_cpu_ep_fallback);
+  EXPECT_FALSE(vie::OnnxRuntimeCudaBackend{}.cpu_ep_fallback());
   vie::InferenceEngine cuda_engine;
   cuda_engine.load(cuda_config);
   constexpr int kWarmup = 3;
@@ -1122,6 +1129,7 @@ TEST(YoloV8PoseReal, StrictCudaMatchesCpu) {
   std::vector<double> validate_ms;
   std::vector<double> pose_decode_ms;
   std::vector<double> nms_ms;
+  std::vector<double> decode_ms;
   std::vector<double> total_ms;
   vie::PoseBatch cuda_batch;
   vie::PoseInferTiming timing;
@@ -1133,12 +1141,20 @@ TEST(YoloV8PoseReal, StrictCudaMatchesCpu) {
     validate_ms.push_back(timing.validate_ms);
     pose_decode_ms.push_back(timing.pose_decode_ms);
     nms_ms.push_back(timing.nms_ms);
+    decode_ms.push_back(timing.decode_ms);
     total_ms.push_back(timing.total_ms);
   }
-  EXPECT_EQ(timing.d2h_bytes, timing.output_bytes);
+  // Phase 14: the pose kernels keep the raw tensor on the device and copy back
+  // only the kept objects and their keypoints.
+  const std::size_t kept = cuda_batch.results[0].objects.size();
+  const std::size_t keypoints = static_cast<std::size_t>(manifest.pose.keypoint_count.value_or(0));
+  EXPECT_EQ(timing.results_after_nms, static_cast<int>(kept));
+  EXPECT_EQ(timing.d2h_bytes, kept * 28u + kept * keypoints * 16u);
   EXPECT_GT(timing.d2h_bytes, 0u);
+  EXPECT_LT(timing.d2h_bytes, timing.output_bytes);
   EXPECT_TRUE(timing.includes_d2h);
-  EXPECT_EQ(cuda_batch.results[0].execution_device, vie::DeviceType::Cpu);
+  EXPECT_EQ(cuda_batch.results[0].execution_device, vie::DeviceType::Cuda);
+  EXPECT_EQ(cuda_batch.results[0].execution_device_id, 0);
   EXPECT_EQ(cuda_batch.results[0].d2h_bytes, timing.d2h_bytes);
 
   vie::BackendRequest cpu_request;
@@ -1216,6 +1232,8 @@ TEST(YoloV8PoseReal, StrictCudaMatchesCpu) {
          << percentile(pose_decode_ms, 0.95) << "\n";
   record << "nms mean " << mean_of(nms_ms) << " p50 " << percentile(nms_ms, 0.50) << " p95 "
          << percentile(nms_ms, 0.95) << "\n";
+  record << "decode mean " << mean_of(decode_ms) << " p50 " << percentile(decode_ms, 0.50) << " p95 "
+         << percentile(decode_ms, 0.95) << "\n";
   record << "total mean " << mean_of(total_ms) << " p50 " << percentile(total_ms, 0.50) << " p95 "
          << percentile(total_ms, 0.95) << "\n";
   cudaFree(device_pixels);

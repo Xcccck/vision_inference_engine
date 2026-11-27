@@ -44,7 +44,9 @@ struct PoseResult {
   int image_width = 0;
   int image_height = 0;
   int num_classes = 0;
-  // The device that ran pose decode and NMS. This phase always uses the CPU.
+  // The device that ran pose decode and NMS. CPU builds and CPU requests use
+  // DeviceType::Cpu; a CUDA request uses DeviceType::Cuda and only the kept
+  // objects are copied back.
   DeviceType execution_device = DeviceType::Cpu;
   int execution_device_id = 0;
   std::string protocol;
@@ -94,7 +96,7 @@ void validate_pose_decode_config(const PoseDecodeConfig& config);
 
 // Phase 12: build the decoder policy from the effective config resolved for
 // this request. This is the only place that maps ResolvedPoseConfig onto
-// PoseDecodeConfig; the current pose decoder is CPU only.
+// PoseDecodeConfig; the CPU and CUDA decoders share this result.
 PoseDecodeConfig pose_decode_config_from_resolved(const ModelManifest& manifest,
                                                  const ResolvedInferenceConfig& resolved);
 

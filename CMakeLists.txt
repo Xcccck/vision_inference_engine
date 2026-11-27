@@ -114,6 +114,7 @@ add_library(vie
   src/decoder/obb_geometry.cpp
   src/decoder/yolov8_obb_decoder.cpp
   src/decoder/yolov8_pose_decoder.cpp
+  src/decoder/pose_cuda_decoder.cpp
   src/decoder/rtdetr_decoder.cpp
   src/decoder/rtdetr_cuda_decoder.cpp
   src/decoder/yolov8_seg_decoder.cpp
@@ -158,7 +159,8 @@ if(VIE_ENABLE_CUDA)
   target_sources(vie PRIVATE src/preprocess/preprocess_cuda.cu src/decoder/yolov8_detect_decoder.cu
                  src/decoder/yolov8_seg_decoder.cu src/decoder/rtdetr_cuda_decoder.cu
                  src/decoder/classification_cuda_decoder.cu
-                 src/decoder/semantic_segmentation_cuda_decoder.cu)
+                 src/decoder/semantic_segmentation_cuda_decoder.cu
+                 src/decoder/pose_cuda_decoder.cu)
   target_link_libraries(vie PUBLIC CUDA::cudart)
   target_compile_definitions(vie PUBLIC VIE_HAS_CUDA=1)
   # nvcc emits GNU line markers. -Wpedantic treats those as errors, so this
@@ -170,7 +172,8 @@ if(VIE_ENABLE_CUDA)
   set_source_files_properties(src/decoder/yolov8_seg_decoder.cu PROPERTIES
     COMPILE_OPTIONS "--fmad=false;-Xcompiler=-Wall,-Wextra,-Werror,-Wno-pedantic")
   set_source_files_properties(src/decoder/classification_cuda_decoder.cu
-                              src/decoder/semantic_segmentation_cuda_decoder.cu PROPERTIES
+                              src/decoder/semantic_segmentation_cuda_decoder.cu
+                              src/decoder/pose_cuda_decoder.cu PROPERTIES
     COMPILE_OPTIONS "--fmad=false;-Xcompiler=-Wall,-Wextra,-Werror,-Wno-pedantic")
 endif()
 
@@ -283,6 +286,7 @@ if(VIE_BUILD_TESTS)
                                    tests/test_rtdetr_cuda_decoder.cpp tests/test_batch_cuda.cpp
                                    tests/test_classification_cuda_decoder.cpp
                                    tests/test_semantic_segmentation_cuda.cpp
+                                   tests/test_pose_cuda_decoder.cpp
                                    tests/test_cuda_decoder_e2e.cpp)
     set_property(TARGET vie_tests APPEND PROPERTY BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
   endif()

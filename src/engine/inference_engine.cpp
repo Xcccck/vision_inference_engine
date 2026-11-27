@@ -5,11 +5,11 @@
 #include "vie/decoder/classification_cuda_decoder.hpp"
 #include "vie/decoder/detection.hpp"
 #include "vie/decoder/mock_decoder.hpp"
+#include "vie/decoder/pose_cuda_decoder.hpp"
 #include "vie/decoder/rtdetr_cuda_decoder.hpp"
 #include "vie/decoder/semantic_segmentation_cuda_decoder.hpp"
 #include "vie/decoder/yolov8_detect_decoder.hpp"
 #include "vie/decoder/yolov8_obb_decoder.hpp"
-#include "vie/decoder/yolov8_pose_decoder.hpp"
 #include "vie/decoder/yolov8_seg_decoder.hpp"
 #include "vie/model/manifest_validator.hpp"
 #include "vie/preprocess/preprocess.hpp"
@@ -257,7 +257,7 @@ InferenceEngine::InferenceEngine() {
   decoders_.register_factory("mock", [] { return std::make_unique<MockDecoder>(); });
   decoders_.register_factory("yolov8_detect_raw", [] { return std::make_unique<YoloV8DetectionDecoder>(); });
   decoders_.register_factory("yolov8_obb_raw", [] { return std::make_unique<YoloV8ObbDecoder>(); });
-  decoders_.register_factory("yolov8_pose_raw", [] { return std::make_unique<YoloV8PoseDecoder>(); });
+  decoders_.register_factory("yolov8_pose_raw", [] { return std::make_unique<PoseDispatchDecoder>(); });
   decoders_.register_factory("yolov8_seg_raw", [] { return std::make_unique<YoloV8SegmentationDecoder>(); });
   decoders_.register_factory("rtdetr_detection_raw", [] { return std::make_unique<RtdetrDetectionDecoder>(); });
   decoders_.register_factory("classification_logits_raw",
@@ -980,26 +980,30 @@ PoseBatch InferenceEngine::infer_pose(const ImageInput& image, const PoseRuntime
   require_same_device(found->second.tensor, device_, "backend output '" + config.output_name + "'");
   Tensor scores = found->second.tensor;
   const std::size_t output_bytes = scores.nbytes();
-  std::size_t d2h_bytes = 0;
-  double d2h_ms = 0;
-  if (scores.is_cuda()) {
-    const auto d2h_start = std::chrono::steady_clock::now();
-    scores = scores.to(DeviceContext(DeviceType::Cpu, 0));
-    d2h_ms = elapsed_ms(d2h_start);
-    d2h_bytes = output_bytes;
-  }
   DecoderInput decoded;
   decoded.geometry = prepared.geometry;
-  decoded.outputs.emplace(config.output_name, std::move(scores));
-  PoseBatch batch = decoder_->decode_pose(decoded, config, DeviceContext{});
+  decoded.outputs.emplace(config.output_name, scores);
+  // Phase 14: the tensor stays on the engine device. On CUDA the decoder runs
+  // candidate filtering, box and keypoint decode, the sort, the inverse map,
+  // and NMS in kernels and copies only the kept objects; on CPU it reads the
+  // host tensor and copies nothing. The engine records whatever the decoder
+  // reports.
+  const auto decode_start = std::chrono::steady_clock::now();
+  PoseBatch batch = decoder_->decode_pose(decoded, config, device_);
+  const double decode_ms = elapsed_ms(decode_start);
+  const std::size_t d2h_bytes = batch.results.empty() ? 0 : batch.results[0].d2h_bytes;
+  const double d2h_ms = batch.results.empty() ? 0.0 : batch.results[0].d2h_ms;
   if (!batch.results.empty()) {
     batch.results[0].output_bytes = output_bytes;
-    batch.results[0].d2h_bytes = d2h_bytes;
-    batch.results[0].d2h_ms = d2h_ms;
     batch.results[0].preprocess_ms = preprocess_ms;
     batch.results[0].execute_ms = execute_ms;
-    batch.results[0].decode_ms = d2h_ms + batch.results[0].validate_ms + batch.results[0].pose_decode_ms +
-                                 batch.results[0].nms_ms;
+    // CPU keeps the documented component sum. CUDA reports the wall clock so
+    // launch and stream-sync cost is not hidden behind GPU event time.
+    batch.results[0].decode_ms =
+        device_.device() == DeviceType::Cuda
+            ? decode_ms
+            : d2h_ms + batch.results[0].validate_ms + batch.results[0].pose_decode_ms +
+                  batch.results[0].nms_ms;
   }
   if (timing != nullptr) {
     timing->preprocess_ms = preprocess_ms;
@@ -1008,7 +1012,9 @@ PoseBatch InferenceEngine::infer_pose(const ImageInput& image, const PoseRuntime
     timing->validate_ms = batch.results.empty() ? 0 : batch.results[0].validate_ms;
     timing->pose_decode_ms = batch.results.empty() ? 0 : batch.results[0].pose_decode_ms;
     timing->nms_ms = batch.results.empty() ? 0 : batch.results[0].nms_ms;
-    timing->decode_ms = d2h_ms + timing->validate_ms + timing->pose_decode_ms + timing->nms_ms;
+    timing->decode_ms = device_.device() == DeviceType::Cuda
+                            ? decode_ms
+                            : d2h_ms + timing->validate_ms + timing->pose_decode_ms + timing->nms_ms;
     timing->total_ms = elapsed_ms(total_start);
     timing->output_bytes = output_bytes;
     timing->d2h_bytes = d2h_bytes;

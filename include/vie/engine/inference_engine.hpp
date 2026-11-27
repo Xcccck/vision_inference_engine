@@ -281,9 +281,11 @@ class InferenceEngine {
   ObbBatch infer_obb(const ImageInput& image, T&& options, ObbInferTiming* timing = nullptr) {
     return infer_obb_options(image, options, timing);
   }
-  // Preprocess, execute, explicit D2H when the output is on CUDA, then the CPU
-  // pose decoder and person-box NMS. Only task pose with yolov8_pose_raw is
-  // accepted. Keypoints are inverse-mapped on their own, not from the box.
+  // Preprocess, execute, then the pose decoder on the engine device: CPU reads
+  // the host tensor, CUDA runs filtering, box and keypoint decode, the inverse
+  // map, and person-box NMS in kernels and copies only the kept objects. Only
+  // task pose with yolov8_pose_raw is accepted. Keypoints are inverse-mapped on
+  // their own, not from the box.
   PoseBatch infer_pose(const ImageInput& image, const PoseRuntimeConfig& runtime, PoseInferTiming* timing = nullptr);
   // Phase 12: person-box conf/IoU/NMS policy from the unified resolver. There
   // is still no keypoint-score filter.

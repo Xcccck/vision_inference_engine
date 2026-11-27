@@ -79,7 +79,7 @@ Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`inte
 ## 已接通的路径
 
 - 模型格式：ONNX。Mock 只用于管线测试。
-- 任务：YOLOv8 Detection 和 Ultralytics RT-DETR Detection（都走 `infer`），YOLOv8 Segmentation（`infer_segmentation`），语义分割（`infer_semantic_segmentation`），YOLOv8-OBB（`infer_obb`），YOLOv8-Pose（`infer_pose`），以及单标签分类（`infer_classification`）。Decoder 按 Manifest 里的 protocol 选择，不按模型家族分支。RT-DETR、分类和语义分割在 CPU 和 CUDA 上各有一个 Decoder，按设备选择。OBB 的旋转 NMS 和 Pose 的人体框 NMS 只在 CPU 上。
+- 任务：YOLOv8 Detection 和 Ultralytics RT-DETR Detection（都走 `infer`），YOLOv8 Segmentation（`infer_segmentation`），语义分割（`infer_semantic_segmentation`），YOLOv8-OBB（`infer_obb`），YOLOv8-Pose（`infer_pose`），以及单标签分类（`infer_classification`）。Decoder 按 Manifest 里的 protocol 选择，不按模型家族分支。RT-DETR、分类、语义分割和 Pose 在 CPU 和 CUDA 上各有一个 Decoder，按设备选择。只有 OBB 的旋转 NMS 仍只在 CPU 上。
 - Backend：构建打开 ONNX Runtime 时有 CPU EP；同时打开 CUDA 和 GPU 包时另有 CUDA EP。CUDA EP 默认禁止 CPU fallback。
 - 预处理和解码：CPU 始终可用；CUDA 只在 `VIE_ENABLE_CUDA` 时编译。
 
@@ -90,7 +90,7 @@ Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`inte
 - 图像文件解码
 - 运行时 Softmax 和多标签。模型自己输出的概率走 `classification_probabilities_raw`，解码时不再做 Softmax
 - resize 模式 `crop`
-- 多人跟踪、ReID、动作识别，以及 CUDA 上的 Pose Decoder 和 CUDA NMS
+- 多人跟踪、ReID、动作识别，以及 OBB 的 CUDA Decoder 和 CUDA 旋转 NMS
 - 并发推理。`load`、`infer`、`infer_segmentation`、`infer_classification`、`infer_obb` 和 `infer_pose` 共用同一个 session，没有锁。重叠调用是数据竞争，库不会把它们串成队列。
 
 `device()` 只描述最近一次成功的 `load`。第一次 `load` 失败时 `loaded()` 仍为 false，`device()` 仍是默认的 CPU 上下文，这不是一次 CPU 推理。再次 `load` 失败不会拆掉已经成功的 session。
@@ -168,7 +168,9 @@ oriented.load(obb);
 vie::ObbBatch found = oriented.infer_obb(image, obb_runtime);
 ```
 
-`yolov8_pose_raw` 读取已经解码好的 `cx, cy, width, height, class probabilities`，后面是若干组 `x, y, confidence`。关键点个数来自 Manifest，不写死成 17。`confidence` 是图内 Sigmoid 之后的概率，Ultralytics 把这一通道叫做 visible；它不是 COCO 的 0/1/2 可见性，也不是人体检测分数。低关键点分数不会删掉人体。`infer_pose()` 用调用者给出的置信度、IoU 和 Top-K 对人体框做 NMS，框和关键点分别映射回原图。关键点使用各自的 `scale_x`、`scale_y` 和 crop/pad 原点，不从框中心反推，也不裁到图像边缘；落在原图外时 `inside_image` 为 false。CUDA EP 把整份输出拷回 CPU 后使用同一个 Decoder，这次拷贝计入 `d2h_bytes`。`infer()` 遇到 Pose Manifest 返回 `Unsupported`。颜色、resize 和归一化仍由调用者填写。
+`yolov8_pose_raw` 读取已经解码好的 `cx, cy, width, height, class probabilities`，后面是若干组 `x, y, confidence`。关键点个数来自 Manifest，不写死成 17。`confidence` 是图内 Sigmoid 之后的概率，Ultralytics 把这一通道叫做 visible；它不是 COCO 的 0/1/2 可见性，也不是人体检测分数。低关键点分数不会删掉人体。`infer_pose()` 用调用者给出的置信度、IoU 和 Top-K 对人体框做 NMS，框和关键点分别映射回原图。关键点使用各自的 `scale_x`、`scale_y` 和 crop/pad 原点，不从框中心反推，也不裁到图像边缘；落在原图外时 `inside_image` 为 false。
+
+Phase 14 给 Pose 加了 CUDA Decoder，按执行设备在 `PoseDispatchDecoder` 里分派，CUDA 路径不调用 CPU Decoder。GPU 按 CPU 相同的读序校验每个 anchor（先全部类别分数，再 box，再关键点），完成后处理筛选、降序排序、pre-NMS Top-K、坐标逆映射、人体框 NMS 和紧凑打包，只把保留结果拷回 Host。`d2h_bytes` 只计最终 payload：每个保留人体 28 字节，每个关键点 16 字节；fault 与候选计数控制字不计入。CUDA 路径使用默认 stream，只在读取计数和取回结果时做 `cudaStreamSynchronize`，不调用 `cudaDeviceSynchronize`；失败不回退 CPU。CPU 与 CUDA 共用同一份 Phase 12 解析出的 `PoseDecodeConfig`，对相同原始 Tensor 的候选顺序、NMS 保留结果与关键点字段一致，浮点差异只来自 float/double 运算顺序。Batch 仍严格限制为 1。
 
 ```cpp
 vie::PoseRuntimeConfig pose_runtime;

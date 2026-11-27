@@ -39,6 +39,14 @@
 |---|---|---|---|---|---|
 | YOLOv8n-pose | `yolov8_pose_raw` | `yolov8_pose` | 17 | [1,3,640,640] | [1,56,8400] |
 
+`yolov8_pose_raw` 的输入契约（CPU 与 CUDA Decoder 共用）：
+
+- rank-3 FP32、连续内存、batch 必须为 1；`channel_axis=1` 为 `[1, C, P]`，`channel_axis=2` 为 `[1, P, C]`。
+- `C == 4 + num_classes + keypoint_count * 3`；`keypoint_count` 来自 Manifest，每关键点固定为 `(x, y, confidence)`。
+- 前 4 个通道是已解码的 `cx, cy, w, h`（模型输入空间），后面是类别分数，再后面是关键点；`w`/`h` 必须为正。
+- CPU Decoder 与 CUDA Decoder 都用 `GeometryTransform` 把人体框与关键点从模型输入空间逆映射回原图，再按 Manifest 的 NMS 策略过滤。
+- 不支持的输入：batch > 1、非 FP32、非连续 Tensor、通道数与 Manifest 不一致、模型内置 NMS。
+
 ### 2.5 RT-DETR
 
 | 模型 | 协议 | 识别器 | Opset | Input Shape | Output Shapes |
@@ -97,18 +105,23 @@ ONNX Analyzer 可以解析动态维度（symbolic dimensions），但当前 Prep
 ## 6. 严格 CUDA EP 支持
 
 CUDA EP 使用 ORT CUDA Backend 执行模型前向。Detection / Instance Segmentation /
-RT-DETR / Classification / Semantic Segmentation 在 CUDA 上有真正的后处理
-（Phase 13 补齐分类 Top-K 与语义分割 ArgMax）；OBB / Pose 仍只在 CPU 上后处理。
+RT-DETR / Classification / Semantic Segmentation / Pose 在 CUDA 上有真正的后处理
+（Phase 13 补齐分类 Top-K 与语义分割 ArgMax，Phase 14 补齐 Pose 关键点解码与人体框 NMS）；
+OBB 仍只在 CPU 上后处理。
 
 | 任务 | CUDA EP | 说明 |
 |---|---|---|
 | Detection | 支持 | 前向 CUDA + CUDA Decoder |
 | Segmentation | 支持 | 前向 CUDA + CUDA Decoder |
 | OBB | 支持 | 前向 CUDA，解码 CPU |
-| Pose | 支持 | 前向 CUDA，解码 CPU |
+| Pose | 支持 | 前向 CUDA + CUDA Decoder，GPU 完成筛选、关键点解码与人体框 NMS，仅回传保留结果 |
 | RT-DETR | 支持 | 前向 CUDA + CUDA Decoder |
 | Classification | 支持 | 前向 CUDA + CUDA Top-K，仅回传 `top_k * 8` 字节 |
 | Semantic Segmentation | 支持 | 前向 CUDA + CUDA ArgMax，仅回传 `width * height * 4` 字节的类别图 |
+
+Pose 的 `d2h_bytes` 只统计最终保留结果的紧凑 payload：每个保留人体 28 字节（框、分数、
+类别、anchor），每个关键点 16 字节（x、y、置信度、是否在图像内）。控制字与错误诊断数据
+（fault、候选计数）不计入，与其它 CUDA Decoder 的口径一致。
 
 CUDA EP 禁止 CPU fallback。如果 CUDA 初始化失败，Engine 返回错误，不自动切换到 CPU。
 

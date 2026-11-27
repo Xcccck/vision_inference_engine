@@ -60,11 +60,30 @@ PreprocessConfig small_config() {
 
 // Builds a synthetic RGB HWC image on the host, then optionally uploads it
 // to device memory. Returned DeviceImage owns either the host or the device
-// buffer so the ImageInput stays valid for the duration of the test.
+// buffer so the ImageInput stays valid for the duration of the test. It is
+// move-only: the implicit copy constructor used to duplicate the device
+// pointer and free it twice, which left a CUDA error for the next test.
 struct DeviceImage {
   std::vector<std::uint8_t> host;
   std::uint8_t* device = nullptr;
   ImageInput input;
+  DeviceImage() = default;
+  DeviceImage(const DeviceImage&) = delete;
+  DeviceImage& operator=(const DeviceImage&) = delete;
+  DeviceImage(DeviceImage&& other) noexcept
+      : host(std::move(other.host)), device(other.device), input(other.input) {
+    other.device = nullptr;
+  }
+  DeviceImage& operator=(DeviceImage&& other) noexcept {
+    if (this != &other) {
+      if (device != nullptr) cudaFree(device);
+      host = std::move(other.host);
+      device = other.device;
+      input = other.input;
+      other.device = nullptr;
+    }
+    return *this;
+  }
   ~DeviceImage() {
     if (device != nullptr) cudaFree(device);
   }
