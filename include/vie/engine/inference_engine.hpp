@@ -113,6 +113,12 @@ struct ObbInferTiming {
   bool includes_d2h = false;
 };
 
+// Wall time of one infer_classification() call. On CPU decode_ms is d2h_ms
+// plus validate_ms and topk_ms (both CPU time; d2h_ms is 0 because the decoder
+// copies nothing). On CUDA the three component values are GPU event times and
+// decode_ms is the wall clock of the decoder call, so kernel-launch and
+// stream-sync cost stays visible; only the top-k pairs are copied D2H
+// (d2h_bytes). includes_d2h reports whether a D2H happened.
 struct ClassificationInferTiming {
   double preprocess_ms = 0;
   double execute_ms = 0;
@@ -128,9 +134,10 @@ struct ClassificationInferTiming {
   bool includes_d2h = false;
 };
 
-// Wall time of one infer_semantic_segmentation() call. decode_ms is d2h_ms plus
-// the decoder's validate_ms and argmax_ms. On CUDA the logits are copied D2H
-// here (d2h_bytes) before the CPU decoder runs; includes_d2h reports that.
+// Wall time of one infer_semantic_segmentation() call. decode_ms is the wall
+// clock of the decoder call; on CUDA the decoder copies only the compact class
+// map D2H (d2h_bytes, GPU event time in d2h_ms), on CPU d2h_bytes is 0 because
+// the decoder copies nothing. includes_d2h reports whether a D2H happened.
 struct SemanticSegmentationInferTiming {
   double preprocess_ms = 0;
   double execute_ms = 0;

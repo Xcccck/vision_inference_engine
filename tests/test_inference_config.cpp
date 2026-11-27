@@ -19,6 +19,8 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <locale>
+#include <sstream>
 #include <string>
 
 using vie::InferenceOptions;
@@ -521,6 +523,102 @@ TEST(InferenceConfig, FingerprintSeparatesEffectiveConfigs) {
   // The protocol participates, so two graphs never share a batch key.
   const ResolvedInferenceConfig rtdetr = resolve(detection_manifest("rtdetr_detection_raw"));
   EXPECT_NE(a.fingerprint(), rtdetr.fingerprint());
+}
+
+// Phase 13 fingerprint audit: the key must separate every distinct effective
+// float, fold signed zero, keep absent mask policy apart from an explicit
+// value, ignore the process locale, and never drop a present block.
+TEST(InferenceConfigFingerprint, SeparatesAdjacentFloatsAndIsStable) {
+  const ModelManifest manifest = detection_manifest();
+  const float bases[] = {0.1f, 0.25f, 0.30000001192092896f, 0.9999999f};
+  for (const float base : bases) {
+    const float up = std::nextafter(base, 1.f);
+    const float down = std::nextafter(base, 0.f);
+    ASSERT_NE(up, base) << base;
+    ASSERT_NE(down, base) << base;
+    const auto key = [&](float value) {
+      InferenceOptions options;
+      options.detection.confidence_threshold = value;
+      return resolve(manifest, {}, options).fingerprint();
+    };
+    const std::string base_key = key(base);
+    EXPECT_NE(base_key, key(up)) << base;
+    EXPECT_NE(base_key, key(down)) << base;
+    EXPECT_NE(key(up), key(down)) << base;
+    // A fresh resolve of the same numeric policy produces the same key.
+    EXPECT_EQ(base_key, key(base)) << base;
+  }
+}
+
+TEST(InferenceConfigFingerprint, FoldsSignedZero) {
+  const ModelManifest manifest = detection_manifest();
+  InferenceOptions positive;
+  positive.detection.confidence_threshold = 0.f;
+  InferenceOptions negative;
+  negative.detection.confidence_threshold = -0.f;
+  ASSERT_EQ(0.f, -0.f);
+  EXPECT_EQ(resolve(manifest, {}, positive).fingerprint(),
+            resolve(manifest, {}, negative).fingerprint());
+  InferenceOptions tiny;
+  tiny.detection.confidence_threshold = std::numeric_limits<float>::denorm_min();
+  EXPECT_NE(resolve(manifest, {}, positive).fingerprint(), resolve(manifest, {}, tiny).fingerprint());
+}
+
+TEST(InferenceConfigFingerprint, SeparatesAbsentMaskPolicyFromExplicitValue) {
+  const ModelManifest manifest = segmentation_manifest();
+  const ResolvedInferenceConfig absent = resolve(manifest);
+  InferenceOptions retina_false;
+  retina_false.segmentation.retina_masks = false;
+  const ResolvedInferenceConfig explicit_false = resolve(manifest, {}, retina_false);
+  ASSERT_FALSE(absent.require_segmentation().retina_masks.has_value());
+  ASSERT_TRUE(explicit_false.require_segmentation().retina_masks.has_value());
+  EXPECT_NE(absent.fingerprint(), explicit_false.fingerprint());
+
+  InferenceOptions bytes;
+  bytes.segmentation.max_mask_bytes = 0u;
+  // Zero is rejected by the count rules, so an absent budget and a zero budget
+  // can never be confused: the zero value never resolves.
+  VIE_EXPECT_ERROR(vie::ErrorCode::InvalidArgument, resolve(manifest, {}, bytes));
+}
+
+TEST(InferenceConfigFingerprint, SeparatesExtraPresentBlockFromSingleBlock) {
+  InferenceOptions request;
+  request.detection.confidence_threshold = 0.5f;
+  const ResolvedInferenceConfig single = resolve(detection_manifest(), {}, request);
+  ResolvedInferenceConfig two_blocks = single;
+  two_blocks.classification = vie::ResolvedClassificationConfig{};
+  two_blocks.classification->top_k.value = 3;
+  EXPECT_NE(single.fingerprint(), two_blocks.fingerprint());
+}
+
+TEST(InferenceConfigFingerprint, IgnoresProcessLocale) {
+  InferenceOptions request;
+  request.detection.confidence_threshold = 0.125f;
+  request.detection.iou_threshold = 0.45f;
+  const std::string reference = resolve(detection_manifest(), {}, request).fingerprint();
+  // A global locale whose decimal separator is a comma would, with a stream
+  // bound to the global locale, turn 0.125 into 0,125 and split batch keys.
+  // The facet is built in-process so the check does not depend on installed
+  // system locales.
+  struct CommaPunct : std::numpunct<char> {
+    char do_decimal_point() const override { return ','; }
+  };
+  const std::locale comma_locale(std::locale::classic(), new CommaPunct);
+  const std::locale previous = std::locale();
+  struct Restore {
+    std::locale previous;
+    ~Restore() { std::locale::global(previous); }
+  } restore{previous};
+  std::locale::global(comma_locale);
+  // Prove the probe is meaningful: an ostringstream created now really uses
+  // the comma decimal point.
+  std::ostringstream probe;
+  probe << 0.125f;
+  ASSERT_NE(probe.str().find(','), std::string::npos) << probe.str();
+  InferenceOptions again;
+  again.detection.confidence_threshold = 0.125f;
+  again.detection.iou_threshold = 0.45f;
+  EXPECT_EQ(reference, resolve(detection_manifest(), {}, again).fingerprint());
 }
 
 TEST(InferenceConfig, ParameterSourceNamesAreStable) {

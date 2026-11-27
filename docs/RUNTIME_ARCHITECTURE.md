@@ -890,7 +890,9 @@ contract as User provenance (see `vie_semantic_verify.cpp`, which pins RGB +
 ImageNet mean/std + stretch bilinear with a User entry so
 `ensure_provenance()` accepts the manifest).
 
-**Decoder.** `SemanticSegmentationDecoder` is CPU-only. It takes
+**Decoder.** `SemanticSegmentationDecoder` is the CPU implementation; Phase 13 adds
+`SemanticSegmentationCudaDecoder` and a device dispatcher (see the Phase 13
+section below). The CPU class still takes
 class-logits in NCHW (`channel_axis` from the manifest), and for every
 original pixel computes `mx = ox * scale_x + geometry_model_origin_x` and
 samples each channel bilinearly. Before sampling it resizes the logits to
@@ -902,10 +904,12 @@ raises `Unsupported` (there is no CUDA decoder pretending to be CPU).
 
 **Engine.** `InferenceEngine::infer_semantic_segmentation(image, timing*)`
 follows the same shape as `infer_classification`: preprocess -> execute ->
-explicit D2H (recording `d2h_bytes` / `d2h_ms`) -> CPU decode ->
-`SemanticSegmentationResult` carrying class_ids, original width/height,
-logits width/height, num_classes, and `execution_device` (the device the
-decoder actually ran on, i.e. always Cpu). `infer()` and `infer_batch()`
+decode. On the CPU path the full logits are copied back (recording
+`d2h_bytes` / `d2h_ms`) before the CPU decoder; on the CUDA path the decoder
+downsamples on the device and only the compact class map crosses the bus
+(Phase 13). `SemanticSegmentationResult` carries class_ids, original
+width/height, logits width/height, num_classes, and `execution_device` (Cpu or
+Cuda, the device the decoder actually ran on). `infer()` and `infer_batch()`
 throw `Unsupported` for this task so callers cannot mistake it for
 detection. `ModelInstance::infer_semantic_segmentation` is a locked
 passthrough with the usual metrics.
@@ -957,7 +961,7 @@ and the reference are edge pixels where two logits nearly tie; the strict
 |---------------|-----------|---------|------------|-------------------|----------|
 | Build A: Mock backend, CPU       | yes (synthetic ONNX graph) | yes | yes | n/a | n/a |
 | Build B: ORT, CPU                | yes | yes | yes | PASS | n/a |
-| Build C: ORT, CUDA (strict EP)   | yes | yes (CPU-only) | yes | PASS | PASS (22.7 MB D2H) |
+| Build C: ORT, CUDA (strict EP)   | yes | yes (CPU class + CUDA decoder) | yes | PASS | PASS (compact class map only) |
 | Build D: ORT, CUDA + EP fallback | allowed but discouraged | same | same | same | same |
 
 Tests: 19 new cases in `tests/test_semantic_segmentation.cpp` cover §12.1
@@ -974,8 +978,9 @@ not silently proxied:
 - Only the DeepLabV3-MobileNetV3-Large representative graph is proven.
   The recognizer may accept other graphs whose structure matches, but no
   other model has been verified.
-- `SemanticSegmentationDecoder` is CPU-only. A CUDA decoder (GPU ArgMax,
-  fused resize) is future work.
+- `SemanticSegmentationDecoder` has a CUDA counterpart as of Phase 13
+  (`SemanticSegmentationCudaDecoder`: GPU ArgMax + GPU-side bilinear resize,
+  only the class map is copied back). Batch decoding remains unavailable.
 - `SemanticSegmentationResult` is one map per call. There is no
   `infer_semantic_segmentation_batch()` and no async submit path for this
   task in this phase; the `infer_batch()` entry point rejects
@@ -1054,6 +1059,105 @@ Priority: **request > model default > usable manifest value > framework default*
 #### CPU/CUDA consistency
 
 Both CPU and CUDA decoders consume the same resolved `DecoderConfig` built from the snapshot; neither keeps a private default set. The CPU/CUDA parity test feeds identical tensors and the same config to the CPU and CUDA decode paths and asserts equal counts/classes and confidence/coordinate equality within an explicit tolerance (confidence `1e-5`, coordinates `1e-4`).
+
+### Classification and Semantic CUDA Decoders (Phase 13)
+
+Phase 13 adds GPU post-processing for the two remaining single-output tasks. The
+CPU decoder classes are untouched; the engine registers thin dispatchers that
+route by `DeviceContext::device()`, so the public Engine/Runtime API, the
+manifest schema and the Phase 12 config priority chain are unchanged.
+
+**Fingerprint hardening (prerequisite audit).** `ResolvedInferenceConfig::fingerprint()`
+is the dynamic-batch grouping key, so two different effective configs must never
+serialize identically. The canonical writer now (a) formats every floating-point
+value with `std::numeric_limits<double>::max_digits10` (round-trip exact), (b)
+uses the classic locale explicitly, (c) folds `-0.0` to `0` and rejects NaN/Inf
+at resolution time, (d) tags every optional field with an `unset,` marker so a
+defaulted field cannot collide with an explicitly set one, and (e) serializes
+independent blocks with `;` separators and an explicit `none` when a block is
+absent. Tests cover float round-trip collisions, `-0.0`, optional presence,
+field-by-field changes, locale independence and repeated-call stability.
+
+**Classification CUDA Top-K** (`ClassificationCudaDecoder`, protocol names
+`classification_logits_raw` / `classification_probabilities_raw`). The input
+must be a rank-2 FP32 CUDA tensor (`[1, C]` or `[C, 1]`, `class_axis` 0/1) with
+stride 1 along the class axis; the class count must equal
+`ResolvedClassificationConfig::num_classes`, and `top_k` comes exclusively from
+that resolved config (`resolved.classification().top_k`), never from a private
+default. The kernel lane validates every logit on the device (`isfinite`), then
+ranks with the same contract as the CPU decoder: descending score, ascending
+class id on exact ties, no Softmax, negative logits preserved; `top_k` comes
+from the Phase 12 resolver, which bounds it to `[1, num_classes]`, and an
+out-of-range request is rejected rather than clamped silently. The
+probabilities protocol additionally
+checks `[0, 1]` and the FP64 sum within `1e-3`. Only the final `top_k`
+`(class_id, score)` pairs are copied back (`top_k * 8` bytes); the full logits
+never leave the device. Non-finite inputs report the lowest offending class id
+with the exact CPU error text. CUDA-side failures never retry on the CPU.
+
+**Semantic Segmentation CUDA ArgMax** (`SemanticSegmentationCudaDecoder`,
+protocol `deeplabv3_semantic_seg_raw`). Input is a rank-4 FP32 CUDA tensor
+`[1, C, H, W]` with `channel_axis == 1`; `C` must equal the manifest
+`num_classes`. The lane mirrors the CPU math bit-for-bit: full-tensor
+finiteness validation (reporting the first `[c, y, x]`), an optional bilinear
+resize of the logits to the preprocessed grid using double-precision corners
+stored back as FP32, then per original pixel `mx = ox * scale_x + origin_x`
+bilinear sampling in double and a strict `>` argmax that keeps the smallest
+class id. The `.cu` file is compiled with `--fmad=false` so the arithmetic
+mirrors the CPU expression. Only the int32 class map is copied back
+(`width * height * 4` bytes); the logits stay resident.
+
+**Kernel and stream usage.** Both decoders reuse the RT-DETR CUDA lane
+conventions: legacy default stream (`nullptr`), which is the stream ONNX
+Runtime's CUDA EP uses in this project (`has_user_compute_stream=0`,
+`do_copy_in_default_stream=1`); `cudaSetDevice(device_id)` once at entry; a
+`cudaStreamSynchronize` on that stream, never `cudaDeviceSynchronize`; RAII
+`DeviceBuffer`/event pairs keep every temporary alive until its async copy has
+completed; every launch is followed by `cudaGetLastError`; request/tensor
+contracts (dtype, rank, device id, contiguity) are rejected before any device
+work. A non-contiguous CUDA tensor is rejected with `Unsupported` (the existing
+Tensor contract), and a CUDA decoder never touches `Tensor::data()`.
+
+**Engine integration.** `infer_classification` and
+`infer_semantic_segmentation` no longer perform a full `Tensor::to(Cpu)` before
+decoding. On CUDA they hand the device tensor to the decoder, which performs
+its own compact copy. `ClassificationResult` / `SemanticSegmentationResult`
+still report `output_bytes` (full tensor bytes), and `d2h_bytes` now counts the
+compact payload only. The result also carries `d2h_ms` (GPU-event time for the
+compact copy); `decode_ms` in the timing struct is wall-clock on CUDA so launch
+and synchronization overhead are never hidden. CPU timing keeps the existing
+`d2h + validate + topk` composition.
+
+**Measured payloads and timings.** RTX 4080 Laptop, Release build, CUDA 12.6
+(`CMAKE_CUDA_ARCHITECTURES=89`), ONNX Runtime 1.20.1 CUDA EP, 3 warmups then 20
+samples for the decoder microbenchmark:
+
+| Decoder lane | CPU validate | CPU decode | CUDA validate | CUDA decode | D2H bytes |
+|---|---:|---:|---:|---:|---:|
+| Classification, 1000 classes, `top_k=5` | 0.0009 ms | 0.031 ms | 0.0085 ms | 0.095 ms + 0.060 ms D2H | **40** (was 4,000) |
+| Semantic, 21 classes, 65x65 logits -> 160x120 map | 0.052 ms | 1.096 ms | 0.0095 ms | 0.088 ms + 0.071 ms D2H | **76,800** (was 354,900) |
+
+Real models (`tests/test_cuda_decoder_e2e.cpp`): ResNet18 `[1,1000]` per-call
+`decode_ms` 0.075 ms on CPU vs 0.373 ms wall-clock on CUDA (launch + sync
+dominates a 4 KB reduction), while end-to-end `total_ms` is 10.42 ms vs 1.75 ms
+because execution moves to the GPU. DeepLabV3-MobileNetV3-Large (520x520, 21
+classes, `bus.ppm` 810x1080): class maps agree on 99.9864% of pixels (MeanIoU
+0.999, 119 of 874,800 pixels differ at near-tie edges between EP kernels; the
+decoder parity itself is exact when both paths consume the same logits).
+Semantic `d2h_bytes` drops from 22,713,600 to **3,499,200** (84.6% less),
+`decode_ms` 75.55 ms (CPU) vs 3.68 ms wall-clock (CUDA).
+
+**Tests and builds.** `tests/test_classification_cuda_decoder.cpp` (8 cases: top_k
+1/5/n, negative logits, ties, class axis 0, non-finite parity incl. message
+equality, probabilities contract, invalid shapes/dtypes, dispatcher, timing) and
+`tests/test_semantic_segmentation_cuda.cpp` (8 cases: identity/letterbox/resize
+geometry, ties, non-finite coordinates, contracts, dispatcher, timing) run only
+when `VIE_ENABLE_CUDA=ON`; `tests/test_cuda_decoder_e2e.cpp` adds the three real
+model lanes. CUDA OFF builds never compile the CUDA branches.
+
+**Scope.** Pose and OBB keep CPU decoders; there is no CUDA batch path (the
+batch aggregator still rejects CUDA batch > 1), no model-specific logic, and no
+implicit CPU fallback.
 
 ### RuntimeConfig
 

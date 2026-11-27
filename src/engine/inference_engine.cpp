@@ -2,9 +2,11 @@
 
 #include "vie/backend/mock_backend.hpp"
 #include "vie/decoder/classification.hpp"
+#include "vie/decoder/classification_cuda_decoder.hpp"
 #include "vie/decoder/detection.hpp"
 #include "vie/decoder/mock_decoder.hpp"
 #include "vie/decoder/rtdetr_cuda_decoder.hpp"
+#include "vie/decoder/semantic_segmentation_cuda_decoder.hpp"
 #include "vie/decoder/yolov8_detect_decoder.hpp"
 #include "vie/decoder/yolov8_obb_decoder.hpp"
 #include "vie/decoder/yolov8_pose_decoder.hpp"
@@ -259,11 +261,11 @@ InferenceEngine::InferenceEngine() {
   decoders_.register_factory("yolov8_seg_raw", [] { return std::make_unique<YoloV8SegmentationDecoder>(); });
   decoders_.register_factory("rtdetr_detection_raw", [] { return std::make_unique<RtdetrDetectionDecoder>(); });
   decoders_.register_factory("classification_logits_raw",
-                             [] { return std::make_unique<ClassificationDecoder>(); });
+                             [] { return std::make_unique<ClassificationDispatchDecoder>(false); });
   decoders_.register_factory("classification_probabilities_raw",
-                             [] { return std::make_unique<ClassificationProbabilitiesDecoder>(); });
+                             [] { return std::make_unique<ClassificationDispatchDecoder>(true); });
   decoders_.register_factory("deeplabv3_semantic_seg_raw",
-                             [] { return std::make_unique<SemanticSegmentationDecoder>(); });
+                             [] { return std::make_unique<SemanticSegmentationDispatchDecoder>(); });
 #if defined(VIE_HAS_ONNXRUNTIME)
   backends_.register_factory(BackendKind::OnnxRuntime,
                              [] { return std::make_unique<OnnxRuntimeBackend>(); });
@@ -696,16 +698,8 @@ ClassificationBatch InferenceEngine::infer_classification(const ImageInput& imag
     throw VieError(ErrorCode::InvalidArgument, "classification output '" + output_name + "' is missing");
   }
   require_same_device(found->second.tensor, device_, "backend output '" + output_name + "'");
-  Tensor scores = found->second.tensor;
+  const Tensor& scores = found->second.tensor;
   const std::size_t output_bytes = scores.nbytes();
-  std::size_t d2h_bytes = 0;
-  double d2h_ms = 0;
-  if (scores.is_cuda()) {
-    const auto d2h_start = std::chrono::steady_clock::now();
-    scores = scores.to(DeviceContext(DeviceType::Cpu, 0));
-    d2h_ms = elapsed_ms(d2h_start);
-    d2h_bytes = output_bytes;
-  }
 
   ClassificationDecodeRequest decoded;
   decoded.output_name = output_name;
@@ -715,13 +709,20 @@ ClassificationBatch InferenceEngine::infer_classification(const ImageInput& imag
   decoded.score_type = manifest_.classification.score_type;
   decoded.class_names = manifest_.classification.class_names;
   DecoderInput decoder_input;
-  decoder_input.outputs.emplace(output_name, std::move(scores));
-  ClassificationBatch batch = decoder_->decode_classification(decoder_input, decoded, DeviceContext{});
+  decoder_input.outputs.emplace(output_name, scores);
+  // Phase 13: the tensor stays on the engine device. On CUDA the decoder runs
+  // validation, the probability sum, the sort, and the top-k cut in kernels
+  // and copies only the final top_k pairs; on CPU it reads the host tensor and
+  // copies nothing. The engine records whatever the decoder reports.
+  const auto decode_start = std::chrono::steady_clock::now();
+  ClassificationBatch batch = decoder_->decode_classification(decoder_input, decoded, device_);
+  const double decode_ms = elapsed_ms(decode_start);
   const double validate_ms = batch.results.empty() ? 0.0 : batch.results[0].validate_ms;
   const double topk_ms = batch.results.empty() ? 0.0 : batch.results[0].topk_ms;
+  const std::size_t d2h_bytes = batch.results.empty() ? 0 : batch.results[0].d2h_bytes;
+  const double d2h_ms = batch.results.empty() ? 0.0 : batch.results[0].d2h_ms;
   if (!batch.results.empty()) {
     batch.results[0].output_bytes = output_bytes;
-    batch.results[0].d2h_bytes = d2h_bytes;
   }
   if (timing != nullptr) {
     timing->preprocess_ms = preprocess_ms;
@@ -729,7 +730,12 @@ ClassificationBatch InferenceEngine::infer_classification(const ImageInput& imag
     timing->d2h_ms = d2h_ms;
     timing->validate_ms = validate_ms;
     timing->topk_ms = topk_ms;
-    timing->decode_ms = d2h_ms + validate_ms + topk_ms;
+    // CPU keeps the documented sum: validate plus sort is all the decoder does
+    // and it copies nothing. CUDA reports the wall clock of the whole decoder
+    // call so launch and stream-sync cost is not hidden behind GPU event time.
+    timing->decode_ms = device_.device() == DeviceType::Cuda
+                            ? decode_ms
+                            : d2h_ms + validate_ms + topk_ms;
     timing->total_ms = elapsed_ms(total_start);
     timing->output_bytes = output_bytes;
     timing->d2h_bytes = d2h_bytes;
@@ -774,17 +780,6 @@ SemanticSegmentationResult InferenceEngine::infer_semantic_segmentation(const Im
   require_same_device(found->second.tensor, device_, "backend output '" + output_name + "'");
   Tensor logits = found->second.tensor;
   const std::size_t output_bytes = logits.nbytes();
-  std::size_t d2h_bytes = 0;
-  double d2h_ms = 0;
-  // The decoder is CPU-only. A CUDA backend leaves the logits on the device,
-  // so this explicit D2H is recorded and reported; it does not change any
-  // tensor's default device semantics outside this call.
-  if (logits.is_cuda()) {
-    const auto d2h_start = std::chrono::steady_clock::now();
-    logits = logits.to(DeviceContext(DeviceType::Cpu, 0));
-    d2h_ms = elapsed_ms(d2h_start);
-    d2h_bytes = output_bytes;
-  }
 
   SemanticSegmentationDecodeRequest decoded;
   decoded.output_name = output_name;
@@ -796,22 +791,30 @@ SemanticSegmentationResult InferenceEngine::infer_semantic_segmentation(const Im
   DecoderInput decoder_input;
   decoder_input.outputs.emplace(output_name, std::move(logits));
   decoder_input.geometry = prepared.geometry;
+  // Phase 13: the logits stay on the engine device. On CUDA the decoder runs
+  // validation, the bilinear resize, and ArgMax in kernels and copies only the
+  // compact class map; on CPU it reads the host tensor and copies nothing.
   const auto decode_start = std::chrono::steady_clock::now();
   SemanticSegmentationBatch batch =
-      decoder_->decode_semantic_segmentation(decoder_input, decoded, DeviceContext{});
+      decoder_->decode_semantic_segmentation(decoder_input, decoded, device_);
   const double decode_ms = elapsed_ms(decode_start);
   if (batch.results.empty()) {
     throw VieError(ErrorCode::Internal, "semantic segmentation decoder produced no result");
   }
   SemanticSegmentationResult result = std::move(batch.results.front());
-  result.d2h_bytes = d2h_bytes;
+  result.output_bytes = output_bytes;
+  // The decoder reports its own compact D2H: 0 on CPU, the class map on CUDA.
+  const std::size_t d2h_bytes = result.d2h_bytes;
+  const double d2h_ms = result.d2h_ms;
   if (timing != nullptr) {
     timing->preprocess_ms = preprocess_ms;
     timing->execute_ms = execute_ms;
     timing->d2h_ms = d2h_ms;
     timing->validate_ms = result.validate_ms;
     timing->argmax_ms = result.argmax_ms;
-    timing->decode_ms = d2h_ms + decode_ms;
+    // Wall clock of the decoder call; on CUDA it contains the class-map copy,
+    // so the D2H wait is not reported twice.
+    timing->decode_ms = decode_ms;
     timing->total_ms = elapsed_ms(total_start);
     timing->output_bytes = output_bytes;
     timing->d2h_bytes = d2h_bytes;

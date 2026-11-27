@@ -20,7 +20,8 @@ struct Classification {
 
 // Top-K for one image. The model output tensor is not stored here.
 // output_bytes is the logits tensor size. d2h_bytes is the explicit host copy
-// of that tensor and stays 0 when the tensor was already on CPU. ORT's own
+// the decoder performs: the whole tensor on the CPU path (0 when the tensor
+// was already on CPU) and only the top_k pairs on the CUDA path. ORT's own
 // transfers are not included. execution_device is the device that ran Top-K.
 struct ClassificationResult {
   std::vector<Classification> labels;
@@ -33,10 +34,15 @@ struct ClassificationResult {
   int execution_device_id = 0;
   std::size_t output_bytes = 0;
   std::size_t d2h_bytes = 0;
-  // CPU time inside the decoder. validate_ms is the numeric check. topk_ms is
-  // only the sort. The engine adds the explicit D2H separately.
+  // Decoder time. On CPU validate_ms is the numeric check and topk_ms is only
+  // the sort; d2h_ms is 0 because the engine copies the whole tensor itself.
+  // On CUDA all three are GPU event times: the validation kernel (which also
+  // packs the ranked array and accumulates the probability sum), thrust::sort,
+  // and the compact top-k copy. Host launch and stream-sync cost is outside
+  // these fields and is covered by the engine wall clock.
   double validate_ms = 0;
   double topk_ms = 0;
+  double d2h_ms = 0;
 };
 
 // One result per image. The first decoder fills a single result for batch 1.

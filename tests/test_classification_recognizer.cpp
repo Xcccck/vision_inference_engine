@@ -510,9 +510,10 @@ TEST(ClassificationRecognizer, GeneratedManifestRunsInferClassification) {
   cuda_engine.load(cuda_config);
   vie::ClassificationInferTiming timing;
   const vie::ClassificationBatch cuda_batch = cuda_engine.infer_classification(gpu_image, runtime, &timing);
-  EXPECT_EQ(timing.d2h_bytes, 4000u);
+  // Phase 13: the CUDA decoder returns only the Top-K pairs (5 * 8 bytes).
+  EXPECT_EQ(timing.d2h_bytes, 40u);
   EXPECT_EQ(timing.output_bytes, 4000u);
-  EXPECT_EQ(cuda_batch.results.at(0).execution_device, vie::DeviceType::Cpu);
+  EXPECT_EQ(cuda_batch.results.at(0).execution_device, vie::DeviceType::Cuda);
   EXPECT_EQ(cuda_batch.results.at(0).labels.size(), 5u);
   cudaFree(device_pixels);
 #endif

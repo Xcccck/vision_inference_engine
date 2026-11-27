@@ -103,9 +103,11 @@ add_library(vie
   src/decoder/decoder_registry.cpp
   src/decoder/classification_decoder.cpp
   src/decoder/classification_probabilities_decoder.cpp
+  src/decoder/classification_cuda_decoder.cpp
   src/decoder/mock_decoder.cpp
   src/decoder/segmentation.cpp
   src/decoder/semantic_segmentation.cpp
+  src/decoder/semantic_segmentation_cuda_decoder.cpp
   src/decoder/detection_ops.cpp
   src/decoder/yolov8_cpu_decode.cpp
   src/decoder/yolov8_detect_decoder.cpp
@@ -154,7 +156,9 @@ target_link_libraries(vie PRIVATE nlohmann_json::nlohmann_json)
 
 if(VIE_ENABLE_CUDA)
   target_sources(vie PRIVATE src/preprocess/preprocess_cuda.cu src/decoder/yolov8_detect_decoder.cu
-                 src/decoder/yolov8_seg_decoder.cu src/decoder/rtdetr_cuda_decoder.cu)
+                 src/decoder/yolov8_seg_decoder.cu src/decoder/rtdetr_cuda_decoder.cu
+                 src/decoder/classification_cuda_decoder.cu
+                 src/decoder/semantic_segmentation_cuda_decoder.cu)
   target_link_libraries(vie PUBLIC CUDA::cudart)
   target_compile_definitions(vie PUBLIC VIE_HAS_CUDA=1)
   # nvcc emits GNU line markers. -Wpedantic treats those as errors, so this
@@ -164,6 +168,9 @@ if(VIE_ENABLE_CUDA)
   set_source_files_properties(src/decoder/rtdetr_cuda_decoder.cu PROPERTIES
     COMPILE_OPTIONS "--fmad=false;-Xcompiler=-Wall,-Wextra,-Werror,-Wno-pedantic")
   set_source_files_properties(src/decoder/yolov8_seg_decoder.cu PROPERTIES
+    COMPILE_OPTIONS "--fmad=false;-Xcompiler=-Wall,-Wextra,-Werror,-Wno-pedantic")
+  set_source_files_properties(src/decoder/classification_cuda_decoder.cu
+                              src/decoder/semantic_segmentation_cuda_decoder.cu PROPERTIES
     COMPILE_OPTIONS "--fmad=false;-Xcompiler=-Wall,-Wextra,-Werror,-Wno-pedantic")
 endif()
 
@@ -273,7 +280,10 @@ if(VIE_BUILD_TESTS)
   if(VIE_ENABLE_CUDA)
     target_sources(vie_tests PRIVATE tests/test_cuda_tensor.cpp tests/test_preprocess_cuda.cpp
                                    tests/test_decoder_cuda.cpp tests/test_yolov8_seg_cuda.cpp
-                                   tests/test_rtdetr_cuda_decoder.cpp tests/test_batch_cuda.cpp)
+                                   tests/test_rtdetr_cuda_decoder.cpp tests/test_batch_cuda.cpp
+                                   tests/test_classification_cuda_decoder.cpp
+                                   tests/test_semantic_segmentation_cuda.cpp
+                                   tests/test_cuda_decoder_e2e.cpp)
     set_property(TARGET vie_tests APPEND PROPERTY BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
   endif()
   include(GoogleTest)

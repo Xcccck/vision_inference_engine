@@ -33,7 +33,7 @@
 - **Manifest 1.0 + provenance**。每个字段标注 `observed` / `metadata` / `inferred` / `user` / `unresolved`；颜色、归一化、resize 这类图上读不出来的语义保持未决，`load()` 直接返回 `UnresolvedField` 而不是猜一个默认值。
 - **任务覆盖**：目标检测、实例分割、语义分割、旋转框、人体关键点、单标签分类。
 - **CPU 与 CUDA 预处理一致**：共用同一采样公式 `source = (index + 0.5) * (source_size / resized_size) - 0.5`，支持 `letterbox` 与 `shortest_side`，几何信息留在 `GeometryTransform` 里而不是塞进 Tensor。
-- **严格 CUDA**：默认 `disable_cpu_ep_fallback=1`，CUDA 失败不回退 CPU；Detection / Instance Segmentation / RT-DETR 有真正的 CUDA Decoder，只把保留结果拷回 Host。
+- **严格 CUDA**：默认 `disable_cpu_ep_fallback=1`，CUDA 失败不回退 CPU；Detection / Instance Segmentation / RT-DETR / Classification / Semantic Segmentation 都有真正的 CUDA Decoder，Top-K 与 ArgMax 在 GPU 上完成，只把最终结果拷回 Host（分类 `top_k * 8` 字节，语义分割 `width * height * 4` 字节）。
 - **运行时层**：多模型生命周期管理、线程池、`submit()` → `std::future`、动态 batch 聚合、设备感知执行调度（饱和 GPU 不会阻塞 CPU 队列）、CPU→CUDA 输入 staging、指标采集。
 - **零拷贝输入**：`ImageInput` 只借用调用方内存，写明设备、布局、颜色、dtype 和行距。
 - **诊断可交付**：模型检查、provider placement 审计、端到端部署校验都有独立工具和 Python 报告。
@@ -44,10 +44,10 @@
 |---|---|---|---|
 | Detection | `infer()`，`infer_batch()`（仅 CPU 上的 `yolov8_detect_raw`） | YOLOv8n、RT-DETR-L | CPU kernel + CUDA kernel |
 | Instance Segmentation | `infer_segmentation()` | YOLOv8n-seg | CPU kernel + CUDA kernel |
-| Semantic Segmentation | `infer_semantic_segmentation()` | DeepLabV3-MobileNetV3-Large（torchvision 权重） | CPU（CUDA 仅前向） |
+| Semantic Segmentation | `infer_semantic_segmentation()` | DeepLabV3-MobileNetV3-Large（torchvision 权重） | CPU kernel + CUDA kernel（GPU ArgMax） |
 | Oriented Box | `infer_obb()` | YOLOv8n-obb | CPU（旋转多边形 NMS） |
 | Pose | `infer_pose()` | YOLOv8n-pose | CPU（关键点个数来自 Manifest） |
-| Classification | `infer_classification()` | ResNet18 / MobileNetV2 / MobileNetV3-Small / EfficientNet-B0（随机初始化导出） | CPU Top-K |
+| Classification | `infer_classification()` | ResNet18 / MobileNetV2 / MobileNetV3-Small / EfficientNet-B0（随机初始化导出） | CPU Top-K + CUDA Top-K |
 
 字段级细节、错误码和新模型适配流程见 [docs/MODEL_COMPATIBILITY.md](docs/MODEL_COMPATIBILITY.md)。
 
@@ -229,13 +229,13 @@ std::future<vie::DetectionResult> fut = runtime.submit("det", image, options);
 ## 测试
 
 ```bash
-ctest --test-dir build-ort --output-on-failure          # CPU + ORT：428 个用例
-ctest --test-dir build-ort-gpu --output-on-failure      # CUDA + ORT：493 个用例（491 通过，2 个已知计时用例在 CUDA EP 下跳过）
+ctest --test-dir build-ort --output-on-failure          # CPU + ORT：433 个用例
+ctest --test-dir build-ort-gpu --output-on-failure      # CUDA + ORT：517 个用例（含 3 个 Phase 13 真实模型 CUDA Decoder E2E；2 个已知计时用例在 CUDA EP 下跳过）
 ```
 
 缺 fixture 时真实模型用例走 `VIE_REQUIRE_MODEL` 跳过而不是失败，所以新 clone 直接 `ctest` 也是全绿 —— 但那意味着约 78 个用例根本没跑。要验证真实模型链路，先执行 `python3 tools/export_test_models.py`，跳过数应归零。
 
-45 个测试源文件覆盖 Tensor / Manifest / Analyzer / Recognizer / Decoder / Preprocess / Runtime / OpenCV 适配。sanitizer 构建：
+48 个测试源文件覆盖 Tensor / Manifest / Analyzer / Recognizer / Decoder / Preprocess / Runtime / OpenCV 适配。sanitizer 构建：
 
 ```bash
 cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DVIE_ENABLE_ONNXRUNTIME=ON \
@@ -270,7 +270,7 @@ target_link_libraries(your_app PRIVATE vie::vie)   # include 目录与 VIE_HAS_*
 - 推理参数由统一的 `InferenceOptions` / `ModelConfig::inference_options` / Manifest 解析（Phase 12）；不是所有 Decoder 都有全部参数：RT-DETR 没有 NMS 参数，语义分割没有可配置后处理参数，Pose 没有关键点分数阈值。
 - 单个 `InferenceEngine` 非线程安全；重叠调用是数据竞争，库不会自动排队。
 - 异步 `submit()` 只接受 CPU 输入；batch > 1 仅 CPU 上的 `yolov8_detect_raw` 支持，其余任务与 CUDA 返回 `Unsupported`。
-- Classification / OBB / Pose / Semantic Segmentation 的解码在 CPU，CUDA 只加速前向并计入 `d2h_bytes`。
+- Classification / Semantic Segmentation / Detection / Instance Segmentation / RT-DETR 有 CPU 与 CUDA 两条解码路径；OBB / Pose 仍为 CPU 解码，CUDA 只加速前向并计入 `d2h_bytes`。
 - 多人跟踪、ReID、动作识别未实现。
 
 ## 文档

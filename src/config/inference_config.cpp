@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <limits>
+#include <locale>
 #include <sstream>
+#include <type_traits>
 
 namespace vie {
 namespace {
@@ -345,9 +348,33 @@ ResolvedClassificationConfig resolve_classification(const ModelManifest& manifes
   return resolved;
 }
 
+// Canonical, locale-independent field serialization. Streams are imbued with
+// the classic locale and use float max_digits10, so a digit can never depend on
+// the process locale and two distinct effective floats can never collapse into
+// the same text. -0.0 is folded into +0.0 because every decoder comparison
+// treats them identically: they are the same effective configuration and must
+// produce the same batch key.
 template <typename T>
 void append_value(std::ostringstream& out, const ResolvedParameter<T>& parameter) {
-  out << parameter.value << ',';
+  if constexpr (std::is_floating_point_v<T>) {
+    const T value = parameter.value == T{0} ? T{0} : parameter.value;
+    out << value << ',';
+  } else {
+    out << parameter.value << ',';
+  }
+}
+
+// An absent optional is not the same configuration as an explicit false/0: the
+// mask fields have no framework default, so the absent form is rejected later
+// while the explicit form runs. The presence marker keeps those two apart.
+template <typename T>
+void append_optional(std::ostringstream& out,
+                     const std::optional<ResolvedParameter<T>>& parameter) {
+  if (!parameter.has_value()) {
+    out << "unset,";
+    return;
+  }
+  append_value(out, *parameter);
 }
 
 }  // namespace
@@ -439,8 +466,15 @@ const ResolvedClassificationConfig& ResolvedInferenceConfig::require_classificat
 
 std::string ResolvedInferenceConfig::fingerprint() const {
   std::ostringstream out;
-  out << std::setprecision(9);
+  // Classical locale and float max_digits10 (9) significant digits: a float
+  // round-trips through this text, so two distinct effective values always
+  // serialize differently, independent of the process locale.
+  out.imbue(std::locale::classic());
+  out << std::setprecision(std::numeric_limits<float>::max_digits10);
   out << to_string(task) << '|' << protocol << '|';
+  // Each present block is serialized; the resolver sets exactly one, but a
+  // hand-built config with an extra block must not collide with the same
+  // values without it.
   if (detection.has_value()) {
     out << "det:";
     append_value(out, detection->confidence_threshold);
@@ -449,40 +483,44 @@ std::string ResolvedInferenceConfig::fingerprint() const {
     append_value(out, detection->pre_nms_top_k);
     append_value(out, detection->class_agnostic_nms);
     append_value(out, detection->multi_label);
-    out << detection->nms_enabled;
-  } else if (segmentation.has_value()) {
+    out << detection->nms_enabled << ';';
+  }
+  if (segmentation.has_value()) {
     out << "seg:";
     append_value(out, segmentation->confidence_threshold);
     append_value(out, segmentation->iou_threshold);
     append_value(out, segmentation->max_detections);
     append_value(out, segmentation->pre_nms_top_k);
     append_value(out, segmentation->class_agnostic_nms);
-    out << (segmentation->retina_masks.has_value() ? segmentation->retina_masks->value : false) << ','
-        << (segmentation->binary_mask_gt_zero.has_value() ? segmentation->binary_mask_gt_zero->value
-                                                          : false)
-        << ','
-        << (segmentation->max_mask_bytes.has_value() ? segmentation->max_mask_bytes->value : 0) << ','
-        << segmentation->nms_enabled;
-  } else if (obb.has_value()) {
+    append_optional(out, segmentation->retina_masks);
+    append_optional(out, segmentation->binary_mask_gt_zero);
+    append_optional(out, segmentation->max_mask_bytes);
+    out << segmentation->nms_enabled << ';';
+  }
+  if (obb.has_value()) {
     out << "obb:";
     append_value(out, obb->confidence_threshold);
     append_value(out, obb->iou_threshold);
     append_value(out, obb->max_detections);
     append_value(out, obb->pre_nms_top_k);
     append_value(out, obb->class_agnostic_nms);
-    out << obb->nms_enabled;
-  } else if (pose.has_value()) {
+    out << obb->nms_enabled << ';';
+  }
+  if (pose.has_value()) {
     out << "pose:";
     append_value(out, pose->confidence_threshold);
     append_value(out, pose->iou_threshold);
     append_value(out, pose->max_detections);
     append_value(out, pose->pre_nms_top_k);
     append_value(out, pose->class_agnostic_nms);
-    out << pose->nms_enabled;
-  } else if (classification.has_value()) {
+    out << pose->nms_enabled << ';';
+  }
+  if (classification.has_value()) {
     out << "cls:";
     append_value(out, classification->top_k);
-  } else {
+  }
+  if (!detection.has_value() && !segmentation.has_value() && !obb.has_value() &&
+      !pose.has_value() && !classification.has_value()) {
     out << "none";
   }
   return out.str();

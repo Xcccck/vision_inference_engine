@@ -31,14 +31,21 @@ struct SemanticSegmentationResult {
   int original_height = 0;
   DeviceType execution_device = DeviceType::Cpu;
   int execution_device_id = 0;
-  // Bytes of the raw logits tensor and the explicit D2H copy of it. d2h_bytes
-  // is 0 when the logits were already on CPU. ORT's own transfers are excluded.
+  // Bytes of the raw logits tensor and the explicit D2H copy the decoder
+  // performs. On CPU d2h_bytes is 0 (the engine copies the whole tensor before
+  // calling the decoder); on CUDA it is only the compact class map. ORT's own
+  // transfers are excluded.
   std::size_t output_bytes = 0;
   std::size_t d2h_bytes = 0;
-  // CPU time inside the decoder. validate_ms is the finite-value and shape
-  // check; argmax_ms is the coordinate recovery plus per-pixel ArgMax.
+  // Decoder time. On CPU validate_ms is the finite-value and shape check and
+  // argmax_ms is the coordinate recovery plus per-pixel ArgMax; d2h_ms is 0.
+  // On CUDA all three are GPU event times: the logits validation kernel, the
+  // resize/ArgMax kernels, and the compact class-map copy. Host launch and
+  // stream-sync cost is outside these fields and is covered by the engine wall
+  // clock.
   double validate_ms = 0;
   double argmax_ms = 0;
+  double d2h_ms = 0;
 };
 
 // One result per image. Batch=1 in this phase; a batch is a future extension.

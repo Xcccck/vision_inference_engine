@@ -328,9 +328,10 @@ TEST(ClassificationRealModels, StrictCudaAgreesWithCpuOnRawTopK) {
     vie::ClassificationInferTiming timing;
     const vie::ClassificationBatch cuda_batch = cuda_engine.infer_classification(gpu_image, runtime, &timing);
     ASSERT_EQ(cuda_batch.results[0].labels.size(), cpu_batch.results[0].labels.size()) << model.file;
-    EXPECT_EQ(timing.d2h_bytes, 4000u) << model.file;
+    // Phase 13: top_k = 5 -> 5 * 8 bytes on the bus instead of the full logits.
+    EXPECT_EQ(timing.d2h_bytes, 40u) << model.file;
     EXPECT_TRUE(timing.includes_d2h) << model.file;
-    EXPECT_EQ(cuda_batch.results[0].execution_device, vie::DeviceType::Cpu) << model.file;
+    EXPECT_EQ(cuda_batch.results[0].execution_device, vie::DeviceType::Cuda) << model.file;
     EXPECT_EQ(cuda_batch.results[0].score_type, model.score_type) << model.file;
     const float gap = std::fabs(cpu_batch.results[0].labels[0].score - cpu_batch.results[0].labels[1].score);
     for (std::size_t index = 0; index < cpu_batch.results[0].labels.size(); ++index) {

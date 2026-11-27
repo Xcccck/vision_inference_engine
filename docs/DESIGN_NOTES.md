@@ -79,7 +79,7 @@ Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`inte
 ## 已接通的路径
 
 - 模型格式：ONNX。Mock 只用于管线测试。
-- 任务：YOLOv8 Detection 和 Ultralytics RT-DETR Detection（都走 `infer`），YOLOv8 Segmentation（`infer_segmentation`），YOLOv8-OBB（`infer_obb`），YOLOv8-Pose（`infer_pose`），以及单标签分类（`infer_classification`）。Decoder 按 Manifest 里的 protocol 选择，不按模型家族分支。RT-DETR 在 CPU 和 CUDA 上各有一个 Decoder，按设备选择。OBB 的旋转 NMS 和 Pose 的人体框 NMS 只在 CPU 上。
+- 任务：YOLOv8 Detection 和 Ultralytics RT-DETR Detection（都走 `infer`），YOLOv8 Segmentation（`infer_segmentation`），语义分割（`infer_semantic_segmentation`），YOLOv8-OBB（`infer_obb`），YOLOv8-Pose（`infer_pose`），以及单标签分类（`infer_classification`）。Decoder 按 Manifest 里的 protocol 选择，不按模型家族分支。RT-DETR、分类和语义分割在 CPU 和 CUDA 上各有一个 Decoder，按设备选择。OBB 的旋转 NMS 和 Pose 的人体框 NMS 只在 CPU 上。
 - Backend：构建打开 ONNX Runtime 时有 CPU EP；同时打开 CUDA 和 GPU 包时另有 CUDA EP。CUDA EP 默认禁止 CPU fallback。
 - 预处理和解码：CPU 始终可用；CUDA 只在 `VIE_ENABLE_CUDA` 时编译。
 
@@ -88,7 +88,7 @@ Manifest 的 `input.color` 是模型输入颜色，不是源图像颜色。`inte
 - NMS 阈值的自动确定
 - TensorRT / PyTorch 解析
 - 图像文件解码
-- 运行时 Softmax、多标签和 CUDA Top-K。模型自己输出的概率走 `classification_probabilities_raw`，解码时不再做 Softmax
+- 运行时 Softmax 和多标签。模型自己输出的概率走 `classification_probabilities_raw`，解码时不再做 Softmax
 - resize 模式 `crop`
 - 多人跟踪、ReID、动作识别，以及 CUDA 上的 Pose Decoder 和 CUDA NMS
 - 并发推理。`load`、`infer`、`infer_segmentation`、`infer_classification`、`infer_obb` 和 `infer_pose` 共用同一个 session，没有锁。重叠调用是数据竞争，库不会把它们串成队列。
@@ -132,7 +132,7 @@ vie::SegmentationBatch segmented = segmenter.infer_segmentation(image, runtime);
 
 检测模型调用 `infer_segmentation`，或分割模型调用 `infer`，都返回 `Unsupported`。分类模型调用 `infer` 同样返回 `Unsupported`。CUDA 推理要求 `ImageInput` 已经在同一块 GPU 上。
 
-`classification_logits_raw` 解码 rank-2 的 FP32 logits。`classification_probabilities_raw` 解码模型已经输出的 rank-2 FP32 概率，要求每个值在 `[0,1]` 且概率和与 1 的差不超过 `1e-3`，不会再次 Softmax，也不会把向量重新归一化。两种协议都按分数从高到低取 Top-K，分数相同则按 `class_id` 从小到大。`score_type` 必须和协议一致。CUDA EP 的输出仍在 CUDA 上，`infer_classification()` 把整条向量拷到 CPU 后再做 Top-K，这次拷贝计入 `d2h_bytes`。结果里的执行设备是 CPU。
+`classification_logits_raw` 解码 rank-2 的 FP32 logits。`classification_probabilities_raw` 解码模型已经输出的 rank-2 FP32 概率，要求每个值在 `[0,1]` 且概率和与 1 的差不超过 `1e-3`，不会再次 Softmax，也不会把向量重新归一化。两种协议都按分数从高到低取 Top-K，分数相同则按 `class_id` 从小到大。`score_type` 必须和协议一致。CUDA EP 的输出留在 CUDA 上，`infer_classification()` 在 GPU 上完成校验和 Top-K，只把最终的 `top_k` 个 `(class_id, score)` 拷回 CPU（`top_k * 8` 字节），结果里的执行设备是 Cuda。
 
 ```cpp
 vie::ClassificationRuntimeConfig labels;

@@ -767,11 +767,13 @@ TEST(ClassificationOnnx, UntrainedResNetExecutesAndDecodes) {
       cuda_engine.infer_classification(gpu_image, runtime, &cuda_timing);
   ASSERT_EQ(cuda_batch.results[0].labels.size(), 5u);
   EXPECT_EQ(cuda_timing.output_bytes, 4000u);
-  EXPECT_EQ(cuda_timing.d2h_bytes, 4000u);
-  EXPECT_EQ(cuda_batch.results[0].d2h_bytes, 4000u);
+  // Phase 13: only the Top-K pairs cross the bus now (5 * 8 bytes).
+  EXPECT_EQ(cuda_timing.d2h_bytes, 40u);
+  EXPECT_EQ(cuda_batch.results[0].d2h_bytes, 40u);
   EXPECT_TRUE(cuda_timing.includes_d2h);
-  EXPECT_EQ(cuda_batch.results[0].execution_device, vie::DeviceType::Cpu);
-  EXPECT_LT(cuda_batch.results[0].labels.size() * sizeof(float), cuda_timing.d2h_bytes);
+  EXPECT_EQ(cuda_batch.results[0].execution_device, vie::DeviceType::Cuda);
+  EXPECT_EQ(cuda_batch.results[0].d2h_bytes, cuda_batch.results[0].labels.size() * 8u);
+  EXPECT_LT(cuda_timing.d2h_bytes, cuda_timing.output_bytes);
 
   const vie::PreprocessResult prepared = cuda_engine.preprocess(gpu_image);
   vie::BackendRequest cuda_request;
@@ -967,17 +969,18 @@ TEST(ClassificationOnnx, SyntheticSoftmaxGraphUsesProbabilitiesProtocol) {
   EXPECT_EQ(cuda_batch.results[0].labels[1].class_id, batch.results[0].labels[1].class_id);
   EXPECT_NEAR(cuda_batch.results[0].labels[0].score, batch.results[0].labels[0].score, 1e-5);
   EXPECT_NEAR(cuda_batch.results[0].labels[1].score, batch.results[0].labels[1].score, 1e-5);
-  EXPECT_EQ(cuda_timing.d2h_bytes, 8u);
-  EXPECT_EQ(cuda_batch.results[0].d2h_bytes, 8u);
+  // Phase 13: top_k = 2 -> 2 * 8 bytes of compact payload.
+  EXPECT_EQ(cuda_timing.d2h_bytes, 16u);
+  EXPECT_EQ(cuda_batch.results[0].d2h_bytes, 16u);
   EXPECT_TRUE(cuda_timing.includes_d2h);
-  EXPECT_EQ(cuda_batch.results[0].execution_device, vie::DeviceType::Cpu);
+  EXPECT_EQ(cuda_batch.results[0].execution_device, vie::DeviceType::Cuda);
   const vie::PreprocessResult prepared = cuda_engine.preprocess(gpu_image);
   vie::BackendRequest cuda_request;
   cuda_request.inputs.emplace("images", prepared.output);
   const vie::BackendOutput cuda_output = cuda_engine.execute(cuda_request);
   EXPECT_TRUE(cuda_output.tensors.at("probabilities").tensor.is_cuda());
   record << "cuda_ep execute_ms_mean " << cuda_execute << " d2h_ms_mean " << cuda_d2h
-         << " d2h_bytes 8 validate_ms_mean " << cuda_validate << " topk_ms_mean " << cuda_topk
+         << " d2h_bytes 16 validate_ms_mean " << cuda_validate << " topk_ms_mean " << cuda_topk
          << " decode_ms_mean " << cuda_decode << " includes_d2h 1\n";
   cudaFree(device_pixels);
 #endif
