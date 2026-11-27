@@ -232,7 +232,7 @@ std::future<vie::DetectionResult> fut = runtime.submit("det", image, options);
 
 ```bash
 ctest --test-dir build-ort --output-on-failure          # CPU + ORT：433 个用例
-ctest --test-dir build-ort-gpu --output-on-failure      # CUDA + ORT：528 个用例（526 通过；2 个并发用例在 CUDA 构建下跳过，2 个 Yolov8BatchCuda 用例显式禁用；含 Phase 13/14 真实模型 CUDA Decoder E2E）
+ctest --test-dir build-ort-gpu --output-on-failure      # CUDA + ORT：528 个用例（524 通过；2 个并发用例在 CUDA 构建下跳过，2 个 Yolov8BatchCuda 用例显式禁用；含 Phase 13/14 真实模型 CUDA Decoder E2E）
 ```
 
 缺 fixture 时真实模型用例走 `VIE_REQUIRE_MODEL` 跳过而不是失败，所以新 clone 直接 `ctest` 也是全绿 —— 但那意味着约 78 个用例根本没跑。要验证真实模型链路，先执行 `python3 tools/export_test_models.py`，跳过数应归零。
