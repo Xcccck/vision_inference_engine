@@ -9,6 +9,7 @@
 #include "vie/core/error.hpp"
 #include "vie/opencv/image_input.hpp"
 #include "vie/preprocess/preprocess.hpp"
+#include "vie/runtime/inference_request.hpp"
 
 #if defined(VIE_HAS_ONNXRUNTIME)
 #include "vie/decoder/detection.hpp"
@@ -256,6 +257,20 @@ void expect_same_detections(const DetectionResult& a, const DetectionResult& b) 
   }
 }
 
+// Allocates a frame padded by left/top/right/bottom and copies the source
+// pixels into that rectangle, so the ROI content is byte-identical to pixels.
+cv::Mat frame_with_pixels(const std::vector<std::uint8_t>& pixels, int width, int height,
+                          int left, int top, int right, int bottom) {
+  cv::Mat frame(height + top + bottom, width + left + right, CV_8UC3);
+  frame.setTo(cv::Scalar(0, 0, 0));
+  cv::Mat area = frame(cv::Rect(left, top, width, height));
+  for (int y = 0; y < height; ++y) {
+    std::memcpy(area.ptr(y), pixels.data() + static_cast<std::size_t>(y) * width * 3,
+                static_cast<std::size_t>(width) * 3);
+  }
+  return frame;
+}
+
 }  // namespace
 
 TEST(OpenCvInputRealModel, MatchesDirectImageInputPath) {
@@ -279,6 +294,117 @@ TEST(OpenCvInputRealModel, MatchesDirectImageInputPath) {
 
   ASSERT_FALSE(direct_result.detections.empty());
   expect_same_detections(direct_result, cv_result);
+}
+
+TEST(OpenCvInputAsync, AdoptPacksRoiStrideAndBytes) {
+  // The request copy must describe a packed image, not the ROI's parent stride.
+  cv::Mat frame(40, 60, CV_8UC3);
+  cv::randu(frame, cv::Scalar(0, 0, 0), cv::Scalar(255, 255, 255));
+  const cv::Mat roi = frame(cv::Rect(31, 9, 20, 13));
+  ASSERT_FALSE(roi.isContinuous());
+  const cv::Mat packed = roi.clone();
+
+  InferenceRequest request;
+  request.image = from_cv_mat(roi);
+  request.adopt_cpu_pixels();
+
+  ASSERT_EQ(request.owned_pixels.size(), 20u * 13u * 3u);
+  EXPECT_EQ(request.image.row_stride_bytes, 20u * 3u);
+  EXPECT_EQ(request.image.data, static_cast<const void*>(request.owned_pixels.data()));
+  EXPECT_EQ(std::memcmp(request.owned_pixels.data(), packed.data, packed.total() * packed.elemSize()),
+            0);
+}
+
+TEST(OpenCvInputAsync, RoiSubmitSurvivesCallerMutationAtEveryParentEdge) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
+
+  std::vector<std::uint8_t> pixels;
+  int width = 0;
+  int height = 0;
+  const ImageInput direct = load_bus_pixels(pixels, width, height);
+
+  InferenceEngine reference_engine;
+  reference_engine.load(detection_config());
+  const DetectionResult expected = reference_engine.infer(direct).results.at(0);
+  ASSERT_FALSE(expected.detections.empty());
+
+  RuntimeConfig config;
+  config.enable_profiling = false;
+  Runtime runtime(config);
+  runtime.models().load("yolov8n", detection_config());
+
+  struct Placement {
+    const char* name;
+    int left;
+    int top;
+    int right;
+    int bottom;
+  };
+  const Placement placements[] = {
+      {"continuous", 0, 0, 0, 0},
+      {"center", 13, 9, 17, 11},
+      {"right_edge", 21, 7, 0, 13},
+      {"bottom_edge", 11, 17, 13, 0},
+      {"bottom_right", 17, 13, 0, 0},
+      {"top_left", 0, 0, 23, 19},
+  };
+
+  for (const Placement& placement : placements) {
+    SCOPED_TRACE(placement.name);
+    cv::Mat frame = frame_with_pixels(pixels, width, height, placement.left, placement.top,
+                                      placement.right, placement.bottom);
+    cv::Mat roi = frame(cv::Rect(placement.left, placement.top, width, height));
+
+    std::future<DetectionResult> future =
+        runtime.submit("yolov8n", from_cv_mat(roi, ColorOrder::Rgb));
+
+    // submit() must have repacked the strided rows before returning. Destroy
+    // every caller-side handle before the queued request runs.
+    frame.setTo(cv::Scalar(0, 0, 0));
+    roi.release();
+    frame.release();
+
+    const DetectionResult actual = future.get();
+    expect_same_detections(expected, actual);
+  }
+
+  runtime.shutdown();
+}
+
+TEST(OpenCvInputAsync, NestedRoiSubmitSurvivesCallerMutation) {
+  VIE_REQUIRE_MODEL("testdata/onnx/yolov8n.onnx");
+
+  std::vector<std::uint8_t> pixels;
+  int width = 0;
+  int height = 0;
+  const ImageInput direct = load_bus_pixels(pixels, width, height);
+
+  InferenceEngine reference_engine;
+  reference_engine.load(detection_config());
+  const DetectionResult expected = reference_engine.infer(direct).results.at(0);
+  ASSERT_FALSE(expected.detections.empty());
+
+  RuntimeConfig config;
+  config.enable_profiling = false;
+  Runtime runtime(config);
+  runtime.models().load("yolov8n", detection_config());
+
+  cv::Mat frame = frame_with_pixels(pixels, width, height, 20, 12, 6, 4);
+  cv::Mat outer = frame(cv::Rect(5, 3, width + 15, height + 9));
+  // Outer starts 15px left of / 9px above the pixels, so an inner ROI at
+  // (15, 9) is exactly the pixels and ends on outer's bottom-right corner.
+  cv::Mat inner = outer(cv::Rect(15, 9, width, height));
+  ASSERT_EQ(inner.step[0], frame.step[0]);
+
+  std::future<DetectionResult> future = runtime.submit("yolov8n", from_cv_mat(inner, ColorOrder::Rgb));
+  frame.setTo(cv::Scalar(0, 0, 0));
+  inner.release();
+  outer.release();
+  frame.release();
+
+  const DetectionResult actual = future.get();
+  expect_same_detections(expected, actual);
+  runtime.shutdown();
 }
 
 TEST(OpenCvInputAsync, SubmitDeepCopiesBeforeReturning) {

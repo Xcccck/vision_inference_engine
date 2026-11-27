@@ -22,8 +22,9 @@ namespace vie {
 // borrow-only by design); nothing is copied. The cv::Mat and its underlying
 // allocation must stay alive for the whole synchronous
 // InferenceEngine::infer()/infer_batch() call that consumes the ImageInput.
-// For Runtime::submit(), the request deep-copies CPU pixels inside submit(),
-// so the cv::Mat may be released as soon as submit() returns.
+// For Runtime::submit(), the request deep-copies CPU pixels inside submit()
+// and repacks strided rows (a ROI is not continuous) into a tightly packed
+// buffer, so the cv::Mat may be released as soon as submit() returns.
 //
 // Geometry. layout is Hwc, row_stride_bytes is mat.step[0] (never
 // width*elemSize). Consequently a non-continuous ROI such as

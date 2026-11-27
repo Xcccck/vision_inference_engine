@@ -491,10 +491,11 @@ transfer span from the validated image layout — `row_bytes = row_stride_bytes 
 width*channels*dtype_size`, `total = row_bytes*height` — with checked multiplies and
 rejects of null data, non-positive dimensions, unsupported dtype, and a stride smaller
 than one packed row, plus integer-overflow detection. It never uses an unvalidated
-`width*height*channels`. `CudaInputBuffer::stage()` reuses the same row layout that
-`InferenceRequest::adopt_cpu_pixels()` produced at submit, so the on-device image
-keeps width/height/channels/pixel-format/row-stride identical to the source and is
-tagged `device == Cuda` (never a CPU pointer mislabeled as CUDA).
+`width*height*channels`. `InferenceRequest::adopt_cpu_pixels()` repacks every source
+row to its packed width before the request enters the queue (ROI padding is dropped,
+not copied), so `CudaInputBuffer::stage()` always sees a tightly packed CPU image.
+The on-device image keeps width/height/channels/pixel-format with a packed row stride
+and is tagged `device == Cuda` (never a CPU pointer mislabeled as CUDA).
 
 **Stream order.** The H2D runs on the engine's committed stream and is synchronized
 before `stage()` returns; the subsequent preprocess/backend work is issued on the same

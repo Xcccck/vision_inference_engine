@@ -243,6 +243,7 @@ if(VIE_BUILD_TESTS)
     tests/test_runtime.cpp
     tests/test_runtime_audit.cpp
     tests/test_async_runtime.cpp
+    tests/test_async_cpu_staging.cpp
     tests/test_dynamic_batch_aggregator.cpp
     tests/test_runtime_concurrency.cpp
     tests/test_async_lifecycle_audit.cpp

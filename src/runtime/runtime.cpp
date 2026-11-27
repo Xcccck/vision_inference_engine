@@ -193,8 +193,10 @@ std::future<DetectionResult> Runtime::submit(const std::string& model_id, ImageI
   request.model = model;
   request.submitted_at = std::chrono::steady_clock::now();
 
-  // Phase 9.2.2.2: Deep-copy CPU pixel data so caller can safely release
-  // their buffer immediately after submit() returns.
+  // Phase 9.2.2.2/11.1: Deep-copy CPU pixel data so the caller can safely
+  // release their buffer immediately after submit() returns. Strided rows
+  // (e.g. a cv::Mat ROI) are repacked, so the queued request never reads the
+  // source's row padding or past its last valid pixel.
   request.adopt_cpu_pixels();
 
   // Get the future before moving the request

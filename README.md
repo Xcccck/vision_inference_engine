@@ -165,7 +165,9 @@ const vie::DetectionBatch out = engine.infer(view);
 std::future<vie::DetectionResult> fut = runtime.submit("det", vie::from_cv_mat(bgr));
 ```
 
-适配只接受 `CV_8UC1`（Gray）、`CV_8UC3`（默认 BGR，可显式传 `ColorOrder::Rgb`）、`CV_32FC1`、`CV_32FC3`；`CV_8UC4`/16 位等直接抛 `Unsupported`，不静默丢 alpha 或换深度。同步 `infer()` 是借用语义，`cv::Mat` 必须活到调用返回。
+适配只接受 `CV_8UC1`（Gray）、`CV_8UC3`（默认 BGR，可显式传 `ColorOrder::Rgb`）、`CV_32FC1`、`CV_32FC3`；`CV_8UC4`/16 位等直接抛 `Unsupported`，不静默丢 alpha 或换深度。
+
+生命周期与深拷贝：`from_cv_mat()` 返回的仍是 Borrowed `ImageInput`，同步 `infer()` 期间 `cv::Mat` 必须保持有效；`Runtime::submit()` 在返回前完成像素深拷贝（ROI/非连续 Mat 按实际有效行宽逐行压紧，拷贝后 `row_stride_bytes` 为 `width*channels*元素大小`，CHW 按平面压紧），所以 `submit()` 返回后修改或释放 `cv::Mat` 都不影响异步任务，深拷贝也不会读取 ROI 有效像素之外的内存。
 
 多模型 + 异步提交：
 
@@ -202,13 +204,13 @@ std::cout << result.detections.size() << " boxes, "
 ## 测试
 
 ```bash
-ctest --test-dir build-ort --output-on-failure          # CPU + ORT：366 个用例
-ctest --test-dir build-ort-gpu --output-on-failure      # CUDA + ORT：432 个用例
+ctest --test-dir build-ort --output-on-failure          # CPU + ORT：384 个用例
+ctest --test-dir build-ort-gpu --output-on-failure      # CUDA + ORT：450 个用例
 ```
 
 缺 fixture 时真实模型用例走 `VIE_REQUIRE_MODEL` 跳过而不是失败，所以新 clone 直接 `ctest` 也是全绿 —— 但那意味着约 73 个用例根本没跑。要验证真实模型链路，先执行 `python3 tools/export_test_models.py`，跳过数应归零。
 
-40 个测试源文件覆盖 Tensor / Manifest / Analyzer / Recognizer / Decoder / Preprocess / Runtime / OpenCV 适配。sanitizer 构建：
+41 个测试源文件覆盖 Tensor / Manifest / Analyzer / Recognizer / Decoder / Preprocess / Runtime / OpenCV 适配。sanitizer 构建：
 
 ```bash
 cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DVIE_ENABLE_ONNXRUNTIME=ON \

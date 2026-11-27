@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -50,42 +51,93 @@ struct InferenceRequest {
   InferenceRequest& operator=(const InferenceRequest&) = delete;
 
   // Deep-copies CPU pixel data so the request is self-contained.
-  // After this call, image.data points to owned_pixels and the caller
-  // may safely release the original buffer.
+  // After this call, image.data points to owned_pixels and the caller may
+  // safely release the original buffer.
   // CUDA inputs are rejected at Runtime::submit() before reaching this
   // method, so this function is always called with device == Cpu.
+  //
+  // Only the packed width*channels*element bytes of each row are read, never
+  // the source row padding. A strided source (a cv::Mat ROI, or any caller
+  // supplied row_stride_bytes larger than one packed row) is therefore
+  // repacked into a contiguous buffer: the last read ends at the last valid
+  // pixel even when the ROI's last row ends exactly on the parent's
+  // allocation boundary. CHW planes are packed independently, matching the
+  // documented "row stride inside one plane, planes contiguous" projection.
+  //
+  // Non-positive geometry is left untouched so the established worker-side
+  // rejection (staging/preprocess throw through the future before reading a
+  // pixel) is preserved. Throws ErrorCode::InvalidArgument for an unsized
+  // dtype, a stride smaller than one packed row, a misaligned stride or a
+  // size overflow.
   void adopt_cpu_pixels() {
     if (image.device != DeviceType::Cpu || image.data == nullptr) {
       return;  // Defensive: CUDA images should not reach here via submit().
     }
-    const std::size_t row_bytes =
-        (image.row_stride_bytes != 0)
-            ? image.row_stride_bytes
-            : static_cast<std::size_t>(image.width) * image.channels * dtype_bytes(image.dtype);
-    const std::size_t total_bytes = row_bytes * static_cast<std::size_t>(image.height);
+    if (!owned_pixels.empty() && image.data == static_cast<const void*>(owned_pixels.data())) {
+      return;  // Already adopted: the pixels are packed and request-owned.
+    }
+    if (image.width <= 0 || image.height <= 0 || image.channels <= 0) {
+      // Keep the established submit() contract: a geometry error surfaces from
+      // CUDA staging or preprocess inside the worker (through the future)
+      // before any pixel is read. Copying is meaningless, so leave the image
+      // untouched rather than rejecting it at submit time.
+      return;
+    }
+    if (image.layout != ImageLayout::Hwc && image.layout != ImageLayout::Chw) {
+      throw VieError(ErrorCode::InvalidArgument,
+                     "async image copy requires an HWC or CHW image layout");
+    }
+    const std::size_t element = dtype_size(image.dtype);
+    const bool hwc = image.layout == ImageLayout::Hwc;
+    const std::size_t packed_row =
+        mul_checked(mul_checked(static_cast<std::size_t>(image.width),
+                                hwc ? static_cast<std::size_t>(image.channels) : 1u,
+                                "width*channels"),
+                    element, "row bytes");
+    const std::size_t source_row =
+        image.row_stride_bytes != 0 ? image.row_stride_bytes : packed_row;
+    if (source_row < packed_row || source_row % element != 0) {
+      throw VieError(ErrorCode::InvalidArgument,
+                     "image row_stride_bytes is smaller than one packed row or is misaligned");
+    }
+    const std::size_t planes = hwc ? 1u : static_cast<std::size_t>(image.channels);
+    const std::size_t packed_plane =
+        mul_checked(packed_row, static_cast<std::size_t>(image.height), "packed row*height");
+    const std::size_t source_plane =
+        mul_checked(source_row, static_cast<std::size_t>(image.height), "row stride*height");
+    const std::size_t total_bytes = mul_checked(packed_plane, planes, "plane bytes*plane count");
+
     owned_pixels.resize(total_bytes);
-    std::memcpy(owned_pixels.data(), image.data, total_bytes);
-    // Redirect image.data to our owned copy
+    const auto* source = static_cast<const std::uint8_t*>(image.data);
+    std::uint8_t* destination = owned_pixels.data();
+    if (source_row == packed_row) {
+      // Already packed: this single copy cannot run past the last valid pixel.
+      std::memcpy(destination, source, total_bytes);
+    } else {
+      // Copy each row's valid bytes only. The final read ends at
+      // source + (planes-1)*source_plane + (height-1)*source_row + packed_row,
+      // which is the image's last valid pixel for any ROI.
+      for (std::size_t plane = 0; plane < planes; ++plane) {
+        const std::uint8_t* source_plane_base = source + plane * source_plane;
+        std::uint8_t* destination_plane_base = destination + plane * packed_plane;
+        for (int row = 0; row < image.height; ++row) {
+          std::memcpy(destination_plane_base + static_cast<std::size_t>(row) * packed_row,
+                      source_plane_base + static_cast<std::size_t>(row) * source_row, packed_row);
+        }
+      }
+    }
+    // Redirect image.data to the owned, tightly packed copy.
     image.data = owned_pixels.data();
-    image.row_stride_bytes = row_bytes;
+    image.row_stride_bytes = packed_row;
   }
 
  private:
-  static std::size_t dtype_bytes(DataType dt) {
-    switch (dt) {
-      case DataType::Uint8:
-      case DataType::Int8:
-        return 1;
-      case DataType::Fp16:
-        return 2;
-      case DataType::Fp32:
-      case DataType::Int32:
-        return 4;
-      case DataType::Int64:
-        return 8;
-      default:
-        return 1;
+  static std::size_t mul_checked(std::size_t lhs, std::size_t rhs, const char* what) {
+    if (lhs != 0 && rhs > std::numeric_limits<std::size_t>::max() / lhs) {
+      throw VieError(ErrorCode::InvalidArgument,
+                     std::string("async image copy overflow computing ") + what);
     }
+    return lhs * rhs;
   }
 };
 
