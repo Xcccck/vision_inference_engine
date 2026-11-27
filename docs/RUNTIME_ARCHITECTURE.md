@@ -1092,8 +1092,11 @@ out-of-range request is rejected rather than clamped silently. The
 probabilities protocol additionally
 checks `[0, 1]` and the FP64 sum within `1e-3`. Only the final `top_k`
 `(class_id, score)` pairs are copied back (`top_k * 8` bytes); the full logits
-never leave the device. Non-finite inputs report the lowest offending class id
-with the exact CPU error text. CUDA-side failures never retry on the CPU.
+never leave the device. Two control words (an 8-byte fault counter and an
+8-byte probability sum) are read back during validation but are not counted in
+`d2h_bytes`, matching the RT-DETR convention of reporting payload only.
+Non-finite inputs report the lowest offending class id with the exact CPU
+error text. CUDA-side failures never retry on the CPU.
 
 **Semantic Segmentation CUDA ArgMax** (`SemanticSegmentationCudaDecoder`,
 protocol `deeplabv3_semantic_seg_raw`). Input is a rank-4 FP32 CUDA tensor
@@ -1105,7 +1108,9 @@ stored back as FP32, then per original pixel `mx = ox * scale_x + origin_x`
 bilinear sampling in double and a strict `>` argmax that keeps the smallest
 class id. The `.cu` file is compiled with `--fmad=false` so the arithmetic
 mirrors the CPU expression. Only the int32 class map is copied back
-(`width * height * 4` bytes); the logits stay resident.
+(`width * height * 4` bytes); the logits stay resident. The 8-byte fault index
+(and, only on error, one 4-byte diagnostic value) is a control transfer and is
+not counted in `d2h_bytes`.
 
 **Kernel and stream usage.** Both decoders reuse the RT-DETR CUDA lane
 conventions: legacy default stream (`nullptr`), which is the stream ONNX
