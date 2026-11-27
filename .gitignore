@@ -5,3 +5,10 @@ runs/
 *.pt
 *.pth
 *.weights
+
+# Ultralytics 权重导出的测试模型不在仓库里分发（AGPL-3.0）。
+# 取回方式：python3 tools/export_test_models.py
+testdata/onnx/yolov8n.onnx
+testdata/onnx/yolov8n-seg.onnx
+testdata/onnx/rtdetr-l.onnx
+testdata/onnx_dynamic/yolov8n_batch.onnx

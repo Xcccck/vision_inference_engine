@@ -332,6 +332,26 @@ if(VIE_ENABLE_CUDA)
     APPEND PROPERTY BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
 endif()
 
+# The Ultralytics-derived fixtures are not distributed with this repository
+# (AGPL-3.0 weights), so a fresh clone starts without them. Say which ones are
+# missing here, because the tests that read them fail until they are rebuilt.
+set(VIE_MISSING_TEST_MODELS "")
+foreach(vie_model IN ITEMS
+    testdata/onnx/yolov8n.onnx
+    testdata/onnx/yolov8n-seg.onnx
+    testdata/onnx/rtdetr-l.onnx
+    testdata/onnx_dynamic/yolov8n_batch.onnx)
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${vie_model}")
+    list(APPEND VIE_MISSING_TEST_MODELS "${vie_model}")
+  endif()
+endforeach()
+if(VIE_MISSING_TEST_MODELS)
+  message(WARNING
+    "Test models are missing: ${VIE_MISSING_TEST_MODELS}. "
+    "Run 'python3 tools/export_test_models.py' before ctest; the real-model "
+    "tests and tools need these files.")
+endif()
+
 message(STATUS "VIE ${PROJECT_VERSION}")
 message(STATUS "  CUDA=${VIE_ENABLE_CUDA} TENSORRT=${VIE_ENABLE_TENSORRT} ONNXRUNTIME=${VIE_ENABLE_ONNXRUNTIME} ONNXRUNTIME_CUDA=${VIE_ENABLE_ONNXRUNTIME_CUDA} OPENCV=${VIE_ENABLE_OPENCV}")
 message(STATUS "  TESTS=${VIE_BUILD_TESTS}")

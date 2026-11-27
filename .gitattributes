@@ -1,2 +1,2 @@
-testdata/onnx/rtdetr-l.onnx filter=lfs diff=lfs merge=lfs -text
+# Ultralytics 衍生的权重（yolov8*、rtdetr-l）不再随仓库分发，见 .gitignore。
 testdata/onnx/deeplabv3_mobilenet_v3_large_520_opset18.onnx filter=lfs diff=lfs merge=lfs -text
